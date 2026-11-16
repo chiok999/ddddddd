@@ -281,3 +281,11 @@ test('KissKh retries temporary rate limits but does not retry forbidden response
   let count=0; const forbidden=require('./kisskh')({request:async()=>{count++; throw Object.assign(Error('forbidden'),{status:403})},safeUrl:u=>new URL(u),sleep:async()=>{throw Error('must not sleep')}});
   await assert.rejects(forbidden.search('A'),{code:'KISSKH_SEARCH_FAILED'}); assert.equal(count,4);
 });
+
+test('MovieBox retrieves and converts an English caption using bounded injected requests', async () => {
+  const seen=[];
+  const request=async (url)=>{ seen.push(url); if(url.includes('/home?')) return {headers:{get:()=>'{"token":"guest"}'}}; if(url.includes('/subject/caption?')) return {json:{data:{captions:[{language:'en',url:'https://subs.example/one.srt'}]}}}; if(url==='https://subs.example/one.srt') return {text:'1\n00:00:01,000 --> 00:00:02,000\nHello'}; throw Error('unexpected'); };
+  const mb=require('./moviebox')({request,safeUrl:u=>new URL(u)});
+  assert.equal(await mb.subtitle({id:'123',format:'MP4',subjectId:'abc',detailPath:'detail'}),'WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nHello');
+  assert.ok(seen.some(x=>x.includes('subjectId=abc')));
+});

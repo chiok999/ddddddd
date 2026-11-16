@@ -21,6 +21,7 @@ const sources = new Map();
 let loginFailures = [];
 const catalog = new Map();
 const captions = new Map();
+const captionSources = new Map();
 const agent = new Agent({ connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
 function remember(url, sid, referer = null, format = null, origin = null) {
@@ -137,6 +138,17 @@ const server = http.createServer(async (req, res) => {
       const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
       return send(res,200,{url:`/caption/${id}`});
     }
+    if (url.pathname === '/api/moviebox-subtitle' && req.method === 'POST') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      const data=await body(req); const source=captionSources.get(data.id);
+      if (!source || source.sid!==sid || source.expires<Date.now()) return send(res,404,{error:'Subtitle source expired'});
+      const text=await moviebox.subtitle(source.info);
+      if (!text) return send(res,200,{url:null});
+      for (const [id, entry] of captions) if (entry.expires < Date.now()) captions.delete(id);
+      if (captions.size > 100) fail('Too many subtitles; restart the server');
+      const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
+      return send(res,200,{url:`/caption/${id}`});
+    }
     if (url.pathname.startsWith('/caption/') && req.method === 'GET') {
       if (!authorized) return send(res,401,{error:'Login required'});
       const entry=captions.get(url.pathname.slice(9));
@@ -152,7 +164,12 @@ const server = http.createServer(async (req, res) => {
         try { const r=await kisskh.resolve(selected.item,Number(data.season),Number(data.episode)); result={ streams:r.streams.map(s=>({...s,provider:'kisskh',referer:r.referer,origin:r.origin})), providers:[{provider:'kisskh',count:r.streams.length,error:null}] }; }
         catch (err) { result={streams:[],providers:[{provider:'kisskh',count:0,error:String(err?.message || 'Unavailable').slice(0,160)}]}; }
       } else result = await resolveProviders({ moviebox, providers, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
-      const streams = result.streams.map(stream => ({ provider:stream.provider, quality:stream.quality, format:stream.format, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin) }));
+      for (const [id, entry] of captionSources) if (entry.expires<Date.now()) captionSources.delete(id);
+      const streams = result.streams.map(stream => {
+        let captionId=null;
+        if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,expires:Date.now()+6*3600000}); }
+        return { provider:stream.provider, quality:stream.quality, format:stream.format, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin) };
+      });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }
     if (url.pathname === '/api/source' && req.method === 'POST') {
