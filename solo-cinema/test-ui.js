@@ -112,3 +112,32 @@ test('discovery cards search the catalog without assuming a playable source', as
   w.fetch=async(url,opts={})=>({ok:true,json:async()=>{ if(url==='/api/session')return {authenticated:true}; if(url==='/api/discover')return {sections:[{id:'popular-movies',items:[{title:'A Film',year:'2026',type:'movie',poster:'https://images.example/p.jpg'}]}]}; if(url==='/api/search'){searched=JSON.parse(opts.body).query;return {results:[{id:'a',title:'A Film',type:'movie',source:'moviebox'}],providers:[]}} throw Error('unexpected');}});
   try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8')); w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8')); await tick(); await tick(); assert.equal(w.document.querySelectorAll('#popular-movies .catalog-card').length,1); w.document.querySelector('#popular-movies .catalog-card').click(); await tick(); assert.equal(searched,'A Film'); assert.equal(w.document.querySelector('.result strong').textContent,'A Film'); assert.ok(w.document.querySelector('#selection').classList.contains('hidden'));}finally{w.close();}
 });
+
+test('subtitle appearance persists and late HLS track updates preserve the selected option', async()=>{
+  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; let player;
+  w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();};
+  class Hls{constructor(){player=this;this.listeners={}} static isSupported(){return true} loadSource(){} attachMedia(){} on(e,f){this.listeners[e]=f} destroy(){} emit(e,d){this.listeners[e]?.(e,d)}}
+  Hls.Events={MANIFEST_PARSED:'manifest',SUBTITLE_TRACKS_UPDATED:'subs',AUDIO_TRACKS_UPDATED:'audio',ERROR:'error'};w.Hls=Hls;
+  w.fetch=async u=>({ok:true,json:async()=>u==='/api/session'?{authenticated:true}:u==='/api/source'?{url:'/media/a'}:{sections:[]}});
+  try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();
+    const size=w.document.getElementById('subtitleSize'),color=w.document.getElementById('subtitleColor'),video=w.document.getElementById('video'); size.value='large';size.dispatchEvent(new w.Event('change'));color.value='yellow';color.dispatchEvent(new w.Event('change')); assert.ok(video.classList.contains('caption-large')); assert.ok(video.classList.contains('caption-yellow')); assert.equal(JSON.parse(w.localStorage.getItem('solo-caption-style')).size,'large');
+    w.document.getElementById('title').value='Test';w.document.getElementById('url').value='https://example.com/video.m3u8';w.document.getElementById('sourceForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();
+    player.emit('subs',{subtitleTracks:[{name:'English'}]}); const select=w.document.getElementById('subtitles');select.value='0'; select.dispatchEvent(new w.Event('change'));player.emit('subs',{subtitleTracks:[{name:'English'}]});assert.equal(select.value,'0');select.value='-1';select.dispatchEvent(new w.Event('change'));player.emit('subs',{subtitleTracks:[{name:'English'}]});assert.equal(select.value,'-1');
+    player.emit('audio',{audioTracks:[{name:'English'}]});const audio=w.document.getElementById('audio');audio.value='0';audio.dispatchEvent(new w.Event('change'));audio.value='-1';audio.dispatchEvent(new w.Event('change'));assert.equal(player.audioTrack,-1);
+  }finally{w.close();}
+});
+
+test('sign out failure stays visible and reports an error; successful sign out hides app',async()=>{
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; let fail=true;
+ w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.Hls=class{};
+ w.fetch=async url=>{if(url==='/api/logout' && fail)throw Error('offline');return {ok:true,json:async()=>url==='/api/session'?{authenticated:true}:{sections:[]}}};
+ try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();w.document.getElementById('logout').click();await tick();assert.match(w.document.getElementById('playError').textContent,/Sign out failed/);assert.equal(w.document.getElementById('app').classList.contains('hidden'),false);fail=false;w.document.getElementById('logout').click();await tick();assert.ok(w.document.getElementById('app').classList.contains('hidden'));assert.ok(w.document.getElementById('mainNav').classList.contains('hidden'));}finally{w.close()}
+});
+
+test('login, direct stream save and remove work through their controls',async()=>{
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; let password;
+ w.Hls=class{};w.fetch=async(url,opts={})=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:false};if(url==='/api/discover')return {sections:[]};if(url==='/api/login'){password=JSON.parse(opts.body).password;return {ok:true}}; throw Error('unexpected')}});
+ try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();assert.ok(w.document.getElementById('app').classList.contains('hidden'));w.document.getElementById('password').value='test password';w.document.getElementById('loginForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();assert.equal(password,'test password');assert.equal(w.document.getElementById('app').classList.contains('hidden'),false);
+ w.document.getElementById('title').value='My video';w.document.getElementById('url').value='https://example.com/video.mp4';w.document.getElementById('save').click();assert.equal(w.document.querySelectorAll('#list .item').length,1);w.document.querySelector('#list .secondary').click();assert.equal(w.document.querySelectorAll('#list .item').length,0);
+ }finally{w.close()}
+});
