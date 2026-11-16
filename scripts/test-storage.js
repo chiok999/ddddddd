@@ -147,3 +147,53 @@ test('WhatsApp login: recovery install refuses to overwrite existing credentials
   authStore.removeDir(dir);
   assert.equal(authStore.hasFiles(dir), false);
 });
+
+test('file auth mode refuses to replace missing or corrupt linked credentials', async () => {
+  const prev = process.env.AUTH_STORE;
+  process.env.AUTH_STORE = 'files';
+  const dir = path.join(ROOT, 'file-auth-guard');
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    await assert.rejects(authStore.useSqliteAuthState(dir, { requireExisting: true }), { code: 'AUTH_MISSING' });
+    fs.writeFileSync(path.join(dir, 'creds.json'), '{broken');
+    await assert.rejects(authStore.useSqliteAuthState(dir, { requireExisting: true }), { code: 'AUTH_CORRUPT' });
+    assert.equal(fs.readFileSync(path.join(dir, 'creds.json'), 'utf8'), '{broken');
+  } finally {
+    if (prev === undefined) delete process.env.AUTH_STORE; else process.env.AUTH_STORE = prev;
+  }
+});
+
+test('owner and linked auth remain isolated with identical key names across independent processes', async () => {
+  const ownerDir = path.join(ROOT, 'isolation-session');
+  const linkedDir = path.join(ownerDir, 'linked', '265991111111', 'c'.repeat(24));
+  const owner = await authStore.useSqliteAuthState(ownerDir);
+  const linked = await authStore.useSqliteAuthState(linkedDir);
+  owner.state.creds.me = { id: '265990000000:1@s.whatsapp.net' };
+  linked.state.creds.me = { id: '265991111111:1@s.whatsapp.net' };
+  await owner.saveCreds();
+  await linked.saveCreds();
+  await owner.state.keys.set({ session: { same: { record: Buffer.from('owner-key') } } });
+  await linked.state.keys.set({ session: { same: { record: Buffer.from('linked-key') } } });
+
+  const worker = `
+    (async () => {
+      const auth = await require(${JSON.stringify(path.join(ROOT, 'lib/authStore'))}).useSqliteAuthState(process.argv[1], { requireExisting: true });
+      const keys = await auth.state.keys.get('session', ['same']);
+      process.stdout.write(JSON.stringify({ id: auth.state.creds.me.id, key: Buffer.from(keys.same.record).toString() }));
+    })().catch(e => { console.error(e.message); process.exitCode = 1; });`;
+  const readWorker = (dir) => {
+    const child = spawnSync(process.execPath, ['-e', worker, dir], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, AUTH_STORE: 'sqlite' } });
+    assert.equal(child.status, 0, child.stderr);
+    return JSON.parse(child.stdout);
+  };
+  assert.deepEqual(readWorker(ownerDir), { id: '265990000000:1@s.whatsapp.net', key: 'owner-key' });
+  assert.deepEqual(readWorker(linkedDir), { id: '265991111111:1@s.whatsapp.net', key: 'linked-key' });
+  // Destroy only the owner namespace; the child can still restart with linked state.
+  authStore.removeDir(ownerDir);
+  assert.deepEqual(readWorker(linkedDir), { id: '265991111111:1@s.whatsapp.net', key: 'linked-key' });
+  // Destroy only the linked namespace; owner state recreated under the same name survives.
+  await owner.saveCreds();
+  await owner.state.keys.set({ session: { same: { record: Buffer.from('owner-key') } } });
+  authStore.removeDir(linkedDir);
+  assert.deepEqual(readWorker(ownerDir), { id: '265990000000:1@s.whatsapp.net', key: 'owner-key' });
+});
