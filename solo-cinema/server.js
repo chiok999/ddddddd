@@ -36,7 +36,8 @@ const { rewritePlaylist } = require('./playlist');
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
 async function providerRequest(url, opts = {}) {
   safeUrl(url);
-  const response = await fetch(url, { ...opts, dispatcher: agent, redirect: 'manual', signal: AbortSignal.timeout(15000) });
+  const { timeoutMs = 15000, ...fetchOpts } = opts;
+  const response = await fetch(url, { ...fetchOpts, dispatcher: agent, redirect: 'manual', signal: AbortSignal.timeout(Math.max(1, Math.min(15000, timeoutMs))) });
   if (!response.ok) { await response.body?.cancel(); throw Object.assign(new Error(`Provider HTTP ${response.status}`), { status: response.status }); }
   const reader = response.body.getReader(); const chunks = []; let total = 0;
   while (true) {
@@ -145,11 +146,18 @@ const server = http.createServer(async (req, res) => {
       const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
       return send(res,200,{url:`/caption/${id}`});
     }
-    if (url.pathname === '/api/moviebox-subtitle' && req.method === 'POST') {
+    if ((url.pathname === '/api/moviebox-subtitle' || url.pathname === '/api/movy-subtitle') && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
       const data=await body(req); const source=captionSources.get(data.id);
       if (!source || source.sid!==sid || source.expires<Date.now()) return send(res,404,{error:'Subtitle source expired'});
-      const text=await moviebox.subtitle(source.info);
+      const expected=url.pathname === '/api/movy-subtitle' ? 'movy' : 'moviebox';
+      if(source.provider!==expected) return send(res,404,{error:'Subtitle source expired'});
+      let text;
+      if(expected==='movy') {
+        const response=await providerRequest(source.info.url,{headers:{referer:'https://www.movy.sx/',origin:'https://www.movy.sx','user-agent':'okhttp/4.12.0'}});
+        const raw=response.text.replace(/^\uFEFF/,'').trim();
+        if(raw.includes('-->') && !/^<(!doctype|html)/i.test(raw)) {const converted=raw.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g,'$1.$2'); text=/^WEBVTT(?:\s|$)/i.test(converted)?converted:`WEBVTT\n\n${converted}`;}
+      } else text=await moviebox.subtitle(source.info);
       if (!text) return send(res,200,{url:null});
       for (const [id, entry] of captions) if (entry.expires < Date.now()) captions.delete(id);
       if (captions.size > 100) fail('Too many subtitles; restart the server');
@@ -174,7 +182,7 @@ const server = http.createServer(async (req, res) => {
       for (const [id, entry] of captionSources) if (entry.expires<Date.now()) captionSources.delete(id);
       const streams = result.streams.map(stream => {
         let captionId=null;
-        if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,expires:Date.now()+6*3600000}); }
+        if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':'moviebox',expires:Date.now()+6*3600000}); }
         return { provider:stream.provider, quality:stream.quality, format:stream.format, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent) };
       });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });

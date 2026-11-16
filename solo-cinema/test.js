@@ -317,3 +317,15 @@ test('Movy retries a stale seed once and backs off on 429',async()=>{
  let attempts=0;const limited=createMovy({safeUrl,now:()=>clock,request:async(url)=>{attempts++;if(url.includes('www.movy.sx'))return {text:'<script id="__NEXT_DATA__">'+JSON.stringify({props:{pageProps:{details:{title:'Test',year:2026}}}})+'</script>'};throw Object.assign(Error('limit'),{status:429});}});
  await assert.rejects(limited({tmdbId:'1368337'},1,1),/rate limited/);await assert.rejects(limited({tmdbId:'1368337'},1,1),/rate limited/);assert.equal(attempts,2);
 });
+
+test('Movy recognizes opaque HLS URLs, numeric quality and payload captions',async()=>{
+ const {createMovy}=require('./movy'); const {safeUrl}=require('./network');const ciphertext='UUXEqNmj0gylepVn5eDkew5tRHobkchsLrr8zzaK-yxfW21ej4HVVefKPk2SoEgS2OaBlADfZzow5iKxaQ-cgweaSZUOL2vOqfjPYYuv6MW6kNZ1qwxQaoFTyyovQrRgvN-ArfKeMv0rV6menCSlOjHnOYT9K8g7A4vYUnbSPz77obJAtgFPk2ZaMsNQgG-EGyVm02iOHLoXxIyymOzF87kkk_bnt5XzmElBQzGwWU_E_-8cMS9cQQlZIoLgPcN7';
+ const timeouts=[];const resolve=createMovy({safeUrl,request:async(url,opts)=>{timeouts.push(opts.timeoutMs);if(url.includes('www.movy.sx'))return {text:'<script id="__NEXT_DATA__">'+JSON.stringify({props:{pageProps:{details:{title:'Test',year:2026}}}})+'</script>'};if(url.includes('/seed?'))return {json:{seed:'test-seed',ttlMs:30000}};return {text:ciphertext}}});
+ const r=await resolve({tmdbId:'1368337',type:'movie'},1,1);assert.deepEqual(r.streams.map(s=>[s.format,s.quality]),[['hls',2160],['hls',720]]);assert.equal(r.captionInfo.url,'https://subs.example/english.srt');assert.ok(timeouts.every(t=>t>0 && t<=3500));
+});
+
+test('Movy enforces a total lookup budget instead of walking indefinitely',async()=>{
+ const {createMovy}=require('./movy'),{safeUrl}=require('./network');let clock=1;let calls=0;
+ const resolve=createMovy({safeUrl,now:()=>clock,request:async url=>{calls++;clock+=4000;if(url.includes('www.movy.sx'))return {text:'<script id="__NEXT_DATA__">'+JSON.stringify({props:{pageProps:{details:{title:'Test',year:2026}}}})+'</script>'};if(url.includes('/seed?'))return {json:{seed:'test-seed'}};throw Error('failed');}});
+ await assert.rejects(resolve({tmdbId:'1368337',type:'movie'},1,1),/timed out/);assert.equal(calls,3);
+});
