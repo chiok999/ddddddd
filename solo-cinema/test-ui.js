@@ -4,10 +4,11 @@ const assert = require('node:assert/strict');
 const fs=require('node:fs'), path=require('node:path');
 const { JSDOM }=require('jsdom');
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
+
 test('UI searches, lists sources, and switches after fatal playback errors', async () => {
   const html=fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8');
   const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'});
-  const w=dom.window; const instances=[];
+  const w=dom.window; w.scrollTo=()=>{}; const instances=[];
   w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();};
   class Hls { constructor(){this.listeners={}; instances.push(this);} static isSupported(){return true;} loadSource(url){this.url=url;} attachMedia(){} on(event,cb){this.listeners[event]=cb;} destroy(){} emit(event,data){this.listeners[event]?.(event,data);} }
   Hls.Events={MANIFEST_PARSED:'manifest',SUBTITLE_TRACKS_UPDATED:'subs',AUDIO_TRACKS_UPDATED:'audio',ERROR:'error'}; w.Hls=Hls;
@@ -22,8 +23,8 @@ test('UI searches, lists sources, and switches after fatal playback errors', asy
     w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));
     await tick(); w.document.getElementById('query').value='Test Movie';
     w.document.getElementById('searchForm').dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true})); await tick();
-    w.document.querySelector('.result').click(); w.document.getElementById('findStreams').click(); await tick();
-    const buttons=w.document.querySelectorAll('#streams button'); assert.equal(buttons.length,3); buttons[0].click(); await tick();
+    w.document.querySelector('.result').click(); await tick();
+    const buttons=w.document.querySelectorAll('#streams button'); assert.equal(buttons.length,3); assert.equal(w.document.getElementById('view-watch').classList.contains('hidden'),false);
     assert.equal(instances.length,1); assert.equal(instances[0].url,'/media/first');
     instances[0].emit('manifest',{levels:[{height:720,bitrate:1000000}]});
     instances[0].emit('subs',{subtitleTracks:[{name:'English',lang:'en'}]});
@@ -38,7 +39,7 @@ test('UI searches, lists sources, and switches after fatal playback errors', asy
 
 test('watchlist Play actually resolves the saved title and starts its stream', async () => {
   const html=fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8');
-  const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'}); const w=dom.window; const instances=[];
+  const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'}); const w=dom.window; w.scrollTo=()=>{}; const instances=[];
   w.localStorage.setItem('solo-watchlist',JSON.stringify([{kind:'catalog',title:'Merry Berry Love',type:'series',year:'2026',source:'moviebox'}]));
   w.scrollTo=()=>{}; w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();};
   class Hls {constructor(){instances.push(this)} static isSupported(){return true} loadSource(url){this.url=url} attachMedia(){} on(){} destroy(){}}
@@ -82,7 +83,7 @@ test('series controls select low quality, seek and advance to the next episode',
 });
 
 test('server selector switches returned sources at the current position and speed changes playback', async () => {
-  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}); const w=dom.window;
+  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}); const w=dom.window; w.scrollTo=()=>{};
   w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();};
   w.Hls=class {static isSupported(){return false}};
   w.fetch=async(url)=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true}; if(url==='/api/search')return {results:[{id:'a',title:'Film',type:'movie',source:'moviebox'}]}; if(url==='/api/resolve')return {title:'Film',providers:[],streams:[{provider:'moviebox',format:'file',quality:360,url:'/media/a'},{provider:'vidsrc',format:'file',quality:720,url:'/media/b'}]}; throw Error('unexpected');}});
@@ -95,7 +96,7 @@ test('server selector switches returned sources at the current position and spee
 });
 
 test('local subtitle upload converts SRT to a selectable VTT track', async () => {
-  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}); const w=dom.window; let blob;
+  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}); const w=dom.window; w.scrollTo=()=>{}; let blob;
   w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();}; w.URL.createObjectURL=b=>{blob=b;return 'blob:https://cinema.example/subtitle'}; w.URL.revokeObjectURL=()=>{}; w.Hls=class{static isSupported(){return false}};
   w.fetch=async(url)=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true}; if(url==='/api/source')return {url:'/media/direct'}; throw Error('unexpected');}});
   try {
@@ -107,14 +108,14 @@ test('local subtitle upload converts SRT to a selectable VTT track', async () =>
 });
 
 test('discovery cards search the catalog without assuming a playable source', async()=>{
-  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}), w=dom.window; let searched;
+  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}), w=dom.window; w.scrollTo=()=>{}; let searched;
   w.HTMLElement.prototype.scrollIntoView=function(){}; w.Hls=class{static isSupported(){return false}};
   w.fetch=async(url,opts={})=>({ok:true,json:async()=>{ if(url==='/api/session')return {authenticated:true}; if(url==='/api/discover')return {sections:[{id:'popular-movies',items:[{title:'A Film',year:'2026',type:'movie',poster:'https://images.example/p.jpg'}]}]}; if(url==='/api/search'){searched=JSON.parse(opts.body).query;return {results:[{id:'a',title:'A Film',type:'movie',source:'moviebox'}],providers:[]}} throw Error('unexpected');}});
   try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8')); w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8')); await tick(); await tick(); assert.equal(w.document.querySelectorAll('#popular-movies .catalog-card').length,1); w.document.querySelector('#popular-movies .catalog-card').click(); await tick(); assert.equal(searched,'A Film'); assert.equal(w.document.querySelector('.result strong').textContent,'A Film'); assert.ok(w.document.querySelector('#selection').classList.contains('hidden'));}finally{w.close();}
 });
 
 test('subtitle appearance persists and late HLS track updates preserve the selected option', async()=>{
-  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; let player;
+  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; w.scrollTo=()=>{}; let player;
   w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();};
   class Hls{constructor(){player=this;this.listeners={}} static isSupported(){return true} loadSource(){} attachMedia(){} on(e,f){this.listeners[e]=f} destroy(){} emit(e,d){this.listeners[e]?.(e,d)}}
   Hls.Events={MANIFEST_PARSED:'manifest',SUBTITLE_TRACKS_UPDATED:'subs',AUDIO_TRACKS_UPDATED:'audio',ERROR:'error'};w.Hls=Hls;
@@ -128,14 +129,14 @@ test('subtitle appearance persists and late HLS track updates preserve the selec
 });
 
 test('sign out failure stays visible and reports an error; successful sign out hides app',async()=>{
- const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; let fail=true;
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; w.scrollTo=()=>{}; let fail=true;
  w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.Hls=class{};
  w.fetch=async url=>{if(url==='/api/logout' && fail)throw Error('offline');return {ok:true,json:async()=>url==='/api/session'?{authenticated:true}:{sections:[]}}};
  try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();w.document.getElementById('logout').click();await tick();assert.match(w.document.getElementById('playError').textContent,/Sign out failed/);assert.equal(w.document.getElementById('app').classList.contains('hidden'),false);fail=false;w.document.getElementById('logout').click();await tick();assert.ok(w.document.getElementById('app').classList.contains('hidden'));assert.ok(w.document.getElementById('mainNav').classList.contains('hidden'));}finally{w.close()}
 });
 
 test('login, direct stream save and remove work through their controls',async()=>{
- const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; let password;
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; w.scrollTo=()=>{}; let password;
  w.Hls=class{};w.fetch=async(url,opts={})=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:false};if(url==='/api/discover')return {sections:[]};if(url==='/api/login'){password=JSON.parse(opts.body).password;return {ok:true}}; throw Error('unexpected')}});
  try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();assert.ok(w.document.getElementById('app').classList.contains('hidden'));w.document.getElementById('password').value='test password';w.document.getElementById('loginForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();assert.equal(password,'test password');assert.equal(w.document.getElementById('app').classList.contains('hidden'),false);
  w.document.getElementById('title').value='My video';w.document.getElementById('url').value='https://example.com/video.mp4';w.document.getElementById('save').click();assert.equal(w.document.querySelectorAll('#list .item').length,1);w.document.querySelector('#list .secondary').click();assert.equal(w.document.querySelectorAll('#list .item').length,0);
@@ -143,8 +144,22 @@ test('login, direct stream save and remove work through their controls',async()=
 });
 
 test('Movy stream requests its own session-bound provider subtitle',async()=>{
- const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window;let captionRequest;
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window; w.scrollTo=()=>{};let captionRequest;
  w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.HTMLMediaElement.prototype.play=function(){return Promise.resolve()};w.Hls=class{static isSupported(){return false}};
  w.fetch=async(url,opts={})=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true};if(url==='/api/search')return {results:[{id:'a',title:'Film',type:'movie',source:'moviebox'}],providers:[]};if(url==='/api/resolve')return {title:'Film',providers:[],streams:[{provider:'movy:miami',format:'hls',url:'/media/a',captionId:'caption-id'}]};if(url==='/api/movy-subtitle'){captionRequest=JSON.parse(opts.body);return {url:'/caption/a'}};return {sections:[]}}});
  try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();w.document.getElementById('query').value='Film';w.document.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();w.document.querySelector('.result').click();w.document.getElementById('findStreams').click();await tick();w.document.querySelector('#streams button').click();await tick();await tick();assert.equal(captionRequest.id,'caption-id');assert.equal(w.document.getElementById('subtitles').value,'external');}finally{w.close()}
+});
+
+test('search results are ranked and selecting one opens the player and auto-resolves without saving',async()=>{
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window;w.scrollTo=()=>{};let resolves=0;
+ w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.HTMLMediaElement.prototype.play=function(){return Promise.resolve()};w.Hls=class{static isSupported(){return false}};
+ w.fetch=async url=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true};if(url==='/api/search')return {results:[{id:'b',title:'Film Again',type:'series',year:'2020',source:'moviebox'},{id:'a',title:'Film',type:'movie',year:'2021',source:'moviebox',poster:'https://images.metahub.space/poster/small/tt123/img'}]};if(url==='/api/resolve'){resolves++;return {title:'Film',providers:[],streams:[{provider:'moviebox',format:'file',quality:720,url:'/media/a'}]}};return {sections:[]}}});
+ try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();w.document.getElementById('query').value='Film';w.document.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();assert.equal(w.document.querySelector('.result strong').textContent,'Film');assert.equal(w.document.querySelectorAll('.result').length,2);assert.ok(w.document.querySelector('.result img'));w.document.querySelector('.result').click();await tick();assert.equal(resolves,1);assert.equal(w.document.getElementById('view-watch').classList.contains('hidden'),false);assert.equal(w.document.getElementById('view-search').classList.contains('hidden'),true);assert.match(w.document.getElementById('video').src,/media\/a/);assert.equal(w.localStorage.getItem('solo-watchlist'),null);w.document.getElementById('backToSearch').click();assert.equal(w.document.getElementById('view-search').classList.contains('hidden'),false);}finally{w.close()}
+});
+
+test('category navigation uses live catalog sections and play episode resolves selected numbers',async()=>{
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window;w.scrollTo=()=>{};let requests=[];
+ w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.HTMLMediaElement.prototype.play=function(){return Promise.resolve()};w.Hls=class{static isSupported(){return false}};
+ w.fetch=async(url,opts={})=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true};if(url==='/api/discover')return {sections:[{id:'popular-movies',items:[]},{id:'anime',items:[{title:'Anime from catalog',type:'series'}]}]};if(url==='/api/search')return {results:[{id:'a',title:'Show',type:'series',source:'moviebox'}]};if(url==='/api/episodes')return {source:'fixture',episodes:[{season:1,episode:1,title:'One'},{season:1,episode:2,title:'Two'}]};if(url==='/api/resolve'){requests.push(JSON.parse(opts.body));return {title:'Show',providers:[],streams:[{provider:'moviebox',format:'file',url:'/media/a'}]}};throw Error('unexpected')}});
+ try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();await tick();w.location.hash='#anime';w.dispatchEvent(new w.HashChangeEvent('hashchange'));assert.equal(w.document.querySelector('#anime .catalog-card strong').textContent,'Anime from catalog');assert.ok(w.document.getElementById('popular-movies').classList.contains('hidden'));w.document.getElementById('query').value='Show';w.document.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();w.document.querySelector('.result').click();await tick();await tick();assert.equal(requests[0].episode,1);const ep=w.document.getElementById('episodeSelect');ep.value='1:2';ep.dispatchEvent(new w.Event('change'));w.document.getElementById('findStreams').click();await tick();assert.equal(requests.at(-1).episode,2);assert.equal(w.document.getElementById('playing').textContent,'Show S1 E2');}finally{w.close()}
 });

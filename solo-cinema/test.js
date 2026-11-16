@@ -295,7 +295,7 @@ test('discovery loads bounded Cinemeta catalogs with independent errors and cach
     urls.push(url); if(url.includes('/series/year/')) throw Error('offline');
     return {json:{metas:[{id:'tt123',name:'A Film',releaseInfo:'2026',poster:'https://images.metahub.space/poster.jpg'},{id:'bad',name:'Invalid'}]}};
   }});
-  const sections=await discover(); assert.equal(sections.length,6); assert.equal(sections.find(s=>s.id==='new-series').error,'Catalog unavailable'); assert.equal(sections[0].items.length,1); assert.equal(sections[0].items[0].poster,'https://images.metahub.space/poster.jpg'); assert.ok(urls.some(u=>u.includes('/year/genre=2026.json'))); await discover(); assert.equal(urls.length,12);
+  const sections=await discover(); assert.equal(sections.length,7); assert.equal(sections.find(s=>s.id==='new-series').error,'Catalog unavailable'); assert.equal(sections[0].items.length,1); assert.equal(sections[0].items[0].poster,'https://images.metahub.space/poster.jpg'); assert.ok(urls.some(u=>u.includes('/year/genre=2026.json'))); await discover(); assert.equal(urls.length,14);
 });
 
 test('Movy decrypts independent Python protocol vector and rejects stale seeds',()=>{
@@ -328,4 +328,25 @@ test('Movy enforces a total lookup budget instead of walking indefinitely',async
  const {createMovy}=require('./movy'),{safeUrl}=require('./network');let clock=1;let calls=0;
  const resolve=createMovy({safeUrl,now:()=>clock,request:async url=>{calls++;clock+=4000;if(url.includes('www.movy.sx'))return {text:'<script id="__NEXT_DATA__">'+JSON.stringify({props:{pageProps:{details:{title:'Test',year:2026}}}})+'</script>'};if(url.includes('/seed?'))return {json:{seed:'test-seed'}};throw Error('failed');}});
  await assert.rejects(resolve({tmdbId:'1368337',type:'movie'},1,1),/timed out/);assert.equal(calls,3);
+});
+
+test('Cinemeta search returns both media types with safe poster URLs',async()=>{
+ const search=require('./catalog-search')({request:async url=>({json:{metas:[{id:url.includes('/movie/')?'tt123':'tt456',name:'Title',releaseInfo:'2023'}]}})});
+ const results=await search('Title');assert.deepEqual(results.map(r=>r.type),['movie','series']);assert.equal(results[0].poster,'https://images.metahub.space/poster/small/tt123/img');
+});
+
+test('Cinemeta title uses only an unambiguous exact MovieBox year match',async()=>{
+ const {resolveProviders}=require('./providers');let matched;const moviebox={search:async()=>[{title:'Film',type:'movie',year:'2020',subjectId:'yes'},{title:'Film',type:'movie',year:'2019',subjectId:'no'}],resolve:async item=>{matched=item;return {streams:[]}}};
+ const providers={vaplayer:async()=>({streams:[]}),vidsrc:async()=>({streams:[]})};await resolveProviders({moviebox,providers,item:{source:'cinemeta',title:'Film',type:'movie',year:'2020'},season:1,episode:1});assert.equal(matched.subjectId,'yes');
+ matched=null;await resolveProviders({moviebox,providers,item:{source:'cinemeta',title:'Film',type:'movie',year:''},season:1,episode:1});assert.equal(matched,null);
+});
+
+test('7Movies VidLink adapter parses quality variants, fixed header allowlist and captions',async()=>{
+ const {safeUrl}=require('./network');let urls=[];const resolve=require('./vidlink')({safeUrl,request:async(url)=>{urls.push(url);if(url.includes('enc-dec.app')) return {json:{result:'abc_123'}};return {json:{stream:{headers:{Referer:'https://vidlink.pro/','Authorization':'secret'},qualities:{720:{url:'https://cdn.example/video',type:'mp4',headers:{Origin:'https://vidlink.pro'}},'1080p':{url:'https://127.0.0.1/video'}},playlist:'https://cdn.example/hls',captions:[{language:'English',url:'https://cdn.example/sub.vtt'}]}}};}});
+ const r=await resolve({tmdbId:'123',type:'series'},2,3);assert.equal(r.streams.length,2);assert.equal(r.streams[0].quality,720);assert.equal(r.streams[0].referer,'https://vidlink.pro/');assert.equal(r.streams[0].origin,'https://vidlink.pro');assert.equal(r.streams[0].authorization,undefined);assert.equal(r.streams[1].format,'hls');assert.equal(r.captionInfo.url,'https://cdn.example/sub.vtt');assert.match(urls[1],/\/tv\/abc_123\/2\/3$/);
+});
+
+test('metadata prefers exact release year over an undated namesake',async()=>{
+ const enrich=require('./metadata')({request:async(url)=>url.includes('/catalog/')?{json:{metas:[{name:'Film',id:'tt1'},{name:'Film',id:'tt2',releaseInfo:'2020'}]}}:{json:{meta:{id:'tt2',moviedb_id:123}}}});
+ const item=await enrich({title:'Film',type:'movie',year:'2020'});assert.equal(item.imdbId,'tt2');assert.equal(item.tmdbId,'123');
 });

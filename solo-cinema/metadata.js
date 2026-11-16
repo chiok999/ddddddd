@@ -10,7 +10,8 @@ module.exports = function createMetadata({ request }) {
       const result = await request(`https://v3-cinemeta.strem.io/catalog/${type}/top/search=${encodeURIComponent(title)}.json`);
       const hits = Array.isArray(result.json?.metas) ? result.json.metas : [];
       // Only exact title and, when supplied by both sources, exact release year.
-      const matches = hits.filter(hit => norm(hit.name) === norm(title) && (!item.year || !String(hit.releaseInfo || hit.year || '').match(/\d{4}/) || String(hit.releaseInfo || hit.year).match(/\d{4}/)[0] === item.year));
+      let matches = hits.filter(hit => norm(hit.name) === norm(title) && (!item.year || !String(hit.releaseInfo || hit.year || '').match(/\d{4}/) || String(hit.releaseInfo || hit.year).match(/\d{4}/)[0] === String(item.year)));
+      if(item.year) { const exactYear=matches.filter(hit=>(String(hit.releaseInfo||hit.year||'').match(/\d{4}/)||[])[0]===String(item.year)); if(exactYear.length) matches=exactYear; }
       if (matches.length !== 1) return out;
       const hit = matches[0];
       out.imdbId = /^tt\d{1,12}$/.test(hit.id || '') ? hit.id : null;

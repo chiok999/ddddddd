@@ -8,7 +8,7 @@ module.exports = function createMoviebox({ request, safeUrl }) {
   let token = null, expires = 0;
   async function bff(route, payload, refresh = false) {
     if (refresh || !token || expires < Date.now()) {
-      const response = await request(`${base}/home?host=moviebox.ph`, { headers });
+      const response = await request(`${base}/home?host=moviebox.ph`, { headers, timeoutMs:7000 });
       const xuser = response.headers.get('x-user');
       try { token = JSON.parse(xuser || '{}').token; } catch { token = null; }
       if (!token) {
@@ -20,7 +20,7 @@ module.exports = function createMoviebox({ request, safeUrl }) {
       expires = Date.now() + 50 * 60000;
     }
     try {
-      return await request(`${base}${route}`, { method: payload ? 'POST' : 'GET', headers: { ...headers, authorization: `Bearer ${token}` }, body: payload ? JSON.stringify(payload) : undefined });
+      return await request(`${base}${route}`, { timeoutMs:7000, method: payload ? 'POST' : 'GET', headers: { ...headers, authorization: `Bearer ${token}` }, body: payload ? JSON.stringify(payload) : undefined });
     } catch (e) {
       if (e.status === 401 && !refresh) return bff(route, payload, true);
       throw e;

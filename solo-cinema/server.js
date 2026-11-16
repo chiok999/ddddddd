@@ -50,11 +50,13 @@ async function providerRequest(url, opts = {}) {
   return { headers:response.headers, json, text };
 }
 const discover = require('./discover')({request:providerRequest});
+const catalogSearch = require('./catalog-search')({request:providerRequest});
 const moviebox = require('./moviebox')({ request:providerRequest, safeUrl });
 const kisskh = require('./kisskh')({ request:providerRequest, safeUrl });
 const { createProviders, resolveProviders } = require('./providers');
 const providers = createProviders({ request:providerRequest, safeUrl });
 const movy = require('./movy').createMovy({request:providerRequest,safeUrl});
+const vidlink = require('./vidlink')({request:providerRequest,safeUrl});
 const episodes = require('./episodes')({ request:providerRequest });
 const enrich = require('./metadata')({ request:providerRequest });
 async function enrichItem(entry) {
@@ -109,19 +111,27 @@ const server = http.createServer(async (req, res) => {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const { query } = await body(req);
       if (typeof query !== 'string' || !query.trim() || query.length > 150) fail('Enter a title up to 150 characters');
-      const searches = await Promise.allSettled([moviebox.search(query), kisskh.search(query)]);
+      const searches = await Promise.allSettled([moviebox.search(query), kisskh.search(query), catalogSearch(query)]);
       if (searches.every(s => s.status === 'rejected')) {
-        const detail=searches.map((s,i)=>`${i===0?'MovieBox':'KissKh'}: ${s.reason?.code==='KISSKH_SEARCH_FAILED' ? s.reason.reasons.join(', ') : describe(s.reason)}`).join(' · ');
+        const detail=searches.map((s,i)=>`${['MovieBox','KissKh','Cinemeta'][i]}: ${s.reason?.code==='KISSKH_SEARCH_FAILED' ? s.reason.reasons.join(', ') : describe(s.reason)}`).join(' · ');
         return send(res, 502, {error:`Search unavailable (${detail})`});
       }
-      const results = searches.flatMap((s,i) => s.status === 'fulfilled' ? s.value.map(item => ({...item, source: i===0 ? 'moviebox' : 'kisskh'})) : []);
-      const searchStatus = searches.map((s,i) => ({ provider: i===0 ? 'moviebox' : 'kisskh', error: s.status === 'rejected' ? `Search unavailable (${s.reason?.code==='KISSKH_SEARCH_FAILED' ? s.reason.reasons.join(', ') : describe(s.reason)})` : null }));
+      const results = searches.flatMap((s,i) => s.status === 'fulfilled' ? s.value.map(item => ({...item, source: ['moviebox','kisskh','cinemeta'][i]})) : []);
+      // Merge only unambiguous exact title/type/year matches; retain distinct remakes.
+      const norm=s=>String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+      const metadata=results.filter(x=>x.source==='cinemeta'), merged=new Set();
+      for(const item of results.filter(x=>x.source==='moviebox' && x.year)) {
+        const matches=metadata.filter(m=>m.type===item.type && m.year===item.year && norm(m.title)===norm(item.title) && (!item.imdbId || item.imdbId===m.imdbId));
+        if(matches.length===1){item.imdbId=item.imdbId||matches[0].imdbId;item.poster=matches[0].poster;merged.add(matches[0]);}
+      }
+      const seenTitles=new Set(); const uniqueResults=results.filter(x=>{if(merged.has(x)) return false; if(x.source!=='moviebox' || !x.year) return true; const key=`${norm(x.title)}:${x.type}:${x.year}`; if(seenTitles.has(key)) return false; seenTitles.add(key); return true;});
+      const searchStatus = searches.map((s,i) => ({ provider: ['moviebox','kisskh','cinemeta'][i], error: s.status === 'rejected' ? `Search unavailable (${s.reason?.code==='KISSKH_SEARCH_FAILED' ? s.reason.reasons.join(', ') : describe(s.reason)})` : null }));
       for (const [id, entry] of catalog) if (entry.expires < Date.now()) catalog.delete(id);
       if (catalog.size > 3000) fail('Too many searches; restart the server');
-      const entries = results.map(item => {
+      const entries = uniqueResults.map(item => {
         const id = crypto.randomBytes(20).toString('base64url');
         catalog.set(id, { item, sid, expires:Date.now() + 3600000 });
-        return { id, title:item.title, type:item.type, year:item.year, overview:item.overview, source:item.source };
+        return { id, title:item.title, type:item.type, year:item.year, overview:item.overview, source:item.source, poster:item.poster || null };
       });
       return send(res, 200, { results:entries, providers:searchStatus });
     }
@@ -146,15 +156,15 @@ const server = http.createServer(async (req, res) => {
       const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
       return send(res,200,{url:`/caption/${id}`});
     }
-    if ((url.pathname === '/api/moviebox-subtitle' || url.pathname === '/api/movy-subtitle') && req.method === 'POST') {
+    if ((url.pathname === '/api/moviebox-subtitle' || url.pathname === '/api/movy-subtitle' || url.pathname === '/api/vidlink-subtitle') && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
       const data=await body(req); const source=captionSources.get(data.id);
       if (!source || source.sid!==sid || source.expires<Date.now()) return send(res,404,{error:'Subtitle source expired'});
-      const expected=url.pathname === '/api/movy-subtitle' ? 'movy' : 'moviebox';
+      const expected=url.pathname === '/api/movy-subtitle' ? 'movy' : url.pathname === '/api/vidlink-subtitle' ? '7movies' : 'moviebox';
       if(source.provider!==expected) return send(res,404,{error:'Subtitle source expired'});
       let text;
-      if(expected==='movy') {
-        const response=await providerRequest(source.info.url,{headers:{referer:'https://www.movy.sx/',origin:'https://www.movy.sx','user-agent':'okhttp/4.12.0'}});
+      if(expected==='movy' || expected==='7movies') {
+        const response=await providerRequest(source.info.url,{headers:expected==='movy'?{referer:'https://www.movy.sx/',origin:'https://www.movy.sx','user-agent':'okhttp/4.12.0'}:{'user-agent':'okhttp/4.12.0'}});
         const raw=response.text.replace(/^\uFEFF/,'').trim();
         if(raw.includes('-->') && !/^<(!doctype|html)/i.test(raw)) {const converted=raw.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g,'$1.$2'); text=/^WEBVTT(?:\s|$)/i.test(converted)?converted:`WEBVTT\n\n${converted}`;}
       } else text=await moviebox.subtitle(source.info);
@@ -178,11 +188,11 @@ const server = http.createServer(async (req, res) => {
       if (selected.item.source === 'kisskh') {
         try { const r=await kisskh.resolve(selected.item,Number(data.season),Number(data.episode)); result={ streams:r.streams.map(s=>({...s,provider:'kisskh',referer:r.referer,origin:r.origin})), providers:[{provider:'kisskh',count:r.streams.length,error:null}] }; }
         catch (err) { result={streams:[],providers:[{provider:'kisskh',count:0,error:String(err?.message || 'Unavailable').slice(0,160)}]}; }
-      } else result = await resolveProviders({ moviebox, providers, movy, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
+      } else result = await resolveProviders({ moviebox, providers, movy, vidlink, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
       for (const [id, entry] of captionSources) if (entry.expires<Date.now()) captionSources.delete(id);
       const streams = result.streams.map(stream => {
         let captionId=null;
-        if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':'moviebox',expires:Date.now()+6*3600000}); }
+        if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
         return { provider:stream.provider, quality:stream.quality, format:stream.format, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent) };
       });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
