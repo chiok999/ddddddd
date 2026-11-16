@@ -15,6 +15,7 @@ const engine = require('../../lib/movies/adapter');
 const host = require('../../lib/movies/host');
 const selections = require('../../lib/selections');
 const diskSpace = require('../../lib/diskSpace');
+const { muxSubtitle } = require('../../lib/movies/subtitleMux');
 const jobQueue = require('../../lib/jobQueue');
 const { getTempDir, createTempFilePath, deleteTempFile, holdTemp } = require('../../lib/tempManager');
 const { safeErrorMessage } = require('../../lib/userErrors');
@@ -40,22 +41,6 @@ function parseArgs(args) {
 
 const help = (P) => `Usage: ${P}kk <title> [e5 | e1-3]`;
 
-async function sendSubtitle(sock, chatId, msg, episodeId, baseName) {
-  if ((MOVIES().subtitles ?? true) === false) return;
-  const dest = createTempFilePath('kisskh_sub', 'srt');
-  const release = holdTemp(path.basename(dest, '.srt'));
-  try {
-    const sub = await kisskh.subtitle(episodeId, 'english');
-    if (!sub) return;
-    fs.writeFileSync(dest, sub.text, 'utf8');
-    await host.sendSubtitle(sock, chatId, msg, { file: dest, name: baseName, language: sub.language });
-  } catch (e) {
-    log.debug(`${baseName} · no subtitle (${e.message})`);
-  } finally {
-    deleteTempFile(dest);
-    release();
-  }
-}
 
 /** Resolve the stream, download it, send the file (+ subtitle). Throws on failure. */
 async function fetchEpisode(sock, msg, chatId, show, ep) {
@@ -70,6 +55,13 @@ async function fetchEpisode(sock, msg, chatId, show, ep) {
   });
   const releaseHold = holdTemp(path.basename(dest, path.extname(dest)));
   let file = dest;
+  let subtitleFile = null;
+  let muxedFile = null;
+  let subHold = null;
+  let muxHold = null;
+  let muxReservation = null;
+  let sub = null;
+  let embedded = false;
   try {
     const saved = await engine.download({ ...src, quality }, dest);
     file = (saved && saved.file) || dest;
@@ -77,16 +69,56 @@ async function fetchEpisode(sock, msg, chatId, show, ep) {
     if (sizeMB > host.maxDownloadMB()) {
       throw Object.assign(new Error(`file is ${Math.round(sizeMB)} MB`), { code: 'TOO_BIG', sizeMB });
     }
+    // A source's subtitle count can be absent or stale, so check each episode.
+    // If muxing is unavailable, keep the downloaded video and send the subtitle
+    // separately rather than silently losing it.
+    if ((MOVIES().subtitles ?? true) !== false) {
+      try {
+        sub = await kisskh.subtitle(ep.id, 'english');
+        if (sub?.text) {
+          subtitleFile = createTempFilePath('movie_sub', 'srt');
+          subHold = holdTemp(path.basename(subtitleFile, '.srt'));
+          fs.writeFileSync(subtitleFile, sub.text, 'utf8');
+          const ffmpeg = host.ffmpegPath();
+          if (ffmpeg) {
+            muxedFile = createTempFilePath('movie_sub', 'mp4');
+            muxHold = holdTemp(path.basename(muxedFile, '.mp4'));
+            // The completed download is now accounted for on disk. Reserve a
+            // second copy for FFmpeg without double-counting the old estimate.
+            reservation.release();
+            muxReservation = diskSpace.reserveSpace(getTempDir(), sizeMB + 8, {
+              label: `kisskh-subtitle:${label}`,
+              tagDir: path.dirname(muxedFile),
+              tagPrefix: path.basename(muxedFile, '.mp4'),
+            });
+            await muxSubtitle({ ffmpeg, input: file, subtitle: subtitleFile, output: muxedFile });
+            if (fs.statSync(muxedFile).size / 1048576 > host.maxDownloadMB()) {
+              throw new Error('subtitled output exceeds download cap');
+            }
+            embedded = true;
+          }
+        }
+      } catch (e) {
+        log.warn(`${label} · subtitle embedding unavailable; using separate subtitle (${e.message})`);
+      }
+    }
+    const deliveredFile = embedded ? muxedFile : file;
     await host.deliver(sock, chatId, msg, {
-      file,
+      file: deliveredFile,
       title: label,
-      caption: `🎬 *${show.title}${show.year ? ` (${show.year})` : ''}*${show.isMovie ? '' : `\nEpisode ${pad(ep.number)}`}\n${host.fmtMB(fs.statSync(file).size)}`,
+      caption: `🎬 *${show.title}${show.year ? ` (${show.year})` : ''}*${show.isMovie ? '' : `\nEpisode ${pad(ep.number)}`}\n${host.fmtMB(fs.statSync(deliveredFile).size)}`,
     });
-    if (ep.subs > 0) await sendSubtitle(sock, chatId, msg, ep.id, label);
+    if (!embedded && subtitleFile && sub) {
+      try { await host.sendSubtitle(sock, chatId, msg, { file: subtitleFile, name: label, language: sub.language }); }
+      catch (e) { log.debug(`${label} · subtitle delivery failed (${e.message})`); }
+    }
   } finally {
     await host.release(file).catch(() => false);
-    for (const f of new Set([dest, file])) { try { fs.rmSync(f, { force: true }); } catch { /* ignore */ } }
+    for (const f of new Set([dest, file, subtitleFile, muxedFile].filter(Boolean))) { try { fs.rmSync(f, { force: true }); } catch { /* ignore */ } }
+    muxReservation?.release();
     reservation.release();
+    subHold?.();
+    muxHold?.();
     releaseHold();
   }
 }
@@ -199,4 +231,5 @@ module.exports = {
   },
 
   _parseArgs: parseArgs,
+  _fetchEpisode: fetchEpisode,
 };

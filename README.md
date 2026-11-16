@@ -29,6 +29,14 @@ Interactive title and quality choices use a tap selector or a prefixed numbered 
 
 `.dramabox <title|bookId> [episode]` searches DramaBox by name (reply `.1`, `.2`… to pick) or takes a book ID directly, then downloads the episode (default `1`) and sends it as a video, with a hint for the next episode. The old Keith resolver it used was deleted by its owner, which is why the command stopped working; it now uses the public Sansekai DramaBox API (`DRAMABOX_API_BASE` to override). Episodes stream internet → disk → WhatsApp and are never loaded into memory.
 
+### KissKh subtitles
+
+`.kk` embeds available English subtitles as a selectable MP4 track for movies
+and episodes when FFmpeg and sufficient disk space are available. Video and
+audio are copied without re-encoding. If embedding fails, the video is sent
+with a separate subtitle file instead; if no subtitle is available, the video
+is sent on its own. Subtitle-track display depends on the recipient's player.
+
 ### Video sites and YouTube
 
 `.song` and `.video` ask the Gronka API (`https://api.gronka.dev`) for one
