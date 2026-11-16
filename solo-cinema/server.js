@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { Readable } = require('node:stream');
 const { Agent, fetch } = require('undici');
 const { safeUrl, publicLookup, getRemote } = require('./network');
+const { describe } = require('./diagnostics');
 
 // Botkeep writes variables to .env rather than exporting them. Node loads the
 // file from the process working directory without overriding real environment
@@ -100,9 +101,12 @@ const server = http.createServer(async (req, res) => {
       const { query } = await body(req);
       if (typeof query !== 'string' || !query.trim() || query.length > 150) fail('Enter a title up to 150 characters');
       const searches = await Promise.allSettled([moviebox.search(query), kisskh.search(query)]);
-      if (searches.every(s => s.status === 'rejected')) fail('MovieBox and KissKh search are unavailable');
+      if (searches.every(s => s.status === 'rejected')) {
+        const detail=searches.map((s,i)=>`${i===0?'MovieBox':'KissKh'}: ${s.reason?.code==='KISSKH_SEARCH_FAILED' ? s.reason.reasons.join(', ') : describe(s.reason)}`).join(' · ');
+        return send(res, 502, {error:`Search unavailable (${detail})`});
+      }
       const results = searches.flatMap((s,i) => s.status === 'fulfilled' ? s.value.map(item => ({...item, source: i===0 ? 'moviebox' : 'kisskh'})) : []);
-      const searchStatus = searches.map((s,i) => ({ provider: i===0 ? 'moviebox' : 'kisskh', error: s.status === 'rejected' ? 'Search unavailable' : null }));
+      const searchStatus = searches.map((s,i) => ({ provider: i===0 ? 'moviebox' : 'kisskh', error: s.status === 'rejected' ? `Search unavailable (${s.reason?.code==='KISSKH_SEARCH_FAILED' ? s.reason.reasons.join(', ') : describe(s.reason)})` : null }));
       for (const [id, entry] of catalog) if (entry.expires < Date.now()) catalog.delete(id);
       if (catalog.size > 3000) fail('Too many searches; restart the server');
       const entries = results.map(item => {

@@ -222,3 +222,12 @@ test('startup loads Botkeep .env and exported environment takes precedence', asy
     await run({...baseEnv,CINEMA_PASSWORD:'exported-value-123'},'exported-value-123','from-env-file-123');
   } finally { fs.rmSync(dir,{recursive:true,force:true}); }
 });
+
+test('search diagnostics show safe failure codes without exposing provider URLs', async () => {
+  const {describe}=require('./diagnostics');
+  assert.equal(describe(Object.assign(new Error('secret https://example.com/?token=x'),{status:403})), 'HTTP 403');
+  assert.equal(describe(Object.assign(new Error('fetch failed'),{cause:{code:'ENOTFOUND'}})), 'ENOTFOUND');
+  assert.equal(describe(new Error('secret https://example.com/?token=x')), 'network or provider error');
+  const kk=require('./kisskh')({request:async()=>{ throw Object.assign(new Error('sensitive url'),{status:403}); },safeUrl:u=>new URL(u)});
+  await assert.rejects(kk.search('Example'),err=>{ assert.equal(err.code,'KISSKH_SEARCH_FAILED'); assert.deepEqual(err.reasons,['HTTP 403']); return true; });
+});

@@ -13,7 +13,7 @@ $('loginForm').onsubmit = async e => { e.preventDefault(); $('loginError').textC
 $('logout').onclick = async () => { fallback.cancel(); current=null; pendingFailure=null; await post('/api/logout', {}); if (hls) hls.destroy(); $('video').pause(); $('video').removeAttribute('src'); $('video').load(); loggedIn(false); };
 function render() {
   const list=load('solo-watchlist'); $('empty').classList.toggle('hidden', list.length > 0); $('list').replaceChildren();
-  list.forEach((item, index) => { const div=document.createElement('div'); div.className='item'; const title=document.createElement('strong'); title.textContent=item.title; const note=document.createElement('small'); note.textContent=item.kind==='catalog' ? `${item.type} · ${item.year || 'year unknown'}` : 'Saved stream'; const play=document.createElement('button'); play.textContent='Play'; play.onclick=()=>{ if(item.kind==='catalog'){ $('query').value=item.title; $('searchForm').requestSubmit(); window.scrollTo({top:0,behavior:'smooth'}); } else fallback.play([item]); }; const del=document.createElement('button'); del.className='secondary'; del.textContent='Remove'; del.onclick=()=>{ list.splice(index,1); save('solo-watchlist',list); render(); }; div.append(title,note,play,del); $('list').append(div); });
+  list.forEach((item, index) => { const div=document.createElement('div'); div.className='item'; const title=document.createElement('strong'); title.textContent=item.title; const note=document.createElement('small'); note.textContent=item.kind==='catalog' ? `${item.type} · ${item.year || 'year unknown'}` : 'Saved stream'; const play=document.createElement('button'); play.textContent='Play'; play.onclick=()=>{ if(item.kind==='catalog'){ $('query').value=item.title; searchTitles(item.title,item); window.scrollTo({top:0,behavior:'smooth'}); } else fallback.play([item]); }; const del=document.createElement('button'); del.className='secondary'; del.textContent='Remove'; del.onclick=()=>{ list.splice(index,1); save('solo-watchlist',list); render(); }; div.append(title,note,play,del); $('list').append(div); });
 }
 function formItem() { return { title:$('title').value.trim(), url:$('url').value.trim(), format:$('format').value }; }
 $('save').onclick=()=>{ if (!$('sourceForm').reportValidity()) return; const item=formItem(), list=load('solo-watchlist'); if (!list.some(x=>x.kind!=='catalog' && x.url===item.url)) list.unshift(item); save('solo-watchlist', list); render(); };
@@ -54,10 +54,19 @@ $('video').ontimeupdate=()=>{ if(!current || Date.now()-lastSave<5000) return; l
 $('video').onerror=()=>{ if(current && pendingFailure && $('video').currentSrc) { const fail=pendingFailure; pendingFailure=null; fail(); } };
 api('/api/session').then(x=>loggedIn(x.authenticated)).catch(()=>loggedIn(false));
 
-$('searchForm').onsubmit = async e => {
-  e.preventDefault(); const sequence=++searchSequence; selected=null; $('searchError').textContent=''; $('results').replaceChildren(); $('selection').classList.add('hidden'); $('streams').replaceChildren();
+async function selectTitle(item) {
+  selected=item; $('selectedTitle').textContent=item.title; $('overview').textContent=item.overview;
+  $('episodeFields').classList.toggle('hidden', item.type!=='series'); $('episodeCatalog').classList.add('hidden'); $('selection').classList.remove('hidden'); $('streams').replaceChildren(); $('providersNotice').textContent='';
+  if(item.type==='series') {
+    $('season').value='1'; $('episode').value='1';
+    $('episodeNotice').textContent='Loading episode list…'; $('episodeCatalog').classList.remove('hidden'); $('episodeSelect').replaceChildren();
+    try { const data=await post('/api/episodes',{id:item.id}); if(selected!==item) return; for(const e of data.episodes){ const option=new Option(`S${e.season} E${e.episode} · ${e.title}`, `${e.season}:${e.episode}`); $('episodeSelect').add(option); } $('episodeNotice').textContent=data.episodes.length ? `Episode data from ${data.source}; you can also enter numbers below.` : 'No episode list available; enter numbers below.'; if(data.episodes.length) $('episodeSelect').dispatchEvent(new Event('change')); } catch { if(selected===item) $('episodeNotice').textContent='Episode list unavailable; enter numbers below.'; }
+  }
+}
+async function searchTitles(query, saved = null) {
+  const sequence=++searchSequence; selected=null; $('searchError').textContent=''; $('results').replaceChildren(); $('selection').classList.add('hidden'); $('streams').replaceChildren();
   try {
-    const data=await post('/api/search', {query:$('query').value.trim()});
+    const data=await post('/api/search', {query});
     if(sequence!==searchSequence) return;
     $('searchError').textContent=(data.providers || []).filter(p=>p.error).map(p=>`${p.provider}: ${p.error}`).join(' · ');
     if(!data.results.length) { $('searchError').textContent += ' No titles found.'; return; }
@@ -65,20 +74,21 @@ $('searchForm').onsubmit = async e => {
       const btn=document.createElement('button'); btn.className='result';
       const title=document.createElement('strong'); title.textContent=item.title;
       const meta=document.createElement('small'); meta.textContent=`${item.source || 'MovieBox'} · ${item.type === 'series' ? 'Series' : 'Movie'} · ${item.year || 'Year unknown'}`;
-      btn.append(title,meta); btn.onclick=async()=>{
-        selected=item; $('selectedTitle').textContent=item.title; $('overview').textContent=item.overview;
-        $('episodeFields').classList.toggle('hidden', item.type!=='series'); $('episodeCatalog').classList.add('hidden'); $('selection').classList.remove('hidden'); $('streams').replaceChildren(); $('providersNotice').textContent=''; $('searchError').textContent='';
-        if(item.type==='series') {
-          $('episodeNotice').textContent='Loading episode list…'; $('episodeCatalog').classList.remove('hidden'); $('episodeSelect').replaceChildren();
-          try { const data=await post('/api/episodes',{id:item.id}); if(selected!==item) return; for(const e of data.episodes){ const option=new Option(`S${e.season} E${e.episode} · ${e.title}`, `${e.season}:${e.episode}`); $('episodeSelect').add(option); } $('episodeNotice').textContent=data.episodes.length ? `Episode data from ${data.source}; you can also enter numbers below.` : 'No episode list available; enter numbers below.'; if(data.episodes.length) $('episodeSelect').dispatchEvent(new Event('change')); } catch { if(selected===item) $('episodeNotice').textContent='Episode list unavailable; enter numbers below.'; }
-        }
-      }; $('results').append(btn);
+      btn.append(title,meta); btn.onclick=()=>selectTitle(item); $('results').append(btn);
+    }
+    if(saved) {
+      const candidates=data.results.filter(item=>item.title===saved.title && item.type===saved.type && (!saved.year || item.year===saved.year));
+      const item=(saved.source && candidates.find(x=>x.source===saved.source)) || (candidates.length===1 ? candidates[0] : null);
+      if (!item) { $('searchError').textContent='Saved title not found unambiguously. Select a result above.'; return; }
+      await selectTitle(item);
+      if(sequence===searchSequence && selected===item) await findStreams(true);
     }
   } catch(err) { if(sequence===searchSequence) $('searchError').textContent=err.message; }
-};
-$('saveTitle').onclick=()=>{ if(!selected) return; const list=load('solo-watchlist'); if (!list.some(x=>x.kind==='catalog' && x.title===selected.title && x.year===selected.year && x.type===selected.type)) list.unshift({kind:'catalog',title:selected.title,year:selected.year,type:selected.type}); save('solo-watchlist',list); render(); };
+}
+$('searchForm').onsubmit=e=>{ e.preventDefault(); searchTitles($('query').value.trim()); };
+$('saveTitle').onclick=()=>{ if(!selected) return; const list=load('solo-watchlist'); if (!list.some(x=>x.kind==='catalog' && x.title===selected.title && x.year===selected.year && x.type===selected.type)) list.unshift({kind:'catalog',title:selected.title,year:selected.year,type:selected.type,source:selected.source}); save('solo-watchlist',list); render(); };
 $('episodeSelect').onchange=()=>{ const [s,e]=$('episodeSelect').value.split(':').map(Number); if(s && e){ $('season').value=s; $('episode').value=e; } };
-$('findStreams').onclick=async()=>{
+async function findStreams(autoplay = false) {
   if(!selected) return; const chosen=selected; $('searchError').textContent=''; $('streams').replaceChildren(); $('findStreams').disabled=true; $('findStreams').textContent='Looking for streams…';
   const season=Number($('season').value), episode=Number($('episode').value);
   try {
@@ -91,8 +101,9 @@ $('findStreams').onclick=async()=>{
       btn.onclick=()=>fallback.play([item,...items.filter((_,n)=>n!==i)]);
       $('streams').append(btn);
     }
-    if(items.length){ const auto=document.createElement('button'); auto.textContent='Play automatically →'; auto.onclick=()=>fallback.play(items); $('streams').prepend(auto); }
+    if(items.length){ const auto=document.createElement('button'); auto.textContent='Play automatically →'; auto.onclick=()=>fallback.play(items); $('streams').prepend(auto); if (autoplay) fallback.play(items); } else if(autoplay) $('playError').textContent='No streams available for this saved title.';
 
   } catch(err) { if(selected===chosen) $('searchError').textContent=err.message; }
   finally { $('findStreams').disabled=false; $('findStreams').textContent='Find available streams →'; }
-};
+}
+$('findStreams').onclick=()=>findStreams(false);
