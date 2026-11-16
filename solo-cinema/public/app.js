@@ -8,7 +8,10 @@ async function api(url, options = {}) {
   if (!response.ok) throw new Error(result.error || 'Request failed'); return result;
 }
 const post = (url, data) => api(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(data) });
-let route='home', resolveSequence=0;
+let route='home', resolveSequence=0, playerMode='vidrift';
+function setPlayerMode(mode){playerMode=mode; $('useDirect').classList.toggle('hidden',mode==='direct'); $('useVidrift').classList.toggle('hidden',mode!=='direct');}
+function clearEmbed(){const frame=$('vidrift'); frame.removeAttribute('src'); frame.classList.add('hidden'); $('embedNotice').classList.add('hidden');}
+function directControls(show){for(const id of ['directTransport','directPlayerbar','directHint']) $(id).classList.toggle('hidden',!show);}
 function showRoute(name, updateHash=true) {
   if(!['home','movies','shows','anime','search','watch','list'].includes(name)) name='home';
   const previous=route; route=name;
@@ -16,7 +19,7 @@ function showRoute(name, updateHash=true) {
   for(const id of ['home','search','watch','list']) $('view-'+id).classList.toggle('hidden',id!==view);
   document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===name));
   document.querySelectorAll('#catalogRows .catalog-section').forEach(el=>{ const groups={movies:['popular-movies','new-movies','top-rated'],shows:['popular-series','new-series'],anime:['anime','animation']}; el.classList.toggle('hidden',!!groups[name]&&!groups[name].includes(el.id)); });
-  if(previous==='watch' && view!=='watch') {++resolveSequence; fallback.cancel(); $('findStreams').disabled=false; $('video').pause();}
+  if(previous==='watch' && view!=='watch') {++resolveSequence; fallback.cancel(); clearEmbed(); directControls(true); $('findStreams').disabled=false; $('video').pause();}
   if(updateHash && location.hash!=='#'+name) location.hash=name;
   if(typeof window.scrollTo==='function') window.scrollTo(0,0);
 }
@@ -24,19 +27,20 @@ window.addEventListener('hashchange',()=>showRoute(location.hash.slice(1),false)
 $('backToSearch').onclick=()=>showRoute('search');
 function loggedIn(on) { $('login').classList.toggle('hidden', on); $('app').classList.toggle('hidden', !on); $('logout').classList.toggle('hidden', !on); $('mainNav').classList.toggle('hidden', !on); if (on) { render(); showRoute(location.hash.slice(1)||'home',false); loadDiscovery(); } }
 $('loginForm').onsubmit = async e => { e.preventDefault(); $('loginError').textContent = ''; try { await post('/api/login', {password:$('password').value}); $('password').value=''; loggedIn(true); } catch (err) { $('loginError').textContent=err.message; } };
-$('logout').onclick = async () => { try { await post('/api/logout', {}); } catch(err) { $('playError').textContent='Sign out failed: '+err.message; return; } ++searchSequence; ++resolveSequence; selected=null; episodes=[]; fallback.cancel(); current=null; pendingFailure=null; if(uploadUrl){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('server').replaceChildren(new Option('No sources yet','')); $('server').disabled=true; $('back10').disabled=true; $('forward10').disabled=true; updateNext(); if (hls) hls.destroy(); $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('playing').textContent='Nothing playing yet'; $('selection').classList.add('hidden'); $('results').replaceChildren(); $('streams').replaceChildren(); $('playError').textContent=''; loggedIn(false); };
+$('logout').onclick = async () => { try { await post('/api/logout', {}); } catch(err) { $('playError').textContent='Sign out failed: '+err.message; return; } ++searchSequence; ++resolveSequence; selected=null; episodes=[]; fallback.cancel(); clearEmbed(); directControls(true); current=null; pendingFailure=null; if(uploadUrl){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('server').replaceChildren(new Option('No sources yet','')); $('server').disabled=true; $('back10').disabled=true; $('forward10').disabled=true; updateNext(); if (hls) hls.destroy(); $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('playing').textContent='Nothing playing yet'; $('selection').classList.add('hidden'); $('results').replaceChildren(); $('streams').replaceChildren(); $('playError').textContent=''; loggedIn(false); };
 function render() {
   const list=load('solo-watchlist'); $('empty').classList.toggle('hidden', list.length > 0); $('list').replaceChildren();
   list.forEach((item, index) => { const div=document.createElement('div'); div.className='item'; const title=document.createElement('strong'); title.textContent=item.title; const note=document.createElement('small'); note.textContent=item.kind==='catalog' ? `${item.type} · ${item.year || 'year unknown'}` : 'Saved stream'; const play=document.createElement('button'); play.textContent='Play'; play.onclick=()=>{ if(item.kind==='catalog'){ $('query').value=item.title; showRoute('watch'); searchTitles(item.title,item); } else {showRoute('watch'); fallback.play([item]);} }; const del=document.createElement('button'); del.className='secondary'; del.textContent='Remove'; del.onclick=()=>{ list.splice(index,1); save('solo-watchlist',list); render(); }; div.append(title,note,play,del); $('list').append(div); });
 }
 function formItem() { return { title:$('title').value.trim(), url:$('url').value.trim(), format:$('format').value }; }
 $('save').onclick=()=>{ if (!$('sourceForm').reportValidity()) return; const item=formItem(), list=load('solo-watchlist'); if (!list.some(x=>x.kind!=='catalog' && x.url===item.url)) list.unshift(item); save('solo-watchlist', list); render(); };
-$('sourceForm').onsubmit=e=>{ e.preventDefault(); ++resolveSequence; selected=null; updateNext(); showRoute('watch'); $('selection').classList.add('hidden'); fallback.play([formItem()]); };
+$('sourceForm').onsubmit=e=>{ e.preventDefault(); ++resolveSequence; selected=null; clearEmbed(); directControls(true); setPlayerMode('direct'); updateNext(); showRoute('watch'); $('selection').classList.add('hidden'); fallback.play([formItem()]); };
 const fallback = createFallback((item, index, total, fail, isActive) => {
   $('playError').textContent=index ? `Trying another source (${index+1}/${total})…` : '';
   playItem(item, fail, index>0, isActive);
 }, () => { pendingFailure=null; $('playError').textContent='All selected sources failed. Choose another title or search again.'; });
 async function playItem(item, fail, isFallback = false, isActive = () => true) {
+  clearEmbed(); directControls(true); setPlayerMode('direct');
   if (!isFallback) $('playError').textContent=''; $('playing').textContent='Preparing…';
   try {
     const url = item.proxy || (await post('/api/source', {url:item.url, format:item.format})).url;
@@ -120,11 +124,11 @@ async function searchTitles(query, saved = null) {
   } catch(err) { if(sequence===searchSequence) { if(saved) showRoute('search'); $('searchError').textContent=err.message; $('resultCount').textContent='Search unavailable'; } }
 }
 $('searchForm').onsubmit=e=>{ e.preventDefault(); showRoute('search'); searchTitles($('query').value.trim()); };
-function openTitle(item){ fallback.cancel(); ++resolveSequence; if(hls){hls.destroy();hls=null;} current=null; pendingFailure=null; $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('placeholder').querySelector('p').textContent='Looking for a stream…'; $('playError').textContent=''; showRoute('watch'); selectTitle(item); findStreams(true); }
+function openTitle(item){ fallback.cancel(); clearEmbed(); directControls(true); setPlayerMode('vidrift'); ++resolveSequence; if(hls){hls.destroy();hls=null;} current=null; pendingFailure=null; $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('placeholder').querySelector('p').textContent='Looking for a stream…'; $('playError').textContent=''; showRoute('watch'); selectTitle(item); playVidrift(); }
 $('saveTitle').onclick=()=>{ if(!selected) return; const list=load('solo-watchlist'); if (!list.some(x=>x.kind==='catalog' && x.title===selected.title && x.year===selected.year && x.type===selected.type && x.source===selected.source)) list.unshift({kind:'catalog',title:selected.title,year:selected.year,type:selected.type,source:selected.source}); save('solo-watchlist',list); render(); };
 $('episodeSelect').onchange=()=>{ const [s,e]=$('episodeSelect').value.split(':').map(Number); if(s && e){ $('season').value=s; $('episode').value=e; } };
 async function findStreams(autoplay = false) {
-  if(!selected) return; const sequence=++resolveSequence; const chosen=selected; $('playError').textContent=''; $('streams').replaceChildren(); $('findStreams').disabled=true; $('findStreams').textContent='Looking for streams…';
+  if(!selected) return; setPlayerMode('direct'); const sequence=++resolveSequence; const chosen=selected; $('playError').textContent=''; $('streams').replaceChildren(); $('findStreams').disabled=true; $('findStreams').textContent='Looking for streams…';
   const season=Number($('season').value), episode=Number($('episode').value);
   try {
     const data=await post('/api/resolve',{id:chosen.id, season, episode});
@@ -142,7 +146,30 @@ async function findStreams(autoplay = false) {
   } catch(err) { if(selected===chosen && sequence===resolveSequence){ $('playError').textContent=err.message; $('placeholder').querySelector('p').textContent='Could not find a stream';} }
   finally { if(sequence===resolveSequence){$('findStreams').disabled=false; $('findStreams').textContent=chosen.type==='series'?'Play selected episode':'Play again';} }
 }
-$('findStreams').onclick=()=>findStreams(true);
+async function playVidrift(){
+  if(!selected) return;
+  setPlayerMode('vidrift'); const chosen=selected, sequence=++resolveSequence;
+  const season=Number($('season').value), episode=Number($('episode').value);
+  fallback.cancel(); clearEmbed(); if(hls){hls.destroy();hls=null;} current=null; pendingFailure=null;
+  $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden');
+  directControls(false); $('placeholder').classList.remove('hidden'); $('placeholder').querySelector('p').textContent='Opening VidRift…'; $('playError').textContent='';
+  $('findStreams').disabled=true; $('findStreams').textContent='Opening player…';
+  try {
+    const result=await post('/api/vidrift',{id:chosen.id,season,episode});
+    if(sequence!==resolveSequence || selected!==chosen || route!=='watch') return;
+    const url=new URL(result.url); if(url.origin!=='https://embed.vidrift.net' || !url.pathname.startsWith('/embed/')) throw Error('Invalid VidRift URL');
+    $('vidrift').src=url.href; $('vidrift').classList.remove('hidden'); $('placeholder').classList.add('hidden'); $('embedNotice').classList.remove('hidden');
+    $('providersNotice').textContent='VidRift manages its own servers in the player. Use Troy player instead to look for direct streams.';
+  } catch(err) {
+    if(sequence!==resolveSequence || selected!==chosen || route!=='watch') return;
+    directControls(true); $('playError').textContent=`VidRift could not be opened: ${err.message}. Looking for Troy sources…`; await findStreams(true);
+  } finally {
+    if(sequence===resolveSequence){$('findStreams').disabled=false; $('findStreams').textContent=chosen.type==='series'?'Play selected episode':'Play again';}
+  }
+}
+$('findStreams').onclick=()=>playerMode==='vidrift'?playVidrift():findStreams(true);
+$('useDirect').onclick=()=>{clearEmbed();directControls(true);findStreams(true);};
+$('useVidrift').onclick=()=>playVidrift();
 
 function updateNext(){
   const ctx=current?.context;
