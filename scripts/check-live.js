@@ -43,6 +43,6 @@ const samples = [
       console.log(`❌ ${label}: ${error.code} — ${error.userMessage || error.message}`);
     }
   }
-  console.log('\nMovie/series sources: send .providers in WhatsApp for the live status of the 12 engine providers.');
+  console.log('\nMovie/series sources: send .providers in WhatsApp for the live status of the engine providers.');
   process.exit(failed ? 1 : 0);
 })();
