@@ -80,3 +80,28 @@ test('series controls select low quality, seek and advance to the next episode',
     w.document.getElementById('nextEpisode').click(); await tick(); assert.equal(requests.at(-1).episode,2); w.document.getElementById('nextEpisode').click(); await tick(); assert.match(w.document.getElementById('playError').textContent,/No later episode/);
   } finally {dom.window.close();}
 });
+
+test('server selector switches returned sources at the current position and speed changes playback', async () => {
+  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}); const w=dom.window;
+  w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();};
+  w.Hls=class {static isSupported(){return false}};
+  w.fetch=async(url)=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true}; if(url==='/api/search')return {results:[{id:'a',title:'Film',type:'movie',source:'moviebox'}]}; if(url==='/api/resolve')return {title:'Film',providers:[],streams:[{provider:'moviebox',format:'file',quality:360,url:'/media/a'},{provider:'vidsrc',format:'file',quality:720,url:'/media/b'}]}; throw Error('unexpected');}});
+  try {
+    w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8')); w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8')); await tick();
+    w.document.getElementById('query').value='Film'; w.document.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true})); await tick(); w.document.querySelector('.result').click(); w.document.getElementById('findStreams').click(); await tick(); w.document.querySelector('#streams button').click(); await tick();
+    const video=w.document.getElementById('video'), server=w.document.getElementById('server'), speed=w.document.getElementById('speed'); assert.equal(server.options.length,2); assert.equal(server.disabled,false); video.currentTime=43; speed.value='1.5'; speed.dispatchEvent(new w.Event('change')); assert.equal(video.playbackRate,1.5);
+    server.value='1'; server.dispatchEvent(new w.Event('change')); await tick(); video.dispatchEvent(new w.Event('loadedmetadata')); assert.match(video.src,/\/media\/b$/); assert.equal(video.currentTime,43); assert.equal(server.value,'1'); assert.equal(video.playbackRate,1.5);
+  } finally {w.close();}
+});
+
+test('local subtitle upload converts SRT to a selectable VTT track', async () => {
+  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}); const w=dom.window; let blob;
+  w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();}; w.URL.createObjectURL=b=>{blob=b;return 'blob:https://cinema.example/subtitle'}; w.URL.revokeObjectURL=()=>{}; w.Hls=class{static isSupported(){return false}};
+  w.fetch=async(url)=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true}; if(url==='/api/source')return {url:'/media/direct'}; throw Error('unexpected');}});
+  try {
+    w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8')); w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8')); await tick();
+    w.document.getElementById('title').value='Test'; w.document.getElementById('url').value='https://example.com/file.mp4'; w.document.getElementById('sourceForm').dispatchEvent(new w.Event('submit',{cancelable:true})); await tick();
+    const input=w.document.getElementById('subtitleFile'); Object.defineProperty(input,'files',{configurable:true,value:[{name:'test.srt',size:100,text:async()=> '1\n00:00:01,000 --> 00:00:02,000\nHello'}]}); input.dispatchEvent(new w.Event('change')); await tick();
+    assert.equal(blob.type,'text/vtt'); assert.equal(w.document.getElementById('subtitles').value,'upload'); assert.equal(w.document.querySelector('video track').src,'blob:https://cinema.example/subtitle');
+  } finally {w.close();}
+});

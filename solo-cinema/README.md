@@ -24,3 +24,7 @@ There is no disk media cache or transcoding. Browser support, source CORS-indepe
 2. Search an authorized title, select an episode, choose a stream and check playback, seeking, available quality/audio/subtitles and fallback. Confirm a KissKh title separately if desired.
 3. Refresh to check the browser-local watchlist and playback position. Check the console if a provider fails. Providers can change or block the host; fixture tests cannot establish live availability.
 4. This service uses bandwidth while proxying streams; it has no disk video cache. The 2 GB plan may still be constrained by memory, network and provider limits.
+
+## Player controls
+
+The server/source menu lists only streams actually returned for the selected title and switches through the same validated streaming proxy. The geographic server names in the design reference are not endpoints and are not fabricated here. Quality, audio and provider subtitles depend on the source; native HLS browsers may control quality themselves. Playback speed and local SRT/VTT subtitle uploads are supported. Uploaded subtitles stay in the browser and are discarded when changing sources or signing out; there is no OpenSubtitles integration. Source switches try to retain position and pause state. These controls have simulated-DOM coverage but have not been verified in a real browser or against every live provider.
