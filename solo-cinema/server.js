@@ -13,6 +13,7 @@ const sessions = new Map();
 const sources = new Map();
 let loginFailures = [];
 const catalog = new Map();
+const captions = new Map();
 const agent = new Agent({ connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
 function remember(url, sid, referer = null, format = null, origin = null) {
@@ -40,6 +41,7 @@ async function providerRequest(url, opts = {}) {
   return { headers:response.headers, json, text };
 }
 const moviebox = require('./moviebox')({ request:providerRequest, safeUrl });
+const kisskh = require('./kisskh')({ request:providerRequest, safeUrl });
 const { createProviders, resolveProviders } = require('./providers');
 const providers = createProviders({ request:providerRequest, safeUrl });
 const episodes = require('./episodes')({ request:providerRequest });
@@ -89,27 +91,57 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
     if (url.pathname === '/api/search' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
-      const { query } = await body(req); const results = await moviebox.search(query);
+      const { query } = await body(req);
+      if (typeof query !== 'string' || !query.trim() || query.length > 150) fail('Enter a title up to 150 characters');
+      const searches = await Promise.allSettled([moviebox.search(query), kisskh.search(query)]);
+      if (searches.every(s => s.status === 'rejected')) fail('MovieBox and KissKh search are unavailable');
+      const results = searches.flatMap((s,i) => s.status === 'fulfilled' ? s.value.map(item => ({...item, source: i===0 ? 'moviebox' : 'kisskh'})) : []);
+      const searchStatus = searches.map((s,i) => ({ provider: i===0 ? 'moviebox' : 'kisskh', error: s.status === 'rejected' ? 'Search unavailable' : null }));
       for (const [id, entry] of catalog) if (entry.expires < Date.now()) catalog.delete(id);
       if (catalog.size > 3000) fail('Too many searches; restart the server');
       const entries = results.map(item => {
         const id = crypto.randomBytes(20).toString('base64url');
         catalog.set(id, { item, sid, expires:Date.now() + 3600000 });
-        return { id, title:item.title, type:item.type, year:item.year, overview:item.overview };
+        return { id, title:item.title, type:item.type, year:item.year, overview:item.overview, source:item.source };
       });
-      return send(res, 200, { results:entries });
+      return send(res, 200, { results:entries, providers:searchStatus });
     }
     if (url.pathname === '/api/episodes' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const data = await body(req); const selected = catalog.get(data.id);
       if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
-      return send(res, 200, { episodes: await episodes(await enrichItem(selected)) });
+      if (selected.item.source === 'kisskh') {
+        const list = await kisskh.details(selected.item.kissId);
+        return send(res, 200, { episodes:list.map(e => ({ season:1, episode:e.number, title:`Episode ${e.number}` })), source:'KissKh' });
+      }
+      return send(res, 200, { episodes: await episodes(await enrichItem(selected)), source:'TVMaze' });
+    }
+    if (url.pathname === '/api/kiss-subtitle' && req.method === 'POST') {
+      if (!authorized) return send(res, 401, { error: 'Login required' });
+      const data = await body(req); const selected = catalog.get(data.id);
+      if (!selected || selected.sid !== sid || selected.expires < Date.now() || selected.item.source !== 'kisskh') return send(res, 404, { error:'Search result expired; search again' });
+      const text=await kisskh.subtitle(selected.item,Number(data.season),Number(data.episode));
+      if (!text) return send(res,200,{ url:null });
+      for (const [id, entry] of captions) if (entry.expires < Date.now()) captions.delete(id);
+      if (captions.size > 100) fail('Too many subtitles; restart the server');
+      const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
+      return send(res,200,{url:`/caption/${id}`});
+    }
+    if (url.pathname.startsWith('/caption/') && req.method === 'GET') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      const entry=captions.get(url.pathname.slice(9));
+      if (!entry || entry.sid!==sid || entry.expires<Date.now()) return send(res,404,{error:'Subtitle expired'});
+      res.writeHead(200,{'Content-Type':'text/vtt; charset=utf-8','Cache-Control':'no-store'}); return res.end(entry.text);
     }
     if (url.pathname === '/api/resolve' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const data = await body(req); const selected = catalog.get(data.id);
       if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
-      const result = await resolveProviders({ moviebox, providers, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
+      let result;
+      if (selected.item.source === 'kisskh') {
+        try { const r=await kisskh.resolve(selected.item,Number(data.season),Number(data.episode)); result={ streams:r.streams.map(s=>({...s,provider:'kisskh',referer:r.referer,origin:r.origin})), providers:[{provider:'kisskh',count:r.streams.length,error:null}] }; }
+        catch (err) { result={streams:[],providers:[{provider:'kisskh',count:0,error:String(err?.message || 'Unavailable').slice(0,160)}]}; }
+      } else result = await resolveProviders({ moviebox, providers, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
       const streams = result.streams.map(stream => ({ provider:stream.provider, quality:stream.quality, format:stream.format, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin) }));
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }
