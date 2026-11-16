@@ -693,3 +693,76 @@ test('status() and health() describe linked numbers and the last WhatsApp close 
   assert.equal(row.state, 'reconnecting');
   assert.equal(row.lastClose.code, 428);
 });
+
+test('reconnect waits for the previous socket credential save before reloading a linked login', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-reconnect-save-'));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const fx = fixture(root, {
+    loadAuthState: async (dir, opts) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, 'creds.json');
+      let creds;
+      try { creds = JSON.parse(fs.readFileSync(file, 'utf8')); }
+      catch {
+        if (opts?.requireExisting) throw Object.assign(new Error('missing'), { code: 'AUTH_MISSING' });
+        creds = { registered: false };
+      }
+      return { state: { creds }, saveCreds: async () => {
+        if (dir.includes(`${path.sep}linked${path.sep}`)) await gate;
+        fs.writeFileSync(file, JSON.stringify(creds));
+      } };
+    },
+  });
+  t.after(async () => { release(); await fx.manager.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await fx.manager.start();
+  const { sock } = await request(fx, '265991111111');
+  open(sock, '265991111111');
+  sock.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 515 } } } });
+  await delay(60);
+  assert.notEqual(stateOf(fx, '265991111111'), 'logged_out', 'a pending credential save must not be mistaken for missing credentials');
+  assert.equal(fx.created.length, 2, 'replacement socket must wait for credential persistence');
+  release();
+  await waitFor(() => fx.created.length === 3);
+  assert.equal(fx.created[2].auth.creds.registered, true);
+});
+
+test('a damaged linked-account index hides linked sessions but does not stop the owner', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-index-isolation-'));
+  const number = '265991111111';
+  const attempt = 'a'.repeat(24);
+  const linkedDir = path.join(root, 'linked', number, attempt);
+  fs.mkdirSync(linkedDir, { recursive: true });
+  fs.writeFileSync(path.join(linkedDir, 'creds.json'), JSON.stringify({ registered: true, me: { id: `${number}:1@s.whatsapp.net` } }));
+  fs.writeFileSync(path.join(root, 'linked', 'accounts.json'), '{invalid');
+  const fx = fixture(root);
+  t.after(async () => { await fx.manager.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await fx.manager.start();
+  open(fx.created[0], '265990000000');
+  assert.equal(fx.created.length, 1, 'the owner starts but the linked session cannot be discovered');
+  assert.equal(stateOf(fx, '265990000000'), 'connected');
+  assert.equal(stateOf(fx, number), undefined);
+  assert.equal(fs.existsSync(path.join(linkedDir, 'creds.json')), true, 'the linked login is preserved');
+});
+
+test('healthy owner and linked connections are not recycled solely because hours passed', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-long-lived-'));
+  const fx = fixture(root, { probe: async () => true });
+  t.after(async () => { await fx.manager.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await fx.manager.start();
+  const owner = fx.created[0];
+  open(owner, '265990000000');
+  const { sock: linked } = await request(fx, '265991111111');
+  open(linked, '265991111111');
+  await waitFor(() => stateOf(fx, '265991111111') === 'connected');
+  const originalNow = Date.now;
+  try {
+    Date.now = () => originalNow() + 24 * 60 * 60 * 1000;
+    await fx.manager._checkStale();
+    await fx.manager._maintain();
+    await fx.manager._maintain();
+    assert.equal(owner.ended, false, 'healthy owner must not be recycled');
+    assert.equal(linked.ended, false, 'healthy linked account must not be recycled');
+    assert.equal(fx.created.length, 2);
+  } finally { Date.now = originalNow; }
+});

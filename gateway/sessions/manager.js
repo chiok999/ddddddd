@@ -63,9 +63,10 @@ function createSessionManager(opts) {
   const probeTimeoutMs = Math.max(100, Number(opts.probeTimeoutMs) || 15_000);
   let staleTimer = null;
   let maintainTimer = null;
-  // Refresh each connection now and then while the bot is idle. Long-lived
-  // WhatsApp sockets can go deaf in ways nothing reports; a fresh one cannot.
-  const recycleMs = opts.recycleMs === undefined ? 8 * 3_600_000 : Math.max(0, Number(opts.recycleMs) || 0);
+  // Do not interrupt healthy owner or linked sockets simply because they are
+  // old. A failed health probe or a close event still triggers recovery.
+  // An explicit nonzero recycleMs remains available to embedding callers.
+  const recycleMs = Math.max(0, Number(opts.recycleMs) || 0);
   const maintainMs = Math.max(500, Number(opts.maintainMs) || 60_000);
   const validManifest = (data) => Boolean(
     data && data.version === 1 && data.accounts && typeof data.accounts === 'object' && !Array.isArray(data.accounts) &&
@@ -131,8 +132,8 @@ function createSessionManager(opts) {
   const isLive = (entry) => !entry.stopped && (entry === primary ? entry.status !== 'logged_out' : entry.status === 'active');
 
   // Periodic upkeep: (1) any account that is down with no reconnect pending is
-  // restarted (nothing may stay offline silently); (2) one idle connection per
-  // run is refreshed when it is older than recycleMs.
+  // restarted (nothing may stay offline silently); (2) if explicitly enabled,
+  // refresh at most one idle connection older than recycleMs per run.
   async function maintain() {
     if (stopped) return;
     const now = Date.now();
@@ -383,6 +384,11 @@ function createSessionManager(opts) {
         sockets.setOffline(entry.id, old);
         try { await old.end(new Error('reconnecting')); } catch { /* already closed */ }
       }
+      // A close can race with an accepted creds.update. Reloading first may
+      // see missing/stale credentials, or allow an older write to overwrite
+      // the replacement socket's newer state. Drain the previous generation.
+      await Promise.allSettled([...entry.credentialWrites]);
+      if (stopped || entry.stopped) return null;
       entry.requestStarted = false;
       let auth;
       try {
