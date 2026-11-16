@@ -3,6 +3,7 @@
 // runtime. No Node, filesystem, network or host callbacks are exposed to it.
 const { getQuickJS } = require('quickjs-emscripten');
 const crypto = require('node:crypto');
+const { describe } = require('./diagnostics');
 const BASE = 'https://kisskh.is/';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
 const SUB_GUID = 'VgV52sWhwvBSf8BsM3BRY9weWiiCbtGp';
@@ -29,14 +30,17 @@ module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToke
     if (typeof query !== 'string' || !query.trim() || query.length > 150) throw Error('Enter a title up to 150 characters');
     const groups = await Promise.allSettled([1,2,3,4].map(async type => {
       const { json } = await request(`${BASE}api/DramaList/Search?q=${encodeURIComponent(query.trim())}&type=${type}`, { headers });
-      if (!Array.isArray(json)) throw Error('Invalid KissKh response');
+      if (!Array.isArray(json)) throw Object.assign(Error('Invalid KissKh response'),{code:'INVALID_PROVIDER_RESPONSE'});
       return json.slice(0,8).map(row => {
         const id=Number(row.id), title=String(row.title || '').trim().slice(0,150);
         if (!Number.isSafeInteger(id) || id < 1 || !title) return null;
         return { source:'kisskh', kissId:id, title, type:type===2 ? 'movie' : 'series', year:'', overview:'', kind:['','Drama','Movie','Anime','Hollywood'][type] };
       }).filter(Boolean);
     }));
-    if (groups.every(g=>g.status==='rejected')) throw Error('KissKh search unavailable');
+    if (groups.every(g=>g.status==='rejected')) {
+      const reasons=[...new Set(groups.map(g=>describe(g.reason)))];
+      throw Object.assign(Error('KissKh search unavailable'), { code:'KISSKH_SEARCH_FAILED', reasons });
+    }
     const seen=new Set(); return groups.flatMap(g=>g.status==='fulfilled' ? g.value : []).filter(item=>{ if (seen.has(item.kissId)) return false; seen.add(item.kissId); return true; });
   }
   async function details(id) {
