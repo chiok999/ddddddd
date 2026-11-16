@@ -152,17 +152,17 @@ async function playVidrift(){
   const season=Number($('season').value), episode=Number($('episode').value);
   fallback.cancel(); clearEmbed(); if(hls){hls.destroy();hls=null;} current=null; pendingFailure=null;
   $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden');
-  directControls(false); $('placeholder').classList.remove('hidden'); $('placeholder').querySelector('p').textContent='Opening VidRift…'; $('playError').textContent='';
+  directControls(false); $('placeholder').classList.remove('hidden'); $('placeholder').querySelector('p').textContent='Opening embedded player…'; $('playError').textContent='';
   $('findStreams').disabled=true; $('findStreams').textContent='Opening player…';
   try {
-    const result=await post('/api/vidrift',{id:chosen.id,season,episode});
+    const provider=$('embedProvider').value; const result=await post(provider==='vidrift'?'/api/vidrift':'/api/embed',{id:chosen.id,season,episode,provider});
     if(sequence!==resolveSequence || selected!==chosen || route!=='watch') return;
-    const url=new URL(result.url); if(url.origin!=='https://embed.vidrift.net' || !url.pathname.startsWith('/embed/')) throw Error('Invalid VidRift URL');
+    const origins={vidrift:'https://embed.vidrift.net',vixsrc:'https://vixsrc.to',vidlink:'https://vidlink.pro',vidfast:'https://vidfast.vc'}; const url=new URL(result.url); if(!Object.hasOwn(origins,provider) || url.origin!==origins[provider] || (provider==='vidrift' && !url.pathname.startsWith('/embed/')) || (provider!=='vidrift' && !/^\/(?:movie|tv)\//.test(url.pathname))) throw Error('Invalid player URL');
     $('vidrift').src=url.href; $('vidrift').classList.remove('hidden'); $('placeholder').classList.add('hidden'); $('embedNotice').classList.remove('hidden');
-    $('providersNotice').textContent='VidRift manages its own servers in the player. Use Troy player instead to look for direct streams.';
+    $('providersNotice').textContent=`${$('embedProvider').selectedOptions[0].textContent} manages its own playback. Use Troy player instead to look for direct streams.`;
   } catch(err) {
     if(sequence!==resolveSequence || selected!==chosen || route!=='watch') return;
-    directControls(true); $('playError').textContent=`VidRift could not be opened: ${err.message}. Looking for Troy sources…`; await findStreams(true);
+    directControls(true); $('playError').textContent=`Embedded player could not be opened: ${err.message}. Looking for Troy sources…`; await findStreams(true);
   } finally {
     if(sequence===resolveSequence){$('findStreams').disabled=false; $('findStreams').textContent=chosen.type==='series'?'Play selected episode':'Play again';}
   }
@@ -170,6 +170,7 @@ async function playVidrift(){
 $('findStreams').onclick=()=>playerMode==='vidrift'?playVidrift():findStreams(true);
 $('useDirect').onclick=()=>{clearEmbed();directControls(true);findStreams(true);};
 $('useVidrift').onclick=()=>playVidrift();
+$('embedProvider').onchange=()=>playVidrift();
 
 function updateNext(){
   const ctx=current?.context;

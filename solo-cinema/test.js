@@ -360,3 +360,10 @@ test('VidRift embeds use validated IDs and the documented fixed movie and TV pat
   const series=new URL(embedUrl({tmdbId:'1399',type:'series',title:'A & B'},2,3));assert.equal(series.pathname,'/embed/tv/1399/2/3');assert.equal(series.searchParams.get('title'),'A & B');
   assert.throws(()=>embedUrl({tmdbId:'1/../../evil',type:'movie'},1,1),/TMDB/);assert.throws(()=>embedUrl({tmdbId:'42',type:'series'},0,1),/valid season/);assert.throws(()=>embedUrl({tmdbId:'42',type:'series'},1,10000),/valid season/);assert.throws(()=>embedUrl({tmdbId:'42',type:'bad'},1,1),/type/);
 });
+
+test('documented alternate embeds accept only fixed providers and validated IDs',()=>{
+ const {embedUrl}=require('./vidrift');const item={type:'series',tmdbId:'1399',imdbId:'tt0944947'};
+ assert.equal(embedUrl(item,2,3,'vixsrc'),'https://vixsrc.to/tv/1399/2/3');assert.equal(embedUrl(item,2,3,'vidlink'),'https://vidlink.pro/tv/1399/2/3');assert.equal(embedUrl(item,2,3,'vidfast'),'https://vidfast.vc/tv/1399/2/3');
+ assert.equal(embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vixsrc'),'https://vixsrc.to/movie/tt1375666');assert.equal(embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vidfast'),'https://vidfast.vc/movie/tt1375666');
+ assert.throws(()=>embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vidlink'),/ID unavailable/);assert.throws(()=>embedUrl(item,2,3,'https://evil.example'),/Unknown/);assert.throws(()=>embedUrl({...item,tmdbId:'https://evil'},0,1,'vidlink'));
+});
