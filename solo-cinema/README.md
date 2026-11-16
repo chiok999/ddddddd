@@ -1,4 +1,4 @@
-# Solo Cinema
+# Troy
 
 A separate, small Node.js streaming application. It proxies **your own authorized HTTPS HLS or direct video URLs** without downloading entire videos to disk. The watchlist and playback position are stored in the browser; clearing browser data removes them. The watchlist stores stream URLs in browser storage, so do not use shared devices or paste credentials into URLs.
 
@@ -20,7 +20,7 @@ There is no disk media cache or transcoding. Browser support, source CORS-indepe
 
 ## Verify after deploying
 
-1. Open the panel’s HTTPS address and sign in. Confirm the startup log shows `Solo Cinema is listening`.
+1. Open the panel’s HTTPS address and sign in. Confirm the startup log shows `Troy is listening`.
 2. Search an authorized title, select an episode, choose a stream and check playback, seeking, available quality/audio/subtitles and fallback. Confirm a KissKh title separately if desired.
 3. Refresh to check the browser-local watchlist and playback position. Check the console if a provider fails. Providers can change or block the host; fixture tests cannot establish live availability.
 4. This service uses bandwidth while proxying streams; it has no disk video cache. The 2 GB plan may still be constrained by memory, network and provider limits.
@@ -28,3 +28,7 @@ There is no disk media cache or transcoding. Browser support, source CORS-indepe
 ## Player controls
 
 The server/source menu lists only streams actually returned for the selected title and switches through the same validated streaming proxy. The geographic server names in the design reference are not endpoints and are not fabricated here. Quality, audio and provider subtitles depend on the source; native HLS browsers may control quality themselves. Playback speed and local SRT/VTT subtitle uploads are supported. Uploaded subtitles stay in the browser and are discarded when changing sources or signing out; there is no OpenSubtitles integration. Source switches try to retain position and pause state. These controls have simulated-DOM coverage but have not been verified in a real browser or against every live provider.
+
+## Troy home
+
+The app is branded Troy; the project folder, environment variables and browser storage keys remain unchanged for existing deployments. The home page uses Cinemeta's popular, featured, animation and current-year metadata catalogs (cached in memory for 30 minutes when all requests succeed). “Trending & popular” uses Cinemeta popularity, not a live trending chart. Anime picks are curated search shortcuts; they are not a live anime catalog. A card searches existing providers and requires choosing the intended match; a listing does not guarantee a stream. Poster images load directly in the browser from Cinemeta's image hosts and the reference site's image host for the curated picks; those hosts can see the browser's IP. Provider, artwork and catalog availability varies. No movie files are stored by the home page.

@@ -289,3 +289,11 @@ test('MovieBox retrieves and converts an English caption using bounded injected 
   assert.equal(await mb.subtitle({id:'123',format:'MP4',subjectId:'abc',detailPath:'detail'}),'WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nHello');
   assert.ok(seen.some(x=>x.includes('subjectId=abc')));
 });
+
+test('discovery loads bounded Cinemeta catalogs with independent errors and caching', async()=>{
+  const urls=[]; const discover=require('./discover')({now:()=>new Date('2026-11-16T00:00:00Z'), request:async url=>{
+    urls.push(url); if(url.includes('/series/year/')) throw Error('offline');
+    return {json:{metas:[{id:'tt123',name:'A Film',releaseInfo:'2026',poster:'https://images.metahub.space/poster.jpg'},{id:'bad',name:'Invalid'}]}};
+  }});
+  const sections=await discover(); assert.equal(sections.length,6); assert.equal(sections.find(s=>s.id==='new-series').error,'Catalog unavailable'); assert.equal(sections[0].items.length,1); assert.equal(sections[0].items[0].poster,'https://images.metahub.space/poster.jpg'); assert.ok(urls.some(u=>u.includes('/year/genre=2026.json'))); await discover(); assert.equal(urls.length,12);
+});

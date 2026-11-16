@@ -48,6 +48,7 @@ async function providerRequest(url, opts = {}) {
   let json = null; try { json = JSON.parse(text); } catch { /* token response may have no JSON */ }
   return { headers:response.headers, json, text };
 }
+const discover = require('./discover')({request:providerRequest});
 const moviebox = require('./moviebox')({ request:providerRequest, safeUrl });
 const kisskh = require('./kisskh')({ request:providerRequest, safeUrl });
 const { createProviders, resolveProviders } = require('./providers');
@@ -98,6 +99,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized });
     if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
+    if (url.pathname === '/api/discover' && req.method === 'GET') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      return send(res,200,{sections:await discover()});
+    }
     if (url.pathname === '/api/search' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const { query } = await body(req);
@@ -210,4 +215,4 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, { error: 'Not found' });
   } catch (e) { if (!res.headersSent) send(res, 400, { error: e.message || 'Request failed' }); else res.destroy(); }
 });
-server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => console.log('Solo Cinema is listening'));
+server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => console.log('Troy is listening'));

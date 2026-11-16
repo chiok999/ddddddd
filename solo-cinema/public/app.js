@@ -8,7 +8,7 @@ async function api(url, options = {}) {
   if (!response.ok) throw new Error(result.error || 'Request failed'); return result;
 }
 const post = (url, data) => api(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(data) });
-function loggedIn(on) { $('login').classList.toggle('hidden', on); $('app').classList.toggle('hidden', !on); $('logout').classList.toggle('hidden', !on); if (on) render(); }
+function loggedIn(on) { $('login').classList.toggle('hidden', on); $('app').classList.toggle('hidden', !on); $('logout').classList.toggle('hidden', !on); if (on) { render(); loadDiscovery(); } }
 $('loginForm').onsubmit = async e => { e.preventDefault(); $('loginError').textContent = ''; try { await post('/api/login', {password:$('password').value}); $('password').value=''; loggedIn(true); } catch (err) { $('loginError').textContent=err.message; } };
 $('logout').onclick = async () => { fallback.cancel(); current=null; pendingFailure=null; if(uploadUrl){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('server').replaceChildren(new Option('No sources yet','')); $('server').disabled=true; $('back10').disabled=true; $('forward10').disabled=true; updateNext(); await post('/api/logout', {}); if (hls) hls.destroy(); $('video').pause(); $('video').removeAttribute('src'); $('video').load(); loggedIn(false); };
 function render() {
@@ -145,3 +145,37 @@ $('nextEpisode').onclick=async()=>{
   const option=`${season}:${episode}`; if([...$('episodeSelect').options].some(x=>x.value===option)) $('episodeSelect').value=option;
   await findStreams(true);
 };
+
+const rowLabels = {
+  'popular-movies':['Trending & popular movies','Cinemeta popular · not a live trend chart'], 'popular-series':['TV shows','Popular on Cinemeta'],
+  'new-movies':['New movies','Current release year'], 'new-series':['New shows','Current release year'],
+  'animation':['Cartoons & animation','Popular animated series'], 'top-rated':['Featured movies','Cinemeta featured catalog']
+};
+function titleCard(item){
+  const card=document.createElement('button'); card.type='button'; card.className='catalog-card';
+  const art=document.createElement('div'); art.className='catalog-art';
+  if(item.poster){ const img=document.createElement('img'); img.loading='lazy'; img.decoding='async'; img.alt=''; img.referrerPolicy='no-referrer'; img.src=item.poster; img.onerror=()=>img.remove(); art.append(img); }
+  const fallback=document.createElement('span'); fallback.className='art-fallback'; fallback.textContent=item.title; art.append(fallback);
+  const name=document.createElement('strong'); name.textContent=item.title;
+  const meta=document.createElement('small'); meta.textContent=`${item.year || 'Year unknown'} · ${item.type==='series'?'Series':'Movie'}`;
+  card.append(art,name,meta); card.onclick=()=>{ $('query').value=item.title; searchTitles(item.title); $('discover').scrollIntoView({behavior:'smooth',block:'start'}); }; return card;
+}
+const animePicks=[{title:'One Piece',type:'series',year:'1999',poster:'https://www.movy.sx/img/w342/dB4EDhre2dsC2kxYDavyKWqLQwi.jpg/q50.webp'},{title:"JoJo's Bizarre Adventure",type:'series',year:'2012',poster:'https://www.movy.sx/img/w342/ogAWwbh3frWtiTyyXrZaVFtqCgp.jpg/q50.webp'},{title:'Cyberpunk: Edgerunners',type:'series',year:'2022',poster:'https://www.movy.sx/img/w342/v3JuB15WybKmxDeT1hWdK3j6eSJ.jpg/q50.webp'}];
+for(const item of animePicks) $('animePicks').append(titleCard(item));
+let discoveryLoading=false, discoveryLoaded=false;
+async function loadDiscovery(){
+  if(discoveryLoading || discoveryLoaded) return; discoveryLoading=true;
+  try {
+    const data=await api('/api/discover'); const root=$('catalogRows'); root.replaceChildren();
+    for(const section of data.sections){ const info=rowLabels[section.id]; if(!info) continue;
+      const row=document.createElement('section'); row.className='catalog-section'; row.id=section.id;
+      const heading=document.createElement('div'); heading.className='row-head'; const title=document.createElement('h2'); title.textContent=info[0]; const note=document.createElement('span'); note.textContent=info[1]; heading.append(title,note); row.append(heading);
+      const rail=document.createElement('div'); rail.className='catalog-rail'; rail.setAttribute('role','group'); rail.setAttribute('aria-label',info[0]); rail.tabIndex=0;
+      for(const item of section.items) rail.append(titleCard(item)); if(!section.items.length){ const empty=document.createElement('p'); empty.className='catalog-status'; empty.textContent=section.error || 'No titles available right now.'; rail.append(empty); }
+      row.append(rail); root.append(row);
+    }
+    discoveryLoaded=data.sections.every(section=>!section.error);
+    if(!discoveryLoaded){ const retry=document.createElement('button'); retry.className='secondary'; retry.textContent='Retry unavailable catalogs'; retry.onclick=loadDiscovery; root.append(retry); }
+  } catch { $('catalogRows').replaceChildren(); const note=document.createElement('p'); note.className='catalog-status'; note.textContent='Catalog unavailable. Search is still available.'; const retry=document.createElement('button'); retry.className='secondary'; retry.textContent='Retry unavailable catalogs'; retry.onclick=loadDiscovery; $('catalogRows').append(note,retry); }
+  finally {discoveryLoading=false;}
+}
