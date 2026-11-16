@@ -211,6 +211,7 @@ function onSessionEvent(event) {
 async function startService() {
   const sessions = createSessionManager({
   sessionDir: config.sessionName,
+  durableIndex: true, // store linked-account index with the SQLite auth state
   pairNumber: config.pairNumber,
   maxAccounts: Number(process.env.MAX_LINKED_ACCOUNTS || 20),
   loggedOutCode: DisconnectReason.loggedOut,

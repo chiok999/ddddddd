@@ -73,11 +73,18 @@ function createSessionManager(opts) {
     Object.entries(data.accounts).every(([number, record]) =>
       NUMBER_RE.test(number) && record && ATTEMPT_RE.test(String(record.attempt || '')) && STORED_STATES.has(record.state)),
   );
-  const stored = readJsonSafe(manifestFile, { defaultValue: { version: 1, accounts: {} }, validate: validManifest });
+  const indexStore = opts.durableIndex && authStore.enabled()
+    ? require('./indexStore').createIndexStore(primaryDir, log)
+    : null;
+  const readIndex = { defaultValue: { version: 1, accounts: {} }, validate: validManifest };
+  const stored = indexStore ? indexStore.read(readIndex) : readJsonSafe(manifestFile, readIndex);
   // Refuse to replace a corrupt index: credentials may still be recoverable.
   const manifestError = !stored.ok;
   const manifest = stored.ok ? stored.data : { version: 1, accounts: {} };
-  if (manifestError) log.error('Linked-account index is unreadable; preserved session files. Fix or remove accounts.json before adding accounts.');
+  const indexUnavailableMessage = indexStore
+    ? 'Linked-account database index is unavailable; preserved session data. Restore a valid database backup before adding accounts.'
+    : 'Linked-account index is unavailable; preserved session files. Fix or restore accounts.json before adding accounts.';
+  if (manifestError) log.error(indexUnavailableMessage);
 
   // Why a connected linked number would not answer ('' = it answers).
   function pauseReason(entry) {
@@ -236,10 +243,10 @@ function createSessionManager(opts) {
   let started = false;
 
   function writeRecord(number, record) {
-    if (manifestError) throw Object.assign(new Error('Linked-account index is unavailable. Fix or remove accounts.json first.'), { statusCode: 503 });
+    if (manifestError) throw Object.assign(new Error(indexUnavailableMessage), { statusCode: 503 });
     const previous = manifest.accounts[number];
     manifest.accounts[number] = record;
-    try { writeJsonAtomic(manifestFile, manifest); }
+    try { if (indexStore) indexStore.write(manifest); else writeJsonAtomic(manifestFile, manifest); }
     catch (err) {
       if (previous) manifest.accounts[number] = previous;
       else delete manifest.accounts[number];
@@ -248,10 +255,10 @@ function createSessionManager(opts) {
   }
 
   function dropRecord(number) {
-    if (manifestError) throw Object.assign(new Error('Linked-account index is unavailable. Fix or remove accounts.json first.'), { statusCode: 503 });
+    if (manifestError) throw Object.assign(new Error(indexUnavailableMessage), { statusCode: 503 });
     const previous = manifest.accounts[number];
     delete manifest.accounts[number];
-    try { writeJsonAtomic(manifestFile, manifest); }
+    try { if (indexStore) indexStore.write(manifest); else writeJsonAtomic(manifestFile, manifest); }
     catch (err) { if (previous) manifest.accounts[number] = previous; throw err; }
   }
 
@@ -578,7 +585,7 @@ function createSessionManager(opts) {
 
   async function doRequestPair(number) {
     if (stopped) throw Object.assign(new Error('WhatsApp service is stopping.'), { statusCode: 503 });
-    if (manifestError) throw Object.assign(new Error('Linked-account index is unavailable. Fix or remove accounts.json first.'), { statusCode: 503 });
+    if (manifestError) throw Object.assign(new Error(indexUnavailableMessage), { statusCode: 503 });
     if (primary.status !== 'logged_out' && primaryNumber() === number) {
       throw Object.assign(new Error('That is the owner number, which is already the main connection.'), { statusCode: 409 });
     }

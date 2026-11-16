@@ -197,3 +197,88 @@ test('owner and linked auth remain isolated with identical key names across inde
   authStore.removeDir(linkedDir);
   assert.deepEqual(readWorker(ownerDir), { id: '265990000000:1@s.whatsapp.net', key: 'owner-key' });
 });
+
+test('SQLite index restores linked sessions when the file index is lost, without reviving removed accounts', async () => {
+  const { EventEmitter } = require('node:events');
+  const { createSessionManager } = require(path.join(ROOT, 'gateway/sessions/manager'));
+  const session = path.join(ROOT, 'lost-index-session');
+  const number = '265991111111';
+  const attempt = 'd'.repeat(24);
+  const linkedDir = path.join(session, 'linked', number, attempt);
+  const auth = await authStore.useSqliteAuthState(linkedDir);
+  auth.state.creds.registered = true;
+  auth.state.creds.me = { id: `${number}:1@s.whatsapp.net` };
+  await auth.saveCreds();
+  const index = path.join(session, 'linked', 'accounts.json');
+  fs.writeFileSync(index, JSON.stringify({ version: 1, accounts: { [number]: { attempt, state: 'active' } } }));
+  const started = [];
+  function manager() {
+    return createSessionManager({
+      sessionDir: session, loggedOutCode: 401, durableIndex: true,
+      loadAuthState: authStore.useSqliteAuthState,
+      getVersion: async () => [2, 0, 0],
+      makeSocket: ({ auth }) => { const sock = { ev: new EventEmitter(), auth, end: async () => {} }; started.push(sock); return sock; },
+      onMessage: async () => {}, log: { warn() {}, error() {}, info() {}, debug() {} },
+    });
+  }
+  const first = manager();
+  await first.start();
+  assert.deepEqual(started.map(s => s.__sessionId).sort(), ['primary', `linked:${number}`].sort());
+  await first.stop();
+  // Model a deployment restoring the SQLite DB but not the session index.
+  fs.rmSync(index);
+  fs.rmSync(`${index}.bak`, { force: true });
+  started.length = 0;
+  const second = manager();
+  try {
+    await second.start();
+    assert.deepEqual(started.map(s => s.__sessionId).sort(), ['primary', `linked:${number}`].sort());
+    assert.equal((await authStore.useSqliteAuthState(linkedDir, { requireExisting: true })).state.creds.me.id, `${number}:1@s.whatsapp.net`);
+    await second.removeAccount(number);
+  } finally { await second.stop(); }
+  // A stale file must never restore an explicitly removed account.
+  fs.writeFileSync(index, JSON.stringify({ version: 1, accounts: { [number]: { attempt, state: 'active' } } }));
+  started.length = 0;
+  const third = manager();
+  try { await third.start(); assert.deepEqual(started.map(s => s.__sessionId), ['primary']); }
+  finally { await third.stop(); }
+});
+
+test('a compressed credentials-only session string restores a snapshot, not later Signal keys', async () => {
+  const zlib = require('node:zlib');
+  const { BufferJSON } = require('@whiskeysockets/baileys');
+  const sourceDir = path.join(ROOT, 'session-token-source');
+  const restoredDir = path.join(ROOT, 'session-token-restored');
+  const source = await authStore.useSqliteAuthState(sourceDir);
+  source.state.creds.registered = true;
+  source.state.creds.me = { id: '265991111111:1@s.whatsapp.net' };
+  source.state.creds.accountSyncCounter = 7;
+  await source.saveCreds();
+  const token = zlib.gzipSync(Buffer.from(JSON.stringify(source.state.creds, BufferJSON.replacer))).toString('base64');
+  await source.state.keys.set({ session: { recipient: { record: Buffer.from('later-key') } } });
+  source.state.creds.accountSyncCounter = 8;
+  await source.saveCreds();
+  const decoded = zlib.gunzipSync(Buffer.from(token, 'base64')).toString('utf8');
+  authStore.installFiles(restoredDir, { 'creds.json': decoded });
+  const restored = await authStore.useSqliteAuthState(restoredDir, { requireExisting: true });
+  assert.equal(restored.state.creds.accountSyncCounter, 7, 'the token is an old credential snapshot');
+  assert.equal((await restored.state.keys.get('session', ['recipient'])).recipient, null, 'Signal keys were not included in the token');
+  assert.equal((await source.state.keys.get('session', ['recipient'])).recipient.record.toString(), 'later-key');
+});
+
+test('linked index refuses corrupt SQLite data instead of trusting a stale file copy', () => {
+  const { createIndexStore } = require(path.join(ROOT, 'gateway/sessions/indexStore'));
+  const session = path.join(ROOT, 'corrupt-durable-index');
+  const file = path.join(session, 'linked', 'accounts.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const old = { version: 1, accounts: { '265991111111': { attempt: 'a'.repeat(24), state: 'active' } } };
+  fs.writeFileSync(file, JSON.stringify(old));
+  const index = createIndexStore(session, { warn() {} });
+  const opts = { defaultValue: { version: 1, accounts: {} }, validate: data => data?.version === 1 && !!data.accounts };
+  assert.deepEqual(index.read(opts).data, old);
+  const key = `linked-session-index:${authStore.dirKey(session)}`;
+  sqlite.open().prepare('UPDATE kv SET value = ? WHERE key = ?').run('{broken', key);
+  const result = index.read(opts);
+  assert.equal(result.ok, false);
+  assert.equal(fs.readFileSync(file, 'utf8'), JSON.stringify(old));
+});
