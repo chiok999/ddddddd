@@ -105,3 +105,10 @@ test('local subtitle upload converts SRT to a selectable VTT track', async () =>
     assert.equal(blob.type,'text/vtt'); assert.equal(w.document.getElementById('subtitles').value,'upload'); assert.equal(w.document.querySelector('video track').src,'blob:https://cinema.example/subtitle');
   } finally {w.close();}
 });
+
+test('discovery cards search the catalog without assuming a playable source', async()=>{
+  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}), w=dom.window; let searched;
+  w.HTMLElement.prototype.scrollIntoView=function(){}; w.Hls=class{static isSupported(){return false}};
+  w.fetch=async(url,opts={})=>({ok:true,json:async()=>{ if(url==='/api/session')return {authenticated:true}; if(url==='/api/discover')return {sections:[{id:'popular-movies',items:[{title:'A Film',year:'2026',type:'movie',poster:'https://images.example/p.jpg'}]}]}; if(url==='/api/search'){searched=JSON.parse(opts.body).query;return {results:[{id:'a',title:'A Film',type:'movie',source:'moviebox'}],providers:[]}} throw Error('unexpected');}});
+  try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8')); w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8')); await tick(); await tick(); assert.equal(w.document.querySelectorAll('#popular-movies .catalog-card').length,1); w.document.querySelector('#popular-movies .catalog-card').click(); await tick(); assert.equal(searched,'A Film'); assert.equal(w.document.querySelector('.result strong').textContent,'A Film'); assert.ok(w.document.querySelector('#selection').classList.contains('hidden'));}finally{w.close();}
+});
