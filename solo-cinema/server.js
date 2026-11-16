@@ -61,7 +61,7 @@ function sameOrigin(req) {
   try { return new URL(req.headers.origin).host === req.headers.host && ['http:', 'https:'].includes(new URL(req.headers.origin).protocol); } catch { return false; }
 }
 const staticFiles = {
-  '/': ['public/index.html', 'text/html; charset=utf-8'], '/app.js': ['public/app.js', 'text/javascript; charset=utf-8'],
+  '/': ['public/index.html', 'text/html; charset=utf-8'], '/fallback.js': ['public/fallback.js', 'text/javascript; charset=utf-8'], '/app.js': ['public/app.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['public/style.css', 'text/css; charset=utf-8'], '/hls.js': ['node_modules/hls.js/dist/hls.min.js', 'text/javascript; charset=utf-8']
 };
 const server = http.createServer(async (req, res) => {
