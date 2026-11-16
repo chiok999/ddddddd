@@ -74,7 +74,7 @@ module.exports = function createMoviebox({ request, safeUrl }) {
     if (first) return first;
     // The selected MovieBox subject can be a duplicate without resources.
     // Only retry exact title/type/year matches to avoid playing unrelated shows.
-    const normalized=s=>String(s || '').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    const normalized=s=>String(s || '').toLowerCase().replace(/\[[^\]]*\]|\([^)]*\)/g,' ').replace(/&/g,' and ').replace(/[^a-z0-9]+/g,' ').trim();
     const matches=await search(item.title).catch(()=>[]);
     for (const alternative of matches.filter(x=>x.subjectId!==item.subjectId && x.type===item.type && normalized(x.title)===normalized(item.title) && (!item.year || !alternativeYearConflict(item.year,x.year))).slice(0,2)) {
       try { const found=await playCandidate(alternative); if(found) return found; } catch { /* try the next exact match */ }

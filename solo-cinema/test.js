@@ -258,3 +258,26 @@ test('MovieBox refreshes an empty player and retries an exact matching duplicate
   assert.equal(r.streams[0].quality,720); assert.ok(domains>=3); assert.match(r.referer,/spa\/videoPlayPage\/movies\/correct/);
   assert.ok(calls.some(x=>x.url.includes('subjectId=2'))); assert.ok(!calls.some(x=>x.url.includes('subjectId=3')));
 });
+
+test('MovieBox retries a matching language-labelled duplicate without selecting another year', async () => {
+  const calls=[];
+  const request=async(url)=>{calls.push(url);
+    if(url.includes('/home?')) return {headers:{get:()=>'{"token":"guest"}'}};
+    if(url.includes('/get-domain')) return {json:{data:'https://player.example'}};
+    if(url.includes('/subject/search')) return {json:{data:{items:[{subject:{subjectId:'2',detailPath:'english',title:'Merry Berry Love [English]',subjectType:2,releaseDate:'2026-01-01'}},{subject:{subjectId:'3',detailPath:'old',title:'Merry Berry Love',subjectType:2,releaseDate:'2025-01-01'}}]}}};
+    if(url.includes('/subject/play')) return {json:{data:{streams:url.includes('subjectId=2')?[{url:'https://cdn.example/video.mp4',resolutions:720,duration:3600}]:[]}}};
+    throw Error('unexpected');
+  };
+  const mb=require('./moviebox')({request,safeUrl:u=>new URL(u)});
+  const out=await mb.resolve({subjectId:'1',detailPath:'original',title:'Merry Berry Love',year:'2026',type:'series'},1,6);
+  assert.equal(out.streams[0].quality,720); assert.ok(calls.some(x=>x.includes('subjectId=2'))); assert.ok(!calls.some(x=>x.includes('subjectId=3')));
+});
+
+test('KissKh retries temporary rate limits but does not retry forbidden responses', async () => {
+  const attempts=new Map(), waits=[];
+  const request=async(url)=>{ const n=(attempts.get(url)||0)+1; attempts.set(url,n); if(n<3) throw Object.assign(Error('rate limited'),{status:429}); return {json:[{id:1,title:'A'}]}; };
+  const kk=require('./kisskh')({request,safeUrl:u=>new URL(u),sleep:async ms=>waits.push(ms)});
+  assert.equal((await kk.search('A')).length,1); assert.equal(attempts.size,4); assert.ok([...attempts.values()].every(x=>x===3)); assert.equal(waits.length,8);
+  let count=0; const forbidden=require('./kisskh')({request:async()=>{count++; throw Object.assign(Error('forbidden'),{status:403})},safeUrl:u=>new URL(u),sleep:async()=>{throw Error('must not sleep')}});
+  await assert.rejects(forbidden.search('A'),{code:'KISSKH_SEARCH_FAILED'}); assert.equal(count,4);
+});
