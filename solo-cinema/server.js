@@ -1,0 +1,164 @@
+'use strict';
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const dns = require('node:dns').promises;
+const net = require('node:net');
+const { Readable } = require('node:stream');
+const { Agent, fetch } = require('undici');
+const ipaddr = require('ipaddr.js');
+
+const password = process.env.CINEMA_PASSWORD || '';
+if (password.length < 12) { console.error('Set CINEMA_PASSWORD to at least 12 characters.'); process.exit(1); }
+const sessions = new Map();
+const sources = new Map();
+let loginFailures = [];
+const catalog = new Map();
+const agent = new Agent({ connect: { lookup(host, options, callback) {
+  dns.lookup(host, { all: true, verbatim: true }).then(rows => {
+    if (!rows.length || rows.some(r => { try { return ipaddr.process(r.address).range() !== 'unicast'; } catch { return true; } })) throw Error('Private or invalid address');
+    const matches = options.family ? rows.filter(r => r.family === options.family) : rows;
+    if (!matches.length) throw Error('No address');
+    if (options.all) callback(null, matches); else callback(null, matches[0].address, matches[0].family);
+  }).catch(callback);
+} } });
+const fail = msg => { throw new Error(msg); };
+function safeUrl(input) {
+  const url = new URL(input);
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (url.protocol !== 'https:' || url.username || url.password || url.port || url.href.length > 8192 || net.isIP(host.replace(/^\[|\]$/g, '')) || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) fail('Only public HTTPS URLs are allowed');
+  return url;
+}
+async function getRemote(input, headers, signal) {
+  let url = safeUrl(input);
+  for (let n = 0; n <= 5; n++) {
+    const response = await fetch(url, { dispatcher: agent, headers, redirect: 'manual', signal });
+    if (![301,302,303,307,308].includes(response.status)) return { response, url };
+    const location = response.headers.get('location');
+    await response.body?.cancel();
+    if (!location || n === 5) fail('Invalid redirect');
+    url = safeUrl(new URL(location, url));
+  }
+}
+function remember(url, sid, referer = null, format = null) {
+  if (sources.size > 10000) for (const [id, entry] of sources) { if (entry.expires < Date.now()) sources.delete(id); }
+  if (sources.size > 12000) fail('Too many media links; restart the server');
+  const id = crypto.randomBytes(24).toString('base64url');
+  sources.set(id, { url: safeUrl(url).href, sid, referer, format, expires: Date.now() + 6 * 3600000 });
+  return `/media/${id}`;
+}
+const { rewritePlaylist } = require('./playlist');
+// Provider API responses are bounded, redirects are forbidden, and credentials
+// never follow a redirect. Every connection uses the public-IP-pinning agent.
+async function providerRequest(url, opts = {}) {
+  safeUrl(url);
+  const response = await fetch(url, { ...opts, dispatcher: agent, redirect: 'manual', signal: AbortSignal.timeout(15000) });
+  if (!response.ok) { await response.body?.cancel(); throw Object.assign(new Error(`Provider HTTP ${response.status}`), { status: response.status }); }
+  const reader = response.body.getReader(); const chunks = []; let total = 0;
+  while (true) {
+    const { done, value } = await reader.read(); if (done) break;
+    total += value.length; if (total > 2 * 1024 * 1024) { await reader.cancel(); fail('Provider response too large'); }
+    chunks.push(Buffer.from(value));
+  }
+  let json = null; try { json = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* token response may have no JSON */ }
+  return { headers:response.headers, json };
+}
+const moviebox = require('./moviebox')({ request:providerRequest, safeUrl });
+async function body(req, max = 16384) {
+  const chunks = []; let size = 0;
+  for await (const chunk of req) { size += chunk.length; if (size > max) fail('Request too large'); chunks.push(chunk); }
+  return JSON.parse(Buffer.concat(chunks).toString() || '{}');
+}
+function send(res, status, message) { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(message)); }
+function sameOrigin(req) {
+  if (!req.headers.origin) return false;
+  try { return new URL(req.headers.origin).host === req.headers.host && ['http:', 'https:'].includes(new URL(req.headers.origin).protocol); } catch { return false; }
+}
+const staticFiles = {
+  '/': ['public/index.html', 'text/html; charset=utf-8'], '/app.js': ['public/app.js', 'text/javascript; charset=utf-8'],
+  '/style.css': ['public/style.css', 'text/css; charset=utf-8'], '/hls.js': ['node_modules/hls.js/dist/hls.min.js', 'text/javascript; charset=utf-8']
+};
+const server = http.createServer(async (req, res) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'");
+  const url = new URL(req.url, 'http://local');
+  const sid = /(?:^|;\s*)cinema=([\w-]+)/.exec(req.headers.cookie || '')?.[1];
+  const session = sessions.get(sid);
+  if (session && session < Date.now()) sessions.delete(sid);
+  const authorized = session && session >= Date.now();
+  try {
+    if (req.method === 'POST' && !sameOrigin(req)) return send(res, 403, { error: 'Origin rejected' });
+    if (url.pathname === '/api/login' && req.method === 'POST') {
+      loginFailures = loginFailures.filter(t => t > Date.now() - 60000);
+      if (loginFailures.length >= 8) return send(res, 429, { error: 'Too many attempts; wait a minute' });
+      const submitted = (await body(req)).password;
+      const a = crypto.createHash('sha256').update(typeof submitted === 'string' ? submitted : '').digest();
+      const b = crypto.createHash('sha256').update(password).digest();
+      if (!crypto.timingSafeEqual(a, b)) { loginFailures.push(Date.now()); return send(res, 401, { error: 'Incorrect password' }); }
+      loginFailures = [];
+      if (sid) sessions.delete(sid);
+      const token = crypto.randomBytes(32).toString('base64url'); sessions.set(token, Date.now() + 24 * 3600000);
+      res.setHeader('Set-Cookie', `cinema=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : ''}`);
+      return send(res, 200, { ok: true });
+    }
+    if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized });
+    if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
+    if (url.pathname === '/api/search' && req.method === 'POST') {
+      if (!authorized) return send(res, 401, { error: 'Login required' });
+      const { query } = await body(req); const results = await moviebox.search(query);
+      for (const [id, entry] of catalog) if (entry.expires < Date.now()) catalog.delete(id);
+      if (catalog.size > 3000) fail('Too many searches; restart the server');
+      const entries = results.map(item => {
+        const id = crypto.randomBytes(20).toString('base64url');
+        catalog.set(id, { item, sid, expires:Date.now() + 3600000 });
+        return { id, title:item.title, type:item.type, year:item.year, overview:item.overview };
+      });
+      return send(res, 200, { results:entries });
+    }
+    if (url.pathname === '/api/resolve' && req.method === 'POST') {
+      if (!authorized) return send(res, 401, { error: 'Login required' });
+      const data = await body(req); const selected = catalog.get(data.id);
+      if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
+      const result = await moviebox.resolve(selected.item, Number(data.season), Number(data.episode));
+      const streams = result.streams.map(stream => ({ quality:stream.quality, format:stream.format, url:remember(stream.url, sid, result.referer, stream.format) }));
+      return send(res, 200, { title:selected.item.title, streams });
+    }
+    if (url.pathname === '/api/source' && req.method === 'POST') {
+      if (!authorized) return send(res, 401, { error: 'Login required' });
+      const data = await body(req);
+      return send(res, 200, { url: remember(data.url, sid, null, data.format === 'hls' ? 'hls' : null) });
+    }
+    if (url.pathname.startsWith('/media/') && req.method === 'GET') {
+      if (!authorized) return send(res, 401, { error: 'Login required' });
+      const entry = sources.get(url.pathname.slice(7));
+      if (!entry || entry.sid !== sid || entry.expires < Date.now()) return send(res, 404, { error: 'Source expired' });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30000);
+      res.on('close', () => { clearTimeout(timer); controller.abort(); });
+      const headers = {}; if (entry.referer) headers.referer = entry.referer; if (/^bytes=\d*-\d*$/.test(req.headers.range || '')) headers.range = req.headers.range;
+      const { response, url: finalUrl } = await getRemote(entry.url, headers, controller.signal);
+      clearTimeout(timer); // The timeout is for connecting, not the duration of a movie.
+      if (!response.ok) { await response.body?.cancel(); return send(res, 502, { error: `Source returned ${response.status}` }); }
+      const contentType = response.headers.get('content-type') || 'application/octet-stream';
+      const isPlaylist = entry.format === 'hls' || /mpegurl/i.test(contentType) || /\.m3u8(?:$|\?)/i.test(finalUrl.href);
+      if (isPlaylist) {
+        const reader = response.body.getReader(); let length = 0, parts = [];
+        while (true) { const { done, value } = await reader.read(); if (done) break; length += value.length; if (length > 2 * 1024 * 1024) { await reader.cancel(); fail('Playlist too large'); } parts.push(Buffer.from(value)); }
+        const text = Buffer.concat(parts).toString('utf8'); if (!text.trimStart().startsWith('#EXTM3U')) fail('Invalid playlist');
+        const rewritten = rewritePlaylist(text, finalUrl, sid, entry.referer, remember);
+        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store' }); return res.end(rewritten);
+      }
+      const out = { 'Content-Type': /^(video\/|audio\/|text\/vtt|application\/octet-stream)/i.test(contentType) ? contentType : 'application/octet-stream', 'Cache-Control': 'no-store', 'Content-Disposition': 'inline' };
+      for (const name of ['content-length','content-range','accept-ranges']) { const value = response.headers.get(name); if (value) out[name] = value; }
+      res.writeHead(response.status, out);
+      if (!response.body) return res.end();
+      const stream = Readable.fromWeb(response.body); stream.on('error', () => res.destroy()); stream.pipe(res); return;
+    }
+    if (req.method === 'GET' && staticFiles[url.pathname]) {
+      const [file, mime] = staticFiles[url.pathname]; res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-store' }); return fs.createReadStream(path.join(__dirname, file)).pipe(res);
+    }
+    return send(res, 404, { error: 'Not found' });
+  } catch (e) { if (!res.headersSent) send(res, 400, { error: e.message || 'Request failed' }); else res.destroy(); }
+});
+server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => console.log('Solo Cinema is listening'));
