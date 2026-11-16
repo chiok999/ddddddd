@@ -35,7 +35,7 @@ module.exports = function createMoviebox({ request, safeUrl }) {
       const subjectId = String(s?.subjectId || ''), detailPath = String(s?.detailPath || '');
       const title = String(s?.title || '').slice(0,150), st = Number(s?.subjectType);
       if (!title || !subjectId || !detailPath || ![1,2].includes(st) || subjectId.length > 128 || detailPath.length > 512) return null;
-      return { subjectId, detailPath, title, type: st === 2 ? 'series' : 'movie', year: String(s?.releaseDate || '').slice(0,4), overview: String(s?.description || '').slice(0,1000) };
+      return { subjectId, detailPath, title, type: st === 2 ? 'series' : 'movie', year: String(s?.releaseDate || '').slice(0,4), overview: String(s?.description || '').slice(0,1000), imdbId: /^tt\d{1,12}$/.test(String(s?.imdbId || '')) ? String(s.imdbId) : null, tmdbId: /^\d{1,12}$/.test(String(s?.tmdbId || '')) ? String(s.tmdbId) : null };
     }).filter(Boolean);
   }
   async function resolve(item, season, episode) {
