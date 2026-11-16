@@ -120,3 +120,54 @@ test('media redirects reject private targets before another network request', as
   const fetch=async()=>{calls++; return {status:302,headers:{get:()=> 'https://127.0.0.1/private'},body:{cancel:async()=>{}}};};
   await assert.rejects(getRemote('https://cdn.example/master',{},undefined,fetch,{}),/public HTTPS/); assert.equal(calls,1);
 });
+
+test('KissKh token sandbox has no Node globals and interrupts infinite code', async () => {
+  const {runToken}=require('./kisskh');
+  const script='function _0x54b991(id){return typeof process + ":" + typeof require + ":" + id}';
+  assert.equal(await runToken(script,123),'undefined:undefined:123');
+  await assert.rejects(runToken('while(true){}',123),/failed or exceeded limits/);
+  await assert.rejects(runToken('function _0x54b991(){return "x"}',-1),/Invalid token input/);
+});
+
+test('KissKh search, episode selection and HLS resolution use fixed safe endpoints', async () => {
+  const create=require('./kisskh'); const urls=[];
+  const request=async url=>{ urls.push(String(url));
+    if(url.includes('/Search?')) return {json:[{id:44,title:'Fixture',episodesCount:2},{id:'bad',title:'Invalid'}]};
+    if(url.includes('/Drama/44')) return {json:{episodes:[{id:102,number:2},{id:101,number:1}]}};
+    if(url.endsWith('/index.html')) return {text:'<script src="/assets/common.js"></script>'};
+    if(url.endsWith('/assets/common.js')) return {text:'function _0x54b991(){return "token"}'};
+    if(url.includes('/Episode/102.png?')) return {json:{Video:'https://cdn.example/test.m3u8?sig=1'}};
+    throw Error('unexpected request '+url);
+  };
+  const safeUrl=value=>{const u=new URL(value); if(u.protocol!=='https:' || u.hostname==='127.0.0.1') throw Error('unsafe'); return u;};
+  const kk=create({request,safeUrl}); const items=await kk.search('Fixture'); assert.equal(items.length,1); assert.equal(items[0].source,'kisskh');
+  assert.deepEqual((await kk.details(44)).map(x=>x.number),[1,2]);
+  const result=await kk.resolve(items[0],1,2); assert.equal(result.streams[0].format,'hls'); assert.equal(result.origin,'https://kisskh.is'); assert.ok(urls.some(u=>u.includes('Episode/102.png?kkey=token')));
+  await assert.rejects(kk.resolve(items[0],2,1),/season 1/);
+});
+
+test('KissKh refuses off-host token scripts', async () => {
+  const create=require('./kisskh'); const request=async url=>{
+    if(url.includes('/Drama/')) return {json:{episodes:[{id:1,number:1}]}};
+    return {text:'<script src="https://evil.example/common.js"></script>'};
+  };
+  const kk=create({request,safeUrl:value=>new URL(value)});
+  await assert.rejects(kk.resolve({source:'kisskh',kissId:4,type:'series'},1,1),/expected host/);
+});
+
+test('KissKh English subtitle decryption produces browser WebVTT', async () => {
+  const create=require('./kisskh'), crypto=require('node:crypto');
+  const c=crypto.createCipheriv('aes-128-cbc',Buffer.from('8056483646328763'),Buffer.from('6852612370185273'));
+  const encoded=Buffer.concat([c.update('Hello there'),c.final()]).toString('base64');
+  const request=async url=>{
+    if(url.includes('/Drama/')) return {json:{episodes:[{id:102,number:2}]}};
+    if(url.endsWith('/index.html')) return {text:'<script src="/common.js"></script>'};
+    if(url.endsWith('/common.js')) return {text:'function _0x54b991(){return "abc"}'};
+    if(url.includes('/api/Sub/102')) return {json:[{label:'English',src:'https://cdn.example/sub.txt'}]};
+    if(url==='https://cdn.example/sub.txt') return {text:`1\n00:00:01,200 --> 00:00:03,400\n${encoded}\n`};
+    throw Error('unexpected');
+  };
+  const kk=create({request,safeUrl:value=>new URL(value)});
+  const sub=await kk.subtitle({source:'kisskh',kissId:44,type:'series'},1,2);
+  assert.match(sub,/^WEBVTT\n\n/); assert.match(sub,/00:00:01\.200 --> 00:00:03\.400\nHello there/);
+});

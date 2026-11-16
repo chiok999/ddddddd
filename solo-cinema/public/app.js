@@ -22,10 +22,16 @@ async function playItem(item) {
   $('playError').textContent=''; $('playing').textContent='Preparing…';
   try {
     const url = item.proxy || (await post('/api/source', {url:item.url, format:item.format})).url;
-    current=item; const video=$('video'); if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
+    current=item; const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
     $('quality').replaceChildren(new Option('Auto', '-1')); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
     const resume=()=>{ const progress=load('solo-progress'); const match=progress.find(x=>x.url===(item.progressKey || item.url)); if(match && match.time>5 && Number.isFinite(video.duration) && match.time<video.duration-10) video.currentTime=match.time; };
     video.addEventListener('loadedmetadata', resume, {once:true});
+    if (item.subtitleRequest) {
+      post('/api/kiss-subtitle',item.subtitleRequest).then(result=>{
+        if (!result.url || current!==item) return;
+        const track=document.createElement('track'); track.kind='subtitles'; track.label='English (KissKh)'; track.srclang='en'; track.src=result.url; track.default=true; video.append(track); track.addEventListener('load',()=>{ track.track.mode='showing'; });
+      }).catch(()=>{});
+    }
     // hls.js can detect a playlist whose URL itself is opaque.
     if (item.format === 'hls' && Hls.isSupported()) {
       hls=new Hls(); hls.loadSource(url); hls.attachMedia(video);
@@ -47,17 +53,18 @@ $('searchForm').onsubmit = async e => {
   e.preventDefault(); $('searchError').textContent=''; $('results').replaceChildren(); $('selection').classList.add('hidden'); $('streams').replaceChildren();
   try {
     const data=await post('/api/search', {query:$('query').value.trim()});
-    if(!data.results.length) { $('searchError').textContent='No titles found.'; return; }
+    $('searchError').textContent=(data.providers || []).filter(p=>p.error).map(p=>`${p.provider}: ${p.error}`).join(' · ');
+    if(!data.results.length) { $('searchError').textContent += ' No titles found.'; return; }
     for(const item of data.results) {
       const btn=document.createElement('button'); btn.className='result';
       const title=document.createElement('strong'); title.textContent=item.title;
-      const meta=document.createElement('small'); meta.textContent=`${item.type === 'series' ? 'Series' : 'Movie'} · ${item.year || 'Year unknown'}`;
+      const meta=document.createElement('small'); meta.textContent=`${item.source || 'MovieBox'} · ${item.type === 'series' ? 'Series' : 'Movie'} · ${item.year || 'Year unknown'}`;
       btn.append(title,meta); btn.onclick=async()=>{
         selected=item; $('selectedTitle').textContent=item.title; $('overview').textContent=item.overview;
         $('episodeFields').classList.toggle('hidden', item.type!=='series'); $('episodeCatalog').classList.add('hidden'); $('selection').classList.remove('hidden'); $('streams').replaceChildren(); $('providersNotice').textContent=''; $('searchError').textContent='';
         if(item.type==='series') {
           $('episodeNotice').textContent='Loading episode list…'; $('episodeCatalog').classList.remove('hidden'); $('episodeSelect').replaceChildren();
-          try { const data=await post('/api/episodes',{id:item.id}); if(selected!==item) return; for(const e of data.episodes){ const option=new Option(`S${e.season} E${e.episode} · ${e.title}`, `${e.season}:${e.episode}`); $('episodeSelect').add(option); } $('episodeNotice').textContent=data.episodes.length ? 'Episode data from TVMaze; you can also enter numbers below.' : 'No episode list available; enter numbers below.'; if(data.episodes.length) $('episodeSelect').dispatchEvent(new Event('change')); } catch { if(selected===item) $('episodeNotice').textContent='Episode list unavailable; enter numbers below.'; }
+          try { const data=await post('/api/episodes',{id:item.id}); if(selected!==item) return; for(const e of data.episodes){ const option=new Option(`S${e.season} E${e.episode} · ${e.title}`, `${e.season}:${e.episode}`); $('episodeSelect').add(option); } $('episodeNotice').textContent=data.episodes.length ? `Episode data from ${data.source}; you can also enter numbers below.` : 'No episode list available; enter numbers below.'; if(data.episodes.length) $('episodeSelect').dispatchEvent(new Event('change')); } catch { if(selected===item) $('episodeNotice').textContent='Episode list unavailable; enter numbers below.'; }
         }
       }; $('results').append(btn);
     }
@@ -73,7 +80,7 @@ $('findStreams').onclick=async()=>{
     $('providersNotice').textContent=data.providers.map(p=>`${p.provider}: ${p.count ? p.count+' stream(s)' : (p.error || 'no streams')}`).join(' · ');
     for(const stream of data.streams){
       const btn=document.createElement('button'); btn.textContent=`${stream.provider} · ${stream.quality ? stream.quality+'p' : 'Auto'} · ${stream.format.toUpperCase()}`;
-      btn.onclick=()=>playItem({title:`${data.title}${selected.type === 'series' ? ` S${season} E${episode}` : ''}`,proxy:stream.url,format:stream.format,progressKey:`moviebox:${selected.title}:${selected.year}:${selected.type}:${season}:${episode}`});
+      btn.onclick=()=>playItem({title:`${data.title}${selected.type === 'series' ? ` S${season} E${episode}` : ''}`,proxy:stream.url,format:stream.format,subtitleRequest:selected.source==='kisskh'?{id:selected.id,season,episode}:null,progressKey:`${selected.source}:${selected.title}:${selected.year}:${selected.type}:${season}:${episode}`});
       $('streams').append(btn);
     }
   } catch(err) { $('searchError').textContent=err.message; }
