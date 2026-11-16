@@ -63,3 +63,60 @@ test('HLS playlists rewrite variants, segments, keys and alternate audio through
   assert.deepEqual(seen.map(x=>x.format),['hls','hls',null,null]);
   assert.ok(seen.every(x=>x.sid==='abc' && x.referer==='https://player.example/'));
 });
+
+test('stream adapters reject local source URLs and preserve provider identity', async () => {
+  const { createProviders } = require('./providers');
+  const calls=[];
+  const request=async (url, opts) => { calls.push({url,opts});
+    if (url.startsWith('https://streamdata.vaplayer.ru/')) return {json:{status_code:'200',data:{stream_urls:['https://cdn.example/master.m3u8','http://127.0.0.1/private','https://127.0.0.1/private']}}};
+    if (url.startsWith('https://vidsrc.net/')) return {text:'<div data-hash="abc123">'};
+    if (url.startsWith('https://cloudorizon.com/')) return {text:'https://cdn.example/stream.m3u8 https://127.0.0.1/private.m3u8'};
+    throw Error('unexpected');
+  };
+  const safeUrl=value=>{ const u=new URL(value); if(u.protocol!=='https:' || u.hostname==='127.0.0.1') throw Error('unsafe'); return u; };
+  const p=createProviders({request,safeUrl}); const item={imdbId:'tt12345',tmdbId:'321',type:'series'};
+  const va=await p.vaplayer(item,2,3); assert.equal(va.streams.length,1); assert.equal(va.origin,'https://nextgencloudfabric.com');
+  assert.match(calls[0].url,/season=2&episode=3/);
+  const vid=await p.vidsrc(item,2,3); assert.equal(vid.streams.length,1); assert.equal(vid.streams[0].url,'https://cdn.example/stream.m3u8');
+  await assert.rejects(p.vaplayer({...item,imdbId:'tt1/evil'},1,1),/IMDb ID/);
+  await assert.rejects(p.vidsrc({...item,tmdbId:'1\/evil'},1,1),/TMDB ID/);
+});
+
+test('one failed provider does not prevent another offering playback', async () => {
+  const { resolveProviders } = require('./providers');
+  const moviebox={resolve:async()=>{ throw Error('offline'); }};
+  const providers={vaplayer:async()=>({streams:[{url:'https://cdn.example/a',format:'hls'}],referer:'https://player.example/'}),vidsrc:async()=>({streams:[]})};
+  const item={type:'series'}; const r=await resolveProviders({moviebox,providers,item,season:1,episode:2});
+  assert.equal(r.streams.length,1); assert.equal(r.streams[0].provider,'vaplayer'); assert.equal(r.providers[0].error,'offline'); assert.equal(r.providers[2].count,0);
+  await assert.rejects(resolveProviders({moviebox,providers,item,season:0,episode:2}),/valid season/);
+});
+
+test('TVMaze episode lookup requires exact IMDb ID and uses numeric show ID', async () => {
+  const create=require('./episodes'); const urls=[];
+  const request=async url=>{urls.push(url); return url.includes('/lookup/')?{json:{id:123}}:{json:[{season:1,number:2,name:'Pilot',airdate:'2025-01-01'}, {season:0,number:1,name:'special'}, {season:1,number:null}]};};
+  const getEpisodes=create({request}); assert.deepEqual(await getEpisodes({type:'series',imdbId:'tt123'}),[{season:1,episode:2,title:'Pilot',airdate:'2025-01-01'}]);
+  assert.equal(urls[1],'https://api.tvmaze.com/shows/123/episodes'); assert.deepEqual(await getEpisodes({type:'series',imdbId:'tt1/evil'}),[]);
+});
+
+test('Cinemeta enrichment refuses ambiguous and wrong-year matches', async () => {
+  const create=require('./metadata'); let metas=[];
+  const enrich=create({request:async()=>({json:{metas}})});
+  const item={title:'Same Name',year:'2020',type:'series'};
+  metas=[{name:'Same Name',id:'tt1',releaseInfo:'2018–'}, {name:'Same Name',id:'tt2',releaseInfo:'2020–'}];
+  assert.equal((await enrich(item)).imdbId,'tt2');
+  metas.push({name:'Same Name',id:'tt3',releaseInfo:'2020–'});
+  assert.equal((await enrich(item)).imdbId,undefined);
+});
+
+test('DNS pinning rejects mixed answers and DNS rebinding on each connection', async () => {
+  const { publicLookup }=require('./network'); let calls=0;
+  const lookup=publicLookup(async()=>{ calls++; return calls===1 ? [{address:'8.8.8.8',family:4}] : [{address:'8.8.8.8',family:4},{address:'127.0.0.1',family:4}]; });
+  const resolve=()=>new Promise((ok,bad)=>lookup('cdn.example',{},(e,address)=>e?bad(e):ok(address)));
+  assert.equal(await resolve(),'8.8.8.8'); await assert.rejects(resolve(),/Private/);
+});
+
+test('media redirects reject private targets before another network request', async () => {
+  const { getRemote }=require('./network'); let calls=0;
+  const fetch=async()=>{calls++; return {status:302,headers:{get:()=> 'https://127.0.0.1/private'},body:{cancel:async()=>{}}};};
+  await assert.rejects(getRemote('https://cdn.example/master',{},undefined,fetch,{}),/public HTTPS/); assert.equal(calls,1);
+});

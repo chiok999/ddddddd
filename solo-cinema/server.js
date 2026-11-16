@@ -3,11 +3,9 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const dns = require('node:dns').promises;
-const net = require('node:net');
 const { Readable } = require('node:stream');
 const { Agent, fetch } = require('undici');
-const ipaddr = require('ipaddr.js');
+const { safeUrl, publicLookup, getRemote } = require('./network');
 
 const password = process.env.CINEMA_PASSWORD || '';
 if (password.length < 12) { console.error('Set CINEMA_PASSWORD to at least 12 characters.'); process.exit(1); }
@@ -15,37 +13,13 @@ const sessions = new Map();
 const sources = new Map();
 let loginFailures = [];
 const catalog = new Map();
-const agent = new Agent({ connect: { lookup(host, options, callback) {
-  dns.lookup(host, { all: true, verbatim: true }).then(rows => {
-    if (!rows.length || rows.some(r => { try { return ipaddr.process(r.address).range() !== 'unicast'; } catch { return true; } })) throw Error('Private or invalid address');
-    const matches = options.family ? rows.filter(r => r.family === options.family) : rows;
-    if (!matches.length) throw Error('No address');
-    if (options.all) callback(null, matches); else callback(null, matches[0].address, matches[0].family);
-  }).catch(callback);
-} } });
+const agent = new Agent({ connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
-function safeUrl(input) {
-  const url = new URL(input);
-  const host = url.hostname.toLowerCase().replace(/\.$/, '');
-  if (url.protocol !== 'https:' || url.username || url.password || url.port || url.href.length > 8192 || net.isIP(host.replace(/^\[|\]$/g, '')) || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) fail('Only public HTTPS URLs are allowed');
-  return url;
-}
-async function getRemote(input, headers, signal) {
-  let url = safeUrl(input);
-  for (let n = 0; n <= 5; n++) {
-    const response = await fetch(url, { dispatcher: agent, headers, redirect: 'manual', signal });
-    if (![301,302,303,307,308].includes(response.status)) return { response, url };
-    const location = response.headers.get('location');
-    await response.body?.cancel();
-    if (!location || n === 5) fail('Invalid redirect');
-    url = safeUrl(new URL(location, url));
-  }
-}
-function remember(url, sid, referer = null, format = null) {
+function remember(url, sid, referer = null, format = null, origin = null) {
   if (sources.size > 10000) for (const [id, entry] of sources) { if (entry.expires < Date.now()) sources.delete(id); }
   if (sources.size > 12000) fail('Too many media links; restart the server');
   const id = crypto.randomBytes(24).toString('base64url');
-  sources.set(id, { url: safeUrl(url).href, sid, referer, format, expires: Date.now() + 6 * 3600000 });
+  sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, expires: Date.now() + 6 * 3600000 });
   return `/media/${id}`;
 }
 const { rewritePlaylist } = require('./playlist');
@@ -61,10 +35,19 @@ async function providerRequest(url, opts = {}) {
     total += value.length; if (total > 2 * 1024 * 1024) { await reader.cancel(); fail('Provider response too large'); }
     chunks.push(Buffer.from(value));
   }
-  let json = null; try { json = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* token response may have no JSON */ }
-  return { headers:response.headers, json };
+  const text = Buffer.concat(chunks).toString('utf8');
+  let json = null; try { json = JSON.parse(text); } catch { /* token response may have no JSON */ }
+  return { headers:response.headers, json, text };
 }
 const moviebox = require('./moviebox')({ request:providerRequest, safeUrl });
+const { createProviders, resolveProviders } = require('./providers');
+const providers = createProviders({ request:providerRequest, safeUrl });
+const episodes = require('./episodes')({ request:providerRequest });
+const enrich = require('./metadata')({ request:providerRequest });
+async function enrichItem(entry) {
+  if (!entry.enriched) { entry.enriched = await enrich(entry.item).catch(() => entry.item); }
+  return entry.enriched;
+}
 async function body(req, max = 16384) {
   const chunks = []; let size = 0;
   for await (const chunk of req) { size += chunk.length; if (size > max) fail('Request too large'); chunks.push(chunk); }
@@ -116,13 +99,19 @@ const server = http.createServer(async (req, res) => {
       });
       return send(res, 200, { results:entries });
     }
+    if (url.pathname === '/api/episodes' && req.method === 'POST') {
+      if (!authorized) return send(res, 401, { error: 'Login required' });
+      const data = await body(req); const selected = catalog.get(data.id);
+      if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
+      return send(res, 200, { episodes: await episodes(await enrichItem(selected)) });
+    }
     if (url.pathname === '/api/resolve' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const data = await body(req); const selected = catalog.get(data.id);
       if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
-      const result = await moviebox.resolve(selected.item, Number(data.season), Number(data.episode));
-      const streams = result.streams.map(stream => ({ quality:stream.quality, format:stream.format, url:remember(stream.url, sid, result.referer, stream.format) }));
-      return send(res, 200, { title:selected.item.title, streams });
+      const result = await resolveProviders({ moviebox, providers, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
+      const streams = result.streams.map(stream => ({ provider:stream.provider, quality:stream.quality, format:stream.format, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin) }));
+      return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }
     if (url.pathname === '/api/source' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
@@ -136,8 +125,8 @@ const server = http.createServer(async (req, res) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 30000);
       res.on('close', () => { clearTimeout(timer); controller.abort(); });
-      const headers = {}; if (entry.referer) headers.referer = entry.referer; if (/^bytes=\d*-\d*$/.test(req.headers.range || '')) headers.range = req.headers.range;
-      const { response, url: finalUrl } = await getRemote(entry.url, headers, controller.signal);
+      const headers = {}; if (entry.referer) headers.referer = entry.referer; if (entry.origin) headers.origin = entry.origin; if (/^bytes=\d*-\d*$/.test(req.headers.range || '')) headers.range = req.headers.range;
+      const { response, url: finalUrl } = await getRemote(entry.url, headers, controller.signal, fetch, agent);
       clearTimeout(timer); // The timeout is for connecting, not the duration of a movie.
       if (!response.ok) { await response.body?.cancel(); return send(res, 502, { error: `Source returned ${response.status}` }); }
       const contentType = response.headers.get('content-type') || 'application/octet-stream';
@@ -146,7 +135,7 @@ const server = http.createServer(async (req, res) => {
         const reader = response.body.getReader(); let length = 0, parts = [];
         while (true) { const { done, value } = await reader.read(); if (done) break; length += value.length; if (length > 2 * 1024 * 1024) { await reader.cancel(); fail('Playlist too large'); } parts.push(Buffer.from(value)); }
         const text = Buffer.concat(parts).toString('utf8'); if (!text.trimStart().startsWith('#EXTM3U')) fail('Invalid playlist');
-        const rewritten = rewritePlaylist(text, finalUrl, sid, entry.referer, remember);
+        const rewritten = rewritePlaylist(text, finalUrl, sid, entry.referer, (url, session, referer, format) => remember(url, session, referer, format, entry.origin));
         res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store' }); return res.end(rewritten);
       }
       const out = { 'Content-Type': /^(video\/|audio\/|text\/vtt|application\/octet-stream)/i.test(contentType) ? contentType : 'application/octet-stream', 'Cache-Control': 'no-store', 'Content-Disposition': 'inline' };
