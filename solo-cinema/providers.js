@@ -34,11 +34,12 @@ function createProviders({ request, safeUrl }) {
   }
   return { vaplayer, vidsrc };
 }
-async function resolveProviders({ moviebox, providers, item, season, episode }) {
+async function resolveProviders({ moviebox, providers, movy, item, season, episode }) {
   if (item.type === 'series' && (!Number.isInteger(season) || season < 1 || season > 999 || !Number.isInteger(episode) || episode < 1 || episode > 9999)) throw Error('Choose a valid season and episode');
   const tasks = [['moviebox', () => moviebox.resolve(item, season, episode)], ['vaplayer', () => providers.vaplayer(item, season, episode)], ['vidsrc', () => providers.vidsrc(item, season, episode)]];
+  if (movy) tasks.push(['movy', () => movy(item, season, episode)]);
   const outcomes = await Promise.all(tasks.map(async ([provider, task]) => {
-    try { const result = await task(); return { provider, streams: result.streams.map(s => ({ ...s, provider, referer: result.referer, origin: result.origin, captionInfo:result.captionInfo })), error: null }; }
+    try { const result = await task(); return { provider, streams: result.streams.map(s => ({ ...s, provider:s.provider || provider, referer: result.referer, origin: result.origin, userAgent:result.userAgent, captionInfo:result.captionInfo })), error: null }; }
     catch (err) { return { provider, streams: [], error: String(err?.message || 'Unavailable').slice(0, 160) }; }
   }));
   return { streams: outcomes.flatMap(o => o.streams), providers: outcomes.map(o => ({ provider: o.provider, count: o.streams.length, error: o.error })) };
