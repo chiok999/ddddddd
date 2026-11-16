@@ -141,3 +141,10 @@ test('login, direct stream save and remove work through their controls',async()=
  w.document.getElementById('title').value='My video';w.document.getElementById('url').value='https://example.com/video.mp4';w.document.getElementById('save').click();assert.equal(w.document.querySelectorAll('#list .item').length,1);w.document.querySelector('#list .secondary').click();assert.equal(w.document.querySelectorAll('#list .item').length,0);
  }finally{w.close()}
 });
+
+test('Movy stream requests its own session-bound provider subtitle',async()=>{
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window;let captionRequest;
+ w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.HTMLMediaElement.prototype.play=function(){return Promise.resolve()};w.Hls=class{static isSupported(){return false}};
+ w.fetch=async(url,opts={})=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true};if(url==='/api/search')return {results:[{id:'a',title:'Film',type:'movie',source:'moviebox'}],providers:[]};if(url==='/api/resolve')return {title:'Film',providers:[],streams:[{provider:'movy:miami',format:'hls',url:'/media/a',captionId:'caption-id'}]};if(url==='/api/movy-subtitle'){captionRequest=JSON.parse(opts.body);return {url:'/caption/a'}};return {sections:[]}}});
+ try{w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));await tick();w.document.getElementById('query').value='Film';w.document.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();w.document.querySelector('.result').click();w.document.getElementById('findStreams').click();await tick();w.document.querySelector('#streams button').click();await tick();await tick();assert.equal(captionRequest.id,'caption-id');assert.equal(w.document.getElementById('subtitles').value,'external');}finally{w.close()}
+});
