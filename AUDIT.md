@@ -26,7 +26,7 @@ This is not an exhaustive audit. The repository contains 161 tracked files and a
 - **Reproduce:** `node -e "(async()=>{await import('./lib/movies/engine/media/index.js');const r=(await import('./lib/movies/engine/core/registry.js')).default;console.log(r.table().length,r.table().map(p=>p.id))})()"` prints 11.
 - **Change:** removed the hard-coded count from the script and corrected the comment.
 
-## Open: provider-supplied HLS URLs can access local services
+## Partially mitigated; still open: provider-supplied HLS URLs can access local services
 
 - **Location:** `lib/movies/engine/providers/stream/vaplayer.js:40-44`, `lib/movies/engine/core/resolver.js:194-221,326-333`, `lib/movies/engine/core/verify.js:140-145`; also `lib/movies/engine/media/hls.js:28-34,110-121`.
 - **Finding:** a provider-supplied HTTP(S) URL is passed to `fetch` without rejecting loopback/private destinations or pinning DNS, and redirects are followed.
@@ -52,7 +52,9 @@ JS
 ```
 
 Observed: the local server received `/private` and `verified: true`. The test directly supplies the same candidate shape produced by VaPlayer; it does not compromise that provider.
-- **Disposition:** flagged, not fixed. A safe fix needs to cover redirects, DNS rebinding, playlists, encryption keys, segments, direct media and subprocess downloaders together; a hostname-only check would not close the vulnerability.
+- **Re-audit:** `node --test scripts/test-hls-security.js` now verifies that HLS verification rejects direct loopback URLs and loopback redirects, and rejected URLs cannot be returned as last-resort unverified links. `safeManifest.js` checks each redirect and uses the existing DNS-pinning lookup through an Undici dispatcher.
+- **Still vulnerable:** the native HLS downloader and external downloader paths are not protected. Reproduced by serving a playlist and segment from loopback and calling `downloadHlsNative()` directly: the local server received `/p` and `/segment`. An externally controlled playlist can also direct subsequent segment and key requests; that specific cross-host case has not been reproduced here. Direct file verification/download paths also remain outside this mitigation.
+- **Disposition:** partially mitigated, not fixed. Do not treat the verification guard as a complete SSRF fix. A safe fix must cover playlists, segments, keys, redirects, DNS rebinding, direct media and both subprocess downloaders without an unsafe fallback.
 
 ## Open: live session database is tracked by Git
 
@@ -68,12 +70,17 @@ Observed: the local server received `/private` and `verified: true`. The test di
 - **Finding:** `npm audit` reports four high-severity dependency entries through `webtorrent` → `torrent-discovery` → `bittorrent-tracker` → `ip` (GHSA-2p57-rm9w-gvfp).
 - **Impact:** the advisory concerns incorrect public/private IP classification; exploitability in this bot was not established. The optional WebTorrent package was not installed in this sandbox, but may be installed on other hosts.
 - **Reproduce:** `npm audit --json`, `npm audit --omit=optional --json`, `npm ls webtorrent --depth=0`. Observed: four high entries in the full lockfile audit, zero when optional dependencies are omitted, and the local optional dependency absent.
+- **Re-audit:** `npm pack bittorrent-tracker@11.2.3`, unpack it and search its JavaScript for imports of `ip` and calls to `isPublic`/`isPrivate`. The only `ip` import is `lib/server/parse-udp.js`, which calls `ipLib.toString`; no tracker call to the advisory's classification functions was found. This narrows the observed usage but does not prove the dependency tree is safe.
 - **Disposition:** flagged. The suggested npm fix is a major downgrade to WebTorrent 0.7.3; it was not applied without compatibility and security validation.
 
 ## Test evidence and limits
 
-- `npm test`: 323 passing test executions across seven suite invocations, zero failures. Some tests and fixture paths overlap across suites; this is not 323 unique production paths.
+- `npm test`: 325 passing test executions across seven suite invocations, zero failures. Some tests and fixture paths overlap across suites; this is not 323 unique production paths.
 - `NODE_V8_COVERAGE=/tmp/audit-coverage npm test` and `npx --yes c8 report --temp-directory /tmp/audit-coverage --reporter text --all`: collected coverage, but many tests copy code to temporary fixture paths and the report also includes test scripts; its aggregate is not a reliable complete production-coverage percentage.
 - `git diff --check`: passed.
 - Static provider chain confirmed for the SSRF finding: provider `search()` → `runProviderSearch()` → `resolve()` → `resolveCandidate()` → `verify()` → `verifyHls()` → `fetch()`.
 - This report is incomplete: there is no full per-export call graph, exhaustive dead-code inventory, branch coverage proof, or live end-to-end provider/session result. Do not interpret passing tests as proof of those properties.
+
+## Current re-audit scope
+
+The HLS verification mitigation was tested offline, but the end-to-end SSRF issue, Git-tracked runtime database, and optional dependency advisory remain open. The exhaustive audit originally requested has not been completed. No real production sessions, provider responses or WhatsApp playback were tested.
