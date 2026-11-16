@@ -171,3 +171,33 @@ test('KissKh English subtitle decryption produces browser WebVTT', async () => {
   const sub=await kk.subtitle({source:'kisskh',kissId:44,type:'series'},1,2);
   assert.match(sub,/^WEBVTT\n\n/); assert.match(sub,/00:00:01\.200 --> 00:00:03\.400\nHello there/);
 });
+
+test('playback fallback tries each candidate once and ignores stale errors', () => {
+  const create=require('./public/fallback'); const attempts=[], failures=[]; let exhausted=0;
+  const fallback=create((item,index,total,fail,active)=>{ attempts.push({item,index,total,active}); failures.push(fail); },()=>exhausted++);
+  fallback.play(['first','second','third']); assert.equal(attempts[0].item,'first'); assert.equal(attempts[0].active(),true);
+  failures[0](); assert.equal(attempts[1].item,'second'); assert.equal(attempts[0].active(),false);
+  failures[0](); assert.equal(attempts.length,2); failures[1](); assert.equal(attempts[2].item,'third'); failures[2](); assert.equal(exhausted,1);
+  fallback.play(['new']); fallback.cancel(); assert.equal(attempts[3].active(),false); failures[3](); assert.equal(exhausted,1);
+});
+
+test('HTTP flow authenticates, resolves a fixture, proxies HLS segments and blocks private redirects', async () => {
+  const probe=net.createServer(); await new Promise(r=>probe.listen(0,'127.0.0.1',r)); const port=probe.address().port; await new Promise(r=>probe.close(r));
+  const child=spawn(process.execPath,['--require',require('node:path').join(__dirname,'test-fixtures/mock-upstream.cjs'),'server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'fixture-password-123'},stdio:['ignore','pipe','pipe']});
+  try {
+    await new Promise((resolve,reject)=>{child.stdout.once('data',resolve); child.once('exit',reject);});
+    const base=`http://127.0.0.1:${port}`;
+    const post=(path,data,cookie)=>fetch(base+path,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});
+    const login=await post('/api/login',{password:'fixture-password-123'}); const cookie=login.headers.get('set-cookie').split(';')[0];
+    const found=await (await post('/api/search',{query:'Fixture'},cookie)).json(); assert.equal(found.results.length,1);
+    const resolved=await (await post('/api/resolve',{id:found.results[0].id,season:1,episode:1},cookie)).json();
+    assert.equal(resolved.streams.length,1); assert.equal(resolved.streams[0].provider,'moviebox');
+    const manifest=await fetch(base+resolved.streams[0].url,{headers:{cookie}}); assert.equal(manifest.status,200);
+    const text=await manifest.text(), segment=text.split('\n').find(line=>line.startsWith('/media/')); assert.ok(segment);
+    assert.equal((await fetch(base+segment)).status,401);
+    assert.equal(await (await fetch(base+segment,{headers:{cookie}})).text(),'segment');
+    const redirect=(await (await post('/api/source',{url:'https://cdn.example/redirect.m3u8',format:'hls'},cookie)).json()).url;
+    assert.equal((await fetch(base+redirect,{headers:{cookie}})).status,400);
+    await post('/api/logout',{},cookie); assert.equal((await fetch(base+segment,{headers:{cookie}})).status,401);
+  } finally {child.kill();}
+});
