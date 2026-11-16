@@ -12,6 +12,8 @@ test('login, origin, and private URL protections', async () => {
   const base=`http://127.0.0.1:${port}`;
   const post=(p,data,extra={})=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...extra},body:JSON.stringify(data)});
   assert.equal((await post('/api/source',{url:'https://example.com/video'})).status,401);
+  assert.equal((await post('/api/vidrift',{id:'not-a-session-id',season:1,episode:1})).status,401);
+  const page=await fetch(base+'/'); assert.match(page.headers.get('content-security-policy'),/frame-src https:\/\/embed\.vidrift\.net/);
   assert.equal((await post('/api/login',{password:'wrong'})).status,401);
   assert.equal((await post('/api/login',{password:'a-strong-test-password'},{origin:'https://evil.test'})).status,403);
   const login=await post('/api/login',{password:'a-strong-test-password'}); assert.equal(login.status,200);
@@ -349,4 +351,12 @@ test('7Movies VidLink adapter parses quality variants, fixed header allowlist an
 test('metadata prefers exact release year over an undated namesake',async()=>{
  const enrich=require('./metadata')({request:async(url)=>url.includes('/catalog/')?{json:{metas:[{name:'Film',id:'tt1'},{name:'Film',id:'tt2',releaseInfo:'2020'}]}}:{json:{meta:{id:'tt2',moviedb_id:123}}}});
  const item=await enrich({title:'Film',type:'movie',year:'2020'});assert.equal(item.imdbId,'tt2');assert.equal(item.tmdbId,'123');
+});
+
+test('VidRift embeds use validated IDs and the documented fixed movie and TV paths',()=>{
+  const {embedUrl}=require('./vidrift');
+  const movie=new URL(embedUrl({tmdbId:'438631',type:'movie',title:'Dune'},1,1));
+  assert.equal(movie.origin,'https://embed.vidrift.net');assert.equal(movie.pathname,'/embed/movie/438631');assert.equal(movie.searchParams.get('title'),'Dune');
+  const series=new URL(embedUrl({tmdbId:'1399',type:'series',title:'A & B'},2,3));assert.equal(series.pathname,'/embed/tv/1399/2/3');assert.equal(series.searchParams.get('title'),'A & B');
+  assert.throws(()=>embedUrl({tmdbId:'1/../../evil',type:'movie'},1,1),/TMDB/);assert.throws(()=>embedUrl({tmdbId:'42',type:'series'},0,1),/valid season/);assert.throws(()=>embedUrl({tmdbId:'42',type:'series'},1,10000),/valid season/);assert.throws(()=>embedUrl({tmdbId:'42',type:'bad'},1,1),/type/);
 });

@@ -80,7 +80,7 @@ const staticFiles = {
 };
 const server = http.createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src https://embed.vidrift.net; frame-ancestors 'none'");
   const url = new URL(req.url, 'http://local');
   const sid = /(?:^|;\s*)cinema=([\w-]+)/.exec(req.headers.cookie || '')?.[1];
   const session = sessions.get(sid);
@@ -179,6 +179,13 @@ const server = http.createServer(async (req, res) => {
       const entry=captions.get(url.pathname.slice(9));
       if (!entry || entry.sid!==sid || entry.expires<Date.now()) return send(res,404,{error:'Subtitle expired'});
       res.writeHead(200,{'Content-Type':'text/vtt; charset=utf-8','Cache-Control':'no-store'}); return res.end(entry.text);
+    }
+    if (url.pathname === '/api/vidrift' && req.method === 'POST') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      const data=await body(req); const selected=catalog.get(data.id);
+      if (!selected || selected.sid!==sid || selected.expires<Date.now()) return send(res,404,{error:'Search result expired; search again'});
+      const item=/^[1-9]\d{0,11}$/.test(String(selected.item.tmdbId||'')) ? selected.item : await enrichItem(selected);
+      return send(res,200,{url:require('./vidrift').embedUrl(item,Number(data.season),Number(data.episode))});
     }
     if (url.pathname === '/api/resolve' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
