@@ -23,13 +23,24 @@ async function runToken(code, episodeId, guid = VIDEO_GUID) {
     finally { result.value.dispose(); }
   } finally { ctx.dispose(); runtime.dispose(); }
 }
-module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToken }) {
+module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToken, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
+  // KissKh's bot client retries rate-limited and transient responses. Keep
+  // retries bounded and GET-only; never retry a 403 or bypass host validation.
+  async function fetchKiss(url, opts) {
+    for (let attempt=0;;attempt++) {
+      try { return await request(url, opts); }
+      catch (error) {
+        if (attempt>=2 || ![429,500,502,503,504].includes(Number(error?.status))) throw error;
+        await sleep(500 * (attempt + 1));
+      }
+    }
+  }
   let script = null, scriptAt = 0;
   const headers = { 'user-agent': UA, referer: BASE, accept:'application/json, */*' };
   async function search(query) {
     if (typeof query !== 'string' || !query.trim() || query.length > 150) throw Error('Enter a title up to 150 characters');
     const groups = await Promise.allSettled([1,2,3,4].map(async type => {
-      const { json } = await request(`${BASE}api/DramaList/Search?q=${encodeURIComponent(query.trim())}&type=${type}`, { headers });
+      const { json } = await fetchKiss(`${BASE}api/DramaList/Search?q=${encodeURIComponent(query.trim())}&type=${type}`, { headers });
       if (!Array.isArray(json)) throw Object.assign(Error('Invalid KissKh response'),{code:'INVALID_PROVIDER_RESPONSE'});
       return json.slice(0,8).map(row => {
         const id=Number(row.id), title=String(row.title || '').trim().slice(0,150);
@@ -45,18 +56,18 @@ module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToke
   }
   async function details(id) {
     if (!Number.isSafeInteger(id) || id < 1) throw Error('Invalid KissKh title');
-    const {json} = await request(`${BASE}api/DramaList/Drama/${id}`, {headers});
+    const {json} = await fetchKiss(`${BASE}api/DramaList/Drama/${id}`, {headers});
     const list = Array.isArray(json?.episodes) ? json.episodes : [];
     return list.slice(0,5000).map(e=>({ id:Number(e.id), number:Number(e.number) })).filter(e=>Number.isSafeInteger(e.id) && e.id>0 && Number.isSafeInteger(e.number) && e.number>0 && e.number<=9999).sort((a,b)=>a.number-b.number);
   }
   async function tokenScript() {
     if (script && Date.now()-scriptAt < 30*60000) return script;
-    const html = (await request(`${BASE}index.html`,{headers})).text;
+    const html = (await fetchKiss(`${BASE}index.html`,{headers})).text;
     const src = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(x=>x[1]).find(x=>x.includes('common'));
     if (!src) throw Error('KissKh token script not found');
     const url = safeUrl(new URL(src,BASE));
     if (url.origin !== new URL(BASE).origin) throw Error('KissKh token script is not on the expected host');
-    const text = (await request(url.href,{headers})).text;
+    const text = (await fetchKiss(url.href,{headers})).text;
     if (typeof text !== 'string' || text.length > 1024*1024) throw Error('KissKh token script is too large');
     script=text; scriptAt=Date.now(); return script;
   }
@@ -69,7 +80,7 @@ module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToke
     if (!ep) throw Error('KissKh episode not found');
     let token; try { token=await tokenRunner(await tokenScript(),ep.id); } catch(e) { script=null; throw e; }
     const params=new URLSearchParams({kkey:token});
-    const {json}=await request(`${BASE}api/DramaList/Episode/${ep.id}.png?${params}`,{headers});
+    const {json}=await fetchKiss(`${BASE}api/DramaList/Episode/${ep.id}.png?${params}`,{headers});
     const url=safeUrl(json?.Video);
     if (url.hostname.endsWith('tickcounter.com')) throw Error('Episode not released yet');
     const format=/\.m3u8$/i.test(url.pathname) ? 'hls' : /\.mp4$/i.test(url.pathname) ? 'file' : null;
@@ -85,11 +96,11 @@ module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToke
     if (!ep) throw Error('KissKh episode not found');
     let token; try { token=await tokenRunner(await tokenScript(),ep.id,SUB_GUID); } catch(e) { script=null; throw e; }
     const params=new URLSearchParams({kkey:token});
-    const list=(await request(`${BASE}api/Sub/${ep.id}?${params}`,{headers})).json;
+    const list=(await fetchKiss(`${BASE}api/Sub/${ep.id}?${params}`,{headers})).json;
     const pick=Array.isArray(list) ? list.find(s=>String(s?.label || '').toLowerCase().includes('english')) : null;
     if (!pick?.src) return null;
     const url=safeUrl(pick.src); const ext=url.pathname.split('.').pop().toLowerCase();
-    const raw=(await request(url.href,{headers})).text;
+    const raw=(await fetchKiss(url.href,{headers})).text;
     if (!raw || raw.length > 2*1024*1024) return null;
     const keys={txt:['8056483646328763','6852612370185273'],txt1:['AmSmZVcH93UQUezi','ReBKWW8cqdjPEnF6'],other:['sWODXX04QRTkHdlZ','8pwhapJeC4hrS9hO']};
     const pair=ext==='srt' || ext==='vtt' ? null : (keys[ext] || keys.other);
