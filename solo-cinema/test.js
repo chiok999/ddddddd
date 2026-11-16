@@ -297,3 +297,23 @@ test('discovery loads bounded Cinemeta catalogs with independent errors and cach
   }});
   const sections=await discover(); assert.equal(sections.length,6); assert.equal(sections.find(s=>s.id==='new-series').error,'Catalog unavailable'); assert.equal(sections[0].items.length,1); assert.equal(sections[0].items[0].poster,'https://images.metahub.space/poster.jpg'); assert.ok(urls.some(u=>u.includes('/year/genre=2026.json'))); await discover(); assert.equal(urls.length,12);
 });
+
+test('Movy decrypts independent Python protocol vector and rejects stale seeds',()=>{
+ const {decrypt}=require('./movy'); const body='UUXEqNmj0gylepVn5eDkew5tRHobkchsLrr8zzaK-yxfW21ej4HVVefKPk2c_kRQ2LuBlADfZzow5iKxaQ-chnyABMlXcEPB';
+ assert.deepEqual(decrypt(body,'test-seed',1368337),{sources:[{url:'https://cdn.example/a.m3u8',quality:'1080p'}]});
+ assert.throws(()=>decrypt(body,'stale',1368337),/seed mismatch/);
+});
+
+test('Movy walks servers serially, double encodes title, caches, and returns fixed playback headers',async()=>{
+ const {createMovy}=require('./movy');const {safeUrl}=require('./network');const body='UUXEqNmj0gylepVn5eDkew5tRHobkchsLrr8zzaK-yxfW21ej4HVVefKPk2c_kRQ2LuBlADfZzow5iKxaQ-chnyABMlXcEPB';const urls=[];let seedCount=0;
+ const request=async(url)=>{urls.push(url);if(url.includes('www.movy.sx'))return {text:`<script id="__NEXT_DATA__">${JSON.stringify({props:{pageProps:{details:{title:'The Odyssey',year:2026,imdbId:'tt33764258'}}}})}</script>`};if(url.includes('/seed?')){seedCount++;return {json:{seed:'test-seed'}}} if(url.includes('/miami/'))return {text:body};throw Error('unexpected');};
+ const resolve=createMovy({request,safeUrl});const item={tmdbId:'1368337',type:'movie'};const [a,b]=await Promise.all([resolve(item,1,1),resolve(item,1,1)]);assert.equal(a.streams[0].provider,'movy:miami');assert.equal(a.streams[0].quality,1080);assert.equal(a.userAgent,'okhttp/4.12.0');assert.equal(a.origin,'https://www.movy.sx');assert.strictEqual(a,b);assert.equal(seedCount,1);assert.match(urls[2],/title=The%2520Odyssey/);assert.match(urls[2],/totalSeasons=0/);assert.equal(urls.length,3);
+});
+
+test('Movy retries a stale seed once and backs off on 429',async()=>{
+ const {createMovy}=require('./movy');const {safeUrl}=require('./network');const body='UUXEqNmj0gylepVn5eDkew5tRHobkchsLrr8zzaK-yxfW21ej4HVVefKPk2c_kRQ2LuBlADfZzow5iKxaQ-chnyABMlXcEPB';let seeds=0, calls=0, clock=100000;
+ const resolve=createMovy({safeUrl,now:()=>clock,request:async(url)=>{calls++;if(url.includes('www.movy.sx'))return {text:'<script id="__NEXT_DATA__">'+JSON.stringify({props:{pageProps:{details:{title:'Test',year:2026}}}})+'</script>'};if(url.includes('/seed?'))return {json:{seed:++seeds===1?'stale':'test-seed'}};return {text:body};}});
+ const r=await resolve({tmdbId:'1368337',type:'movie'},1,1);assert.equal(r.streams.length,1);assert.equal(seeds,2);
+ let attempts=0;const limited=createMovy({safeUrl,now:()=>clock,request:async(url)=>{attempts++;if(url.includes('www.movy.sx'))return {text:'<script id="__NEXT_DATA__">'+JSON.stringify({props:{pageProps:{details:{title:'Test',year:2026}}}})+'</script>'};throw Object.assign(Error('limit'),{status:429});}});
+ await assert.rejects(limited({tmdbId:'1368337'},1,1),/rate limited/);await assert.rejects(limited({tmdbId:'1368337'},1,1),/rate limited/);assert.equal(attempts,2);
+});

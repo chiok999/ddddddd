@@ -24,11 +24,11 @@ const captions = new Map();
 const captionSources = new Map();
 const agent = new Agent({ connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
-function remember(url, sid, referer = null, format = null, origin = null) {
+function remember(url, sid, referer = null, format = null, origin = null, userAgent = null) {
   if (sources.size > 10000) for (const [id, entry] of sources) { if (entry.expires < Date.now()) sources.delete(id); }
   if (sources.size > 12000) fail('Too many media links; restart the server');
   const id = crypto.randomBytes(24).toString('base64url');
-  sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, expires: Date.now() + 6 * 3600000 });
+  sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, expires: Date.now() + 6 * 3600000 });
   return `/media/${id}`;
 }
 const { rewritePlaylist } = require('./playlist');
@@ -53,6 +53,7 @@ const moviebox = require('./moviebox')({ request:providerRequest, safeUrl });
 const kisskh = require('./kisskh')({ request:providerRequest, safeUrl });
 const { createProviders, resolveProviders } = require('./providers');
 const providers = createProviders({ request:providerRequest, safeUrl });
+const movy = require('./movy').createMovy({request:providerRequest,safeUrl});
 const episodes = require('./episodes')({ request:providerRequest });
 const enrich = require('./metadata')({ request:providerRequest });
 async function enrichItem(entry) {
@@ -169,12 +170,12 @@ const server = http.createServer(async (req, res) => {
       if (selected.item.source === 'kisskh') {
         try { const r=await kisskh.resolve(selected.item,Number(data.season),Number(data.episode)); result={ streams:r.streams.map(s=>({...s,provider:'kisskh',referer:r.referer,origin:r.origin})), providers:[{provider:'kisskh',count:r.streams.length,error:null}] }; }
         catch (err) { result={streams:[],providers:[{provider:'kisskh',count:0,error:String(err?.message || 'Unavailable').slice(0,160)}]}; }
-      } else result = await resolveProviders({ moviebox, providers, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
+      } else result = await resolveProviders({ moviebox, providers, movy, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
       for (const [id, entry] of captionSources) if (entry.expires<Date.now()) captionSources.delete(id);
       const streams = result.streams.map(stream => {
         let captionId=null;
         if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,expires:Date.now()+6*3600000}); }
-        return { provider:stream.provider, quality:stream.quality, format:stream.format, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin) };
+        return { provider:stream.provider, quality:stream.quality, format:stream.format, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent) };
       });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }
@@ -190,7 +191,7 @@ const server = http.createServer(async (req, res) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 30000);
       res.on('close', () => { clearTimeout(timer); controller.abort(); });
-      const headers = {}; if (entry.referer) headers.referer = entry.referer; if (entry.origin) headers.origin = entry.origin; if (/^bytes=\d*-\d*$/.test(req.headers.range || '')) headers.range = req.headers.range;
+      const headers = {}; if (entry.userAgent) headers['user-agent'] = entry.userAgent; if (entry.referer) headers.referer = entry.referer; if (entry.origin) headers.origin = entry.origin; if (/^bytes=\d*-\d*$/.test(req.headers.range || '')) headers.range = req.headers.range;
       const { response, url: finalUrl } = await getRemote(entry.url, headers, controller.signal, fetch, agent);
       clearTimeout(timer); // The timeout is for connecting, not the duration of a movie.
       if (!response.ok) { await response.body?.cancel(); return send(res, 502, { error: `Source returned ${response.status}` }); }
@@ -200,7 +201,7 @@ const server = http.createServer(async (req, res) => {
         const reader = response.body.getReader(); let length = 0, parts = [];
         while (true) { const { done, value } = await reader.read(); if (done) break; length += value.length; if (length > 2 * 1024 * 1024) { await reader.cancel(); fail('Playlist too large'); } parts.push(Buffer.from(value)); }
         const text = Buffer.concat(parts).toString('utf8'); if (!text.trimStart().startsWith('#EXTM3U')) fail('Invalid playlist');
-        const rewritten = rewritePlaylist(text, finalUrl, sid, entry.referer, (url, session, referer, format) => remember(url, session, referer, format, entry.origin));
+        const rewritten = rewritePlaylist(text, finalUrl, sid, entry.referer, (url, session, referer, format) => remember(url, session, referer, format, entry.origin, entry.userAgent));
         res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store' }); return res.end(rewritten);
       }
       const out = { 'Content-Type': /^(video\/|audio\/|text\/vtt|application\/octet-stream)/i.test(contentType) ? contentType : 'application/octet-stream', 'Cache-Control': 'no-store', 'Content-Disposition': 'inline' };

@@ -29,3 +29,7 @@ Scope: inspected the standalone app's `public/index.html` and every handler in `
 3. No genuine geographic server integration, live trending chart, live anime-specific catalog, OpenSubtitles search, subtitle timing adjustment, or torrent transport. The Cinemeta popular and curated anime sections are labelled accordingly.
 4. Storage-disabled or quota-exceeded environments can make watchlist/progress persistence fail (`public/app.js:5`); normal browser storage is assumed.
 5. The existing bot downloader's SSRF exposure remains separately documented in `../AUDIT.md`; the standalone app deliberately does not expose that downloader. Provider-supplied links and the QuickJS token sandbox still warrant independent security review.
+
+## Movy update
+
+The user subsequently supplied API and decryption details. The standalone app now tries named English Movy servers sequentially, stopping at the first usable response, and labels actual results in the source picker. This is not a simultaneous list of all servers. Dubbed servers and Berlin's alternate-title rule are not implemented. External endpoint access, signed-link expiry, actual response format, and playback headers across live CDN redirects remain unverified here; the tests are fixtures/mocks. A 10-minute cache cannot guarantee a particular signed URL remains valid for its entire lifetime. The existing KissKh catalog path remains separate and does not fall back to Movy.
