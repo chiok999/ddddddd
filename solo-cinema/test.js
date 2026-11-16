@@ -48,7 +48,7 @@ test('MovieBox player host is checked before requesting streams', async () => {
     throw Error('unexpected request');
   }});
   await assert.rejects(adapter.resolve({type:'movie',title:'x',subjectId:'1',detailPath:'x'},1,1),/unsafe/);
-  assert.equal(calls,2);
+  assert.equal(calls,3); // search fallback is also attempted, but the private player is never requested.
 });
 
 test('HLS playlists rewrite variants, segments, keys and alternate audio through the proxy', () => {
@@ -95,7 +95,7 @@ test('TVMaze episode lookup requires exact IMDb ID and uses numeric show ID', as
   const create=require('./episodes'); const urls=[];
   const request=async url=>{urls.push(url); return url.includes('/lookup/')?{json:{id:123}}:{json:[{season:1,number:2,name:'Pilot',airdate:'2025-01-01'}, {season:0,number:1,name:'special'}, {season:1,number:null}]};};
   const getEpisodes=create({request}); assert.deepEqual(await getEpisodes({type:'series',imdbId:'tt123'}),[{season:1,episode:2,title:'Pilot',airdate:'2025-01-01'}]);
-  assert.equal(urls[1],'https://api.tvmaze.com/shows/123/episodes'); assert.deepEqual(await getEpisodes({type:'series',imdbId:'tt1/evil'}),[]);
+  assert.equal(urls[2],'https://api.tvmaze.com/shows/123/episodes'); assert.deepEqual(await getEpisodes({type:'series',imdbId:'tt1/evil'}),[]);
 });
 
 test('Cinemeta enrichment refuses ambiguous and wrong-year matches', async () => {
@@ -230,4 +230,31 @@ test('search diagnostics show safe failure codes without exposing provider URLs'
   assert.equal(describe(new Error('secret https://example.com/?token=x')), 'network or provider error');
   const kk=require('./kisskh')({request:async()=>{ throw Object.assign(new Error('sensitive url'),{status:403}); },safeUrl:u=>new URL(u)});
   await assert.rejects(kk.search('Example'),err=>{ assert.equal(err.code,'KISSKH_SEARCH_FAILED'); assert.deepEqual(err.reasons,['HTTP 403']); return true; });
+});
+
+test('Cinemeta details provide TMDB ID and episode list when catalog and TVMaze lack them', async () => {
+  const request=async url=>{
+    if(url.includes('/catalog/')) return {json:{metas:[{id:'tt38937897',name:'Merry Berry Love',releaseInfo:'2026'}]}};
+    if(url==='https://cinemeta-live.strem.io/meta/series/tt38937897.json') return {json:{meta:{id:'tt38937897',moviedb_id:305551,videos:[{season:1,episode:6,title:'Episode 6',released:'2026-11-11T00:00:00Z'}]}}};
+    throw Error('TVMaze unavailable');
+  };
+  const item=await require('./metadata')({request})({title:'Merry Berry Love',year:'2026',type:'series'});
+  assert.equal(item.imdbId,'tt38937897'); assert.equal(item.tmdbId,'305551');
+  const list=await require('./episodes')({request})(item);
+  assert.deepEqual(list,[{season:1,episode:6,title:'Episode 6',airdate:'2026-11-11'}]);
+});
+
+test('MovieBox refreshes an empty player and retries an exact matching duplicate', async () => {
+  const calls=[]; let domains=0;
+  const request=async(url,opts={})=>{calls.push({url,opts});
+    if(url.includes('/home?')) return {headers:{get:()=>'{"token":"guest"}'}};
+    if(url.includes('/get-domain')) {domains++; return {json:{data:'https://player.example'}};}
+    if(url.includes('/subject/search')) return {json:{data:{items:[{subject:{subjectId:'2',detailPath:'correct',title:'Merry Berry Love',subjectType:2,releaseDate:'2026-01-01'}},{subject:{subjectId:'3',detailPath:'wrong',title:'Merry Berry Love',subjectType:2,releaseDate:'2025-01-01'}}]}}};
+    if(url.includes('/subject/play')) return {json:{data:{streams:url.includes('subjectId=2')?[{url:'https://cdn.example/video.mp4',resolutions:720,duration:3600}]:[]}}};
+    throw Error('unexpected');
+  };
+  const mb=require('./moviebox')({request,safeUrl:u=>new URL(u)});
+  const r=await mb.resolve({subjectId:'1',detailPath:'empty',title:'Merry Berry Love',year:'2026',type:'series'},1,6);
+  assert.equal(r.streams[0].quality,720); assert.ok(domains>=3); assert.match(r.referer,/spa\/videoPlayPage\/movies\/correct/);
+  assert.ok(calls.some(x=>x.url.includes('subjectId=2'))); assert.ok(!calls.some(x=>x.url.includes('subjectId=3')));
 });

@@ -124,7 +124,7 @@ const server = http.createServer(async (req, res) => {
         const list = await kisskh.details(selected.item.kissId);
         return send(res, 200, { episodes:list.map(e => ({ season:1, episode:e.number, title:`Episode ${e.number}` })), source:'KissKh' });
       }
-      return send(res, 200, { episodes: await episodes(await enrichItem(selected)), source:'TVMaze' });
+      return send(res, 200, { episodes: await episodes(await enrichItem(selected)), source:'Cinemeta / TVMaze' });
     }
     if (url.pathname === '/api/kiss-subtitle' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
