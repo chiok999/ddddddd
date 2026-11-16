@@ -766,3 +766,76 @@ test('healthy owner and linked connections are not recycled solely because hours
     assert.equal(fx.created.length, 2);
   } finally { Date.now = originalNow; }
 });
+
+test('a rejected socket end during stale recovery does not crash the process', (t) => {
+  const { spawnSync } = require('node:child_process');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-end-rejection-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const code = `
+    const { EventEmitter } = require('node:events');
+    const { createSessionManager } = require(${JSON.stringify(require.resolve('../gateway/sessions/manager'))});
+    let sock;
+    const manager = createSessionManager({
+      sessionDir: process.argv[1], staleMs: 10, recycleMs: 0,
+      loadAuthState: async () => ({ state: { creds: { registered: true, me: { id: '265990000000:1@s.whatsapp.net' } } }, saveCreds: async () => {} }),
+      getVersion: async () => [2, 0, 0], probe: async () => { throw new Error('no pong'); },
+      makeSocket: () => sock = { ev: new EventEmitter(), end: async () => { throw new Error('end failed'); } },
+      onMessage: async () => {}, log: { warn() {}, error() {}, info() {} },
+    });
+    (async () => { await manager.start(); sock.ev.emit('connection.update', { connection: 'open' });
+      await new Promise(r => setTimeout(r, 20)); await manager._checkStale();
+      await new Promise(r => setTimeout(r, 20)); await manager.stop(); process.stdout.write('survived'); })();
+  `;
+  const result = spawnSync(process.execPath, ['--unhandled-rejections=strict', '-e', code, root], { encoding: 'utf8', timeout: 3000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, 'survived');
+});
+
+test('a failed credential save is retried before a linked socket reloads', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-save-retry-'));
+  let fail = true;
+  const fx = fixture(root, {
+    loadAuthState: async (dir, opts) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, 'creds.json');
+      let creds;
+      try { creds = JSON.parse(fs.readFileSync(file, 'utf8')); }
+      catch { if (opts?.requireExisting) throw Object.assign(new Error('missing'), { code: 'AUTH_MISSING' }); creds = { registered: false }; }
+      return { state: { creds }, saveCreds: async () => {
+        if (dir.includes(`${path.sep}linked${path.sep}`) && fail) throw new Error('disk temporarily unavailable');
+        fs.writeFileSync(file, JSON.stringify(creds));
+      } };
+    },
+  });
+  t.after(async () => { await fx.manager.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await fx.manager.start();
+  const { sock } = await request(fx, '265991111111');
+  open(sock, '265991111111');
+  await delay(10);
+  sock.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 515 } } } });
+  await delay(40);
+  assert.notEqual(stateOf(fx, '265991111111'), 'logged_out', 'transient disk failures must not erase an in-memory login');
+  assert.equal(fx.created.length, 2, 'do not reload stale or missing credentials');
+  fail = false;
+  await waitFor(() => fx.created.length === 3, 1000);
+  assert.equal(fx.created[2].auth.creds.registered, true);
+});
+
+test('credential updates save in order before reconnection', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-save-order-'));
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  let calls = 0;
+  const fx = fixture(root, { loadAuthState: async () => ({
+    state: { creds: { registered: true, me: { id: '265990000000:1@s.whatsapp.net' } } },
+    saveCreds: async () => { calls++; if (calls === 1) { await gate; throw new Error('first write failed'); } },
+  }) });
+  t.after(async () => { release(); await fx.manager.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await fx.manager.start();
+  const sock = fx.created[0];
+  sock.ev.emit('creds.update');
+  sock.ev.emit('creds.update');
+  await delay(15);
+  assert.equal(calls, 1, 'a later save cannot overtake an unfinished save');
+  release();
+  await waitFor(() => calls === 2);
+});

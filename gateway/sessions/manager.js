@@ -210,7 +210,12 @@ function createSessionManager(opts) {
         sockets.setOffline(entry.id, sock);
         entry.reconnects += 1;
         entry.reconnector.schedule(1000);
-        try { sock.end?.(new Error('stale-connection')); } catch { /* already closed */ }
+        // Socket end may reject asynchronously, not just throw synchronously.
+        // Do not wait here: a hung close must not block probing other accounts.
+        try {
+          Promise.resolve(sock.end?.(new Error('stale-connection'))).catch((closeError) =>
+            log.warn(`Stale socket could not close: ${closeError?.message || closeError}`));
+        } catch (closeError) { log.warn(`Stale socket could not close: ${closeError?.message || closeError}`); }
         notify();
       } finally { entry.probing = false; }
     }
@@ -279,7 +284,7 @@ function createSessionManager(opts) {
     const entry = {
       id, number, attempt,
       dir: number ? path.join(linkedRoot, number, attempt) : primaryDir,
-      status: state, pairNumber, sock: null, auth: null, connected: false,
+      status: state, pairNumber, sock: null, auth: null, saveCreds: null, credentialSaveError: null, credentialWriteTail: Promise.resolve(), connected: false,
       stopped: false, starting: null, requestStarted: false, pairResult: null,
       waiters: [], expiryTimer: null, seen: new Map(), credentialWrites: new Set(), retryNoticeAt: 0,
       openedAt: 0, lastInboundAt: 0, lastProbeOkAt: 0, probing: false, reconnects: 0, pauseReason: '', pauseNoticeAt: 0, pauseSince: 0,
@@ -396,6 +401,13 @@ function createSessionManager(opts) {
       // the replacement socket's newer state. Drain the previous generation.
       await Promise.allSettled([...entry.credentialWrites]);
       if (stopped || entry.stopped) return null;
+      // Never discard the only current in-memory credentials after a failed
+      // save. Let the reconnect scheduler retry persistence before reloading.
+      if (entry.credentialSaveError && entry.saveCreds) {
+        await entry.saveCreds();
+        entry.credentialSaveError = null;
+      }
+      if (stopped || entry.stopped) return null;
       entry.requestStarted = false;
       let auth;
       try {
@@ -413,6 +425,7 @@ function createSessionManager(opts) {
       }
       if (stopped || entry.stopped) return null;
       entry.auth = auth.state;
+      entry.saveCreds = auth.saveCreds;
       const version = await opts.getVersion();
       if (stopped || entry.stopped) return null;
       const sock = opts.makeSocket({ auth: auth.state, version });
@@ -438,13 +451,19 @@ function createSessionManager(opts) {
 
       sock.ev.on('creds.update', () => {
         if (entry.stopped || sock.__superseded || entry.sock !== sock) return;
-        const write = Promise.resolve().then(() => auth.saveCreds()).then(() => {
+        // Serialize saves so an older completion cannot mask a newer failure.
+        const write = entry.credentialWriteTail.then(() => auth.saveCreds()).then(() => {
+          entry.credentialSaveError = null;
           if (entry.number && entry.auth?.creds?.registered && !entry.stopped && entry.status !== 'logged_out') {
             mark(entry, 'active');
             if (entry.expiryTimer) clearTimeout(entry.expiryTimer);
             entry.expiryTimer = null;
           }
-        }).catch((err) => log.error(`Could not save WhatsApp credentials: ${err?.message || err}`));
+        }).catch((err) => {
+          entry.credentialSaveError = err;
+          log.error(`Could not save WhatsApp credentials: ${err?.message || err}`);
+        });
+        entry.credentialWriteTail = write;
         entry.credentialWrites.add(write);
         void write.then(() => entry.credentialWrites.delete(write), () => entry.credentialWrites.delete(write));
       });
