@@ -201,3 +201,24 @@ test('HTTP flow authenticates, resolves a fixture, proxies HLS segments and bloc
     await post('/api/logout',{},cookie); assert.equal((await fetch(base+segment,{headers:{cookie}})).status,401);
   } finally {child.kill();}
 });
+
+test('startup loads Botkeep .env and exported environment takes precedence', async () => {
+  const fs=require('node:fs'), os=require('node:os'), path=require('node:path');
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'solo-cinema-env-'));
+  const probe=net.createServer(); await new Promise(r=>probe.listen(0,'127.0.0.1',r)); const port=probe.address().port; await new Promise(r=>probe.close(r));
+  fs.writeFileSync(path.join(dir,'.env'),'CINEMA_PASSWORD=from-env-file-123\n');
+  const baseEnv={...process.env,PORT:String(port)}; delete baseEnv.CINEMA_PASSWORD;
+  async function run(env,valid,invalid) {
+    const child=spawn(process.execPath,[path.join(__dirname,'server.js')],{cwd:dir,env,stdio:['ignore','pipe','pipe']});
+    try {
+      await new Promise((resolve,reject)=>{child.stdout.once('data',resolve); child.once('exit',reject);});
+      const base=`http://127.0.0.1:${port}`;
+      const login=password=>fetch(base+'/api/login',{method:'POST',headers:{origin:base,'content-type':'application/json'},body:JSON.stringify({password})});
+      assert.equal((await login(invalid)).status,401); assert.equal((await login(valid)).status,200);
+    } finally { const done=new Promise(r=>child.once('exit',r)); child.kill(); await done; }
+  }
+  try {
+    await run(baseEnv,'from-env-file-123','exported-value-123');
+    await run({...baseEnv,CINEMA_PASSWORD:'exported-value-123'},'exported-value-123','from-env-file-123');
+  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+});

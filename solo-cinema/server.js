@@ -7,6 +7,12 @@ const { Readable } = require('node:stream');
 const { Agent, fetch } = require('undici');
 const { safeUrl, publicLookup, getRemote } = require('./network');
 
+// Botkeep writes variables to .env rather than exporting them. Node loads the
+// file from the process working directory without overriding real environment
+// variables supplied by the host. Never log the values.
+try { process.loadEnvFile(path.resolve(process.cwd(), '.env')); }
+catch (err) { if (err.code !== 'ENOENT') { console.error('Unable to load .env file.'); process.exit(1); } }
+
 const password = process.env.CINEMA_PASSWORD || '';
 if (password.length < 12) { console.error('Set CINEMA_PASSWORD to at least 12 characters.'); process.exit(1); }
 const sessions = new Map();
