@@ -34,12 +34,14 @@ function createProviders({ request, safeUrl }) {
   }
   return { vaplayer, vidsrc };
 }
-async function resolveProviders({ moviebox, providers, movy, item, season, episode }) {
+async function resolveProviders({ moviebox, providers, movy, vidlink, item, season, episode }) {
   if (item.type === 'series' && (!Number.isInteger(season) || season < 1 || season > 999 || !Number.isInteger(episode) || episode < 1 || episode > 9999)) throw Error('Choose a valid season and episode');
-  const tasks = [['moviebox', () => moviebox.resolve(item, season, episode)], ['vaplayer', () => providers.vaplayer(item, season, episode)], ['vidsrc', () => providers.vidsrc(item, season, episode)]];
+  const movieboxResolve=async()=>{ if(item.source!=='cinemeta') return moviebox.resolve(item,season,episode); const norm=s=>String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim(); const matches=(await moviebox.search(item.title)).filter(x=>x.type===item.type && norm(x.title)===norm(item.title) && item.year && x.year===item.year); if(matches.length!==1) throw Error('No unambiguous MovieBox match'); return moviebox.resolve(matches[0],season,episode); };
+  const tasks = [['moviebox', movieboxResolve], ['vaplayer', () => providers.vaplayer(item, season, episode)], ['vidsrc', () => providers.vidsrc(item, season, episode)]];
   if (movy) tasks.push(['movy', () => movy(item, season, episode)]);
+  if (vidlink) tasks.push(['7movies', () => vidlink(item, season, episode)]);
   const outcomes = await Promise.all(tasks.map(async ([provider, task]) => {
-    try { const result = await task(); return { provider, streams: result.streams.map(s => ({ ...s, provider:s.provider || provider, referer: result.referer, origin: result.origin, userAgent:result.userAgent, captionInfo:result.captionInfo })), error: null }; }
+    try { const result = await task(); return { provider, streams: result.streams.map(s => ({ ...s, provider:s.provider || provider, referer: s.referer || result.referer, origin: s.origin || result.origin, userAgent:s.userAgent || result.userAgent, captionInfo:result.captionInfo })), error: null }; }
     catch (err) { return { provider, streams: [], error: String(err?.message || 'Unavailable').slice(0, 160) }; }
   }));
   return { streams: outcomes.flatMap(o => o.streams), providers: outcomes.map(o => ({ provider: o.provider, count: o.streams.length, error: o.error })) };

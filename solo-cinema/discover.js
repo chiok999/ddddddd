@@ -7,7 +7,7 @@ module.exports = function createDiscover({request, now = () => new Date()}) {
     if(pending) return pending;
     pending=(async()=>{
       const year=now().getUTCFullYear();
-      const paths=[['popular-movies','movie','top',''],['popular-series','series','top',''],['new-movies','movie','year',`genre=${year}`],['new-series','series','year',`genre=${year}`],['animation','series','top','genre=Animation'],['top-rated','movie','imdbRating','']];
+      const paths=[['popular-movies','movie','top',''],['popular-series','series','top',''],['new-movies','movie','year',`genre=${year}`],['new-series','series','year',`genre=${year}`],['animation','series','top','genre=Animation'],['anime','series','top','genre=Anime'],['top-rated','movie','imdbRating','']];
       const results=await Promise.allSettled(paths.map(async ([id,type,catalog,extra])=>{
         const url=`https://cinemeta-catalogs.strem.io/${catalog}/catalog/${type}/${catalog}${extra ? '/'+extra : ''}.json`;
         const response=await request(url); const metas=response.json?.metas;

@@ -40,7 +40,7 @@ module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToke
   async function search(query) {
     if (typeof query !== 'string' || !query.trim() || query.length > 150) throw Error('Enter a title up to 150 characters');
     const groups = await Promise.allSettled([1,2,3,4].map(async type => {
-      const { json } = await fetchKiss(`${BASE}api/DramaList/Search?q=${encodeURIComponent(query.trim())}&type=${type}`, { headers });
+      const { json } = await fetchKiss(`${BASE}api/DramaList/Search?q=${encodeURIComponent(query.trim())}&type=${type}`, { headers, timeoutMs:5000 });
       if (!Array.isArray(json)) throw Object.assign(Error('Invalid KissKh response'),{code:'INVALID_PROVIDER_RESPONSE'});
       return json.slice(0,8).map(row => {
         const id=Number(row.id), title=String(row.title || '').trim().slice(0,150);
