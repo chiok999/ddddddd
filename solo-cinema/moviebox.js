@@ -64,7 +64,11 @@ module.exports = function createMoviebox({ request, safeUrl }) {
           for (const stream of Array.isArray(data.hls) ? data.hls.slice(0,30) : []) {
             try { list.push({ url:safeUrl(typeof stream === 'string' ? stream : stream.url).href, format:'hls', quality:Number(stream?.resolutions) || 0 }); } catch { /* unsafe or unsupported URL */ }
           }
-          if (list.length) return { streams:list, referer };
+          if (list.length) {
+            const captionStream=(Array.isArray(data.streams) ? data.streams : []).find(s=>s?.id);
+            const captionInfo=captionStream ? {id:String(captionStream.id),format:String(captionStream.format || 'MP4'),subjectId:candidate.subjectId,detailPath:candidate.detailPath} : null;
+            return { streams:list, referer, captionInfo };
+          }
         }
       }
       return null;
@@ -82,5 +86,25 @@ module.exports = function createMoviebox({ request, safeUrl }) {
     if (firstError) throw firstError;
     throw Error('MovieBox returned no playable streams for this title or episode');
   }
-  return { search, resolve };
+  async function subtitle(info) {
+    if (!info || !info.id || !info.subjectId || !info.detailPath) return null;
+    const params=new URLSearchParams({id:info.id,format:info.format,subjectId:info.subjectId,detailPath:info.detailPath});
+    for(const route of ['/subject/caption','/subject/captions','/subject/subtitle']) {
+      let result; try { result=await bff(`${route}?${params}`); } catch { continue; }
+      const data=result.json?.data || {};
+      const tracks=Array.isArray(data)?data:(data.captions || data.list || data.subtitles || data.tracks || []);
+      if(!Array.isArray(tracks)) continue;
+      const track=tracks.find(t=>/^(?:en|eng|english)(?:$|[-_\s])/i.test(String(t?.language || t?.lan || t?.lang || t?.code || '')));
+      if(!track) continue;
+      try {
+        const url=safeUrl(track.url || track.src || track.subtitleUrl);
+        const text=(await request(url.href)).text?.replace(/^\uFEFF/,'').trim();
+        if(!text || /^<(!doctype|html)/i.test(text) || !text.includes('-->')) continue;
+        const converted=text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g,'$1.$2');
+        return /^WEBVTT/i.test(converted) ? converted : `WEBVTT\n\n${converted}`;
+      } catch { /* malformed or unreachable subtitle */ }
+    }
+    return null;
+  }
+  return { search, resolve, subtitle };
 };
