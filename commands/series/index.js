@@ -27,6 +27,10 @@ const log = logger('series');
 const QUALITY_RX = /^(?:(480|720|1080|2160)p?|4k)$/i;
 const MOVIES = () => config.movies || {};
 const pad = (n) => String(n).padStart(2, '0');
+const NON_MOVIEBOX_PROVIDERS = [
+  'vidsrc', 'vaplayer', 'yts', 'torrentio', 'eztv',
+  'nyaa', 'knaben', 'solidtorrents', 'torrentscsv', 'apibay',
+];
 
 const help = (P) =>
   `Usage: ${P}series <title> s01e03 | s01 1-6 | s01 full [480|720|1080]`;
@@ -288,7 +292,7 @@ async function askQuality(sock, msg, extra, meta, job) {
   if (job.explicitQuality) return deliver(sock, msg, extra, meta, job);
 
   await react('🔎');
-  const episode = job.pack ? null : (job.from || 1);
+  const episode = job.from || 1;
   let options = [];
   try {
     const found = await engine.qualityOptions({ item: meta, type: 'series', season, episode });
@@ -380,7 +384,7 @@ async function sendEpisode(sock, msg, chatId, file, meta, season, episode, quali
   return stat.size;
 }
 
-async function deliverSeasonPack(sock, msg, extra, meta, job) {
+async function deliverSeasonPack(sock, msg, extra, meta, job, { exclude = [] } = {}) {
   const chatId = extra.from;
   const season = job.season || 1;
   const react = (emoji) =>
@@ -396,7 +400,8 @@ async function deliverSeasonPack(sock, msg, extra, meta, job) {
     // Start immediately; disk reservations protect concurrent downloads.
     const out = await engine.enqueue(chatId, `season ${meta.title} S${pad(season)}`, async () => {
       const resolved = await engine.resolveSeason({
-        item: meta, tmdbId: meta.tmdbId, title: meta.title, year: meta.year, season, quality: job.quality,
+        item: meta, tmdbId: meta.tmdbId, title: meta.title, year: meta.year,
+        season, quality: job.quality, exclude,
       });
 
       if (MOVIES().dryRun) return { res: resolved, file: null };
@@ -480,10 +485,11 @@ async function deliverSeasonPack(sock, msg, extra, meta, job) {
 
 /**
  * Resolve + download one episode, retrying with the failed provider excluded.
- * A single dead CDN link no longer costs the user the whole batch.
+ * MovieBox is always tried first; fallback providers run only if MovieBox has
+ * no series result or no playable episode link.
  */
-async function fetchEpisodeSource(meta, season, ep, quality, attempts = 3) {
-  const exclude = [];
+async function fetchEpisodeSource(meta, season, ep, quality, attempts = 3, { initialExclude = [] } = {}) {
+  const exclude = [...initialExclude];
   let lastErr = null;
 
   for (let i = 0; i < attempts; i++) {
@@ -508,7 +514,8 @@ async function fetchEpisodeSource(meta, season, ep, quality, attempts = 3) {
       tagDir: path.dirname(dest),
       tagPrefix: path.basename(dest, path.extname(dest)),
     });
-    const releaseHold = holdTemp(path.basename(dest, path.extname(dest)));
+    const releaseHold = holdTemp(path.basename(dest, path.extname(dest)),
+    );
     try {
       const saved = await engine.download(resolved, dest);
       const realFile = downloadedFile = (saved && saved.file) || dest;
@@ -526,7 +533,7 @@ async function fetchEpisodeSource(meta, season, ep, quality, attempts = 3) {
       for (const f of new Set([downloadedFile, dest, dest.replace(/\.(mp4|mkv|ts|m4v)$/i, '') + '.ts'])) {
         try { fs.rmSync(f, { force: true }); } catch { /* ignore */ }
       }
-      if (exclude.length >= attempts) break;
+      if (i + 1 >= attempts) break;
     }
   }
   throw lastErr || new Error('no downloadable source found');
@@ -534,57 +541,97 @@ async function fetchEpisodeSource(meta, season, ep, quality, attempts = 3) {
 
 async function deliver(sock, msg, extra, meta, job) {
   const chatId = extra.from;
-
-  if (job.pack) return deliverSeasonPack(sock, msg, extra, meta, job);
-
   const season = job.season || 1;
   const limit = MOVIES().episodeBatchLimit || 10;
-  const from = Math.max(1, job.from || 1);
-  const to = Math.min(job.to || from, from + limit - 1);
-  const episodes = [];
-  for (let e = from; e <= to; e++) episodes.push(e);
-
-  // TVMaze (keyless) knows how many episodes actually exist and when they air.
-  // Without this a typo like "s01 1-30" burns 30 resolve attempts on nothing.
-  let guide = null;
-  try { guide = await engine.episodeGuide(meta, season); } catch { guide = null; }
-  if (Array.isArray(guide) && guide.length) {
-    const known = new Map(guide.map(g => [Number(g.episode), g]));
-    const missing = episodes.filter(e => !known.has(e));
-    if (missing.length === episodes.length) {
-      return extra.reply(
-        `❌ *${meta.title}* S${pad(season)} has ${guide.length} episode(s), so ${missing.map(e => `E${pad(e)}`).join(', ')} does not exist.`
-      );
-    }
-    if (missing.length) {
-      const last = Math.max(...[...known.keys()]);
-      await extra.reply(`ℹ️ S${pad(season)} has ${last} episode(s) — skipping ${missing.map(e => `E${pad(e)}`).join(', ')}.`);
-      episodes.splice(0, episodes.length, ...episodes.filter(e => known.has(e)));
-    }
-  }
-
   const react = (emoji) =>
     msg?.key ? sock.sendMessage(chatId, { react: { text: emoji, key: msg.key } }).catch(() => {}) : Promise.resolve();
   const say = (text) => sock.sendMessage(chatId, { text }, selections.quoteOpts(msg));
 
-  await react('⏳');
+  let guide = null;
+  try { guide = await engine.episodeGuide(meta, season); } catch { guide = null; }
+
+  // Full-season request (`.series <title> s01` or `.series <title> s01 full`):
+  // Always call MovieBox FIRST before falling back to a torrent season pack.
+  let prefetchedFirst = null;
+  let stopAtSeasonEnd = false;
+  let episodes = [];
+  let guideMissingAll = null;
+
+  if (job.pack) {
+    if (Array.isArray(guide) && guide.length) {
+      episodes = guide
+        .map((g) => Number(g.episode))
+        .filter((n) => Number.isFinite(n) && n >= 1)
+        .sort((a, b) => a - b)
+        .slice(0, limit);
+    }
+    if (!episodes.length) {
+      for (let e = 1; e <= limit; e++) episodes.push(e);
+      stopAtSeasonEnd = true;
+    }
+
+    await react('⏳');
+    const firstEp = episodes[0] || 1;
+    try {
+      prefetchedFirst = await engine.enqueue(
+        chatId,
+        `${meta.title} S${pad(season)}E${pad(firstEp)}`,
+        () => fetchEpisodeSource(meta, season, firstEp, job.quality, 1, {
+          initialExclude: NON_MOVIEBOX_PROVIDERS,
+        }),
+        { timeoutMs: MOVIES().jobTimeoutMs },
+      );
+    } catch (e) {
+      if (e.code === 'NOT_ENOUGH_DISK') {
+        await react('❌');
+        return say(safeErrorMessage(e, { isOwner: Boolean(extra?.isOwner) }));
+      }
+      // MovieBox had no series result or no playable episode link — now move to
+      // fallback providers for the season pack.
+      return deliverSeasonPack(sock, msg, extra, meta, job, { exclude: ['moviebox'] });
+    }
+  } else {
+    const from = Math.max(1, job.from || 1);
+    const to = Math.min(job.to || from, from + limit - 1);
+    for (let e = from; e <= to; e++) episodes.push(e);
+
+    if (Array.isArray(guide) && guide.length) {
+      const known = new Map(guide.map((g) => [Number(g.episode), g]));
+      const missing = episodes.filter((e) => !known.has(e));
+      if (missing.length === episodes.length) {
+        // Never skip MovieBox because of an external episode guide (e.g. anime
+        // continuous Season 1 numbering): check MovieBox first, and only report
+        // "does not exist" if MovieBox also has no playable episode link.
+        guideMissingAll = { count: guide.length, missing };
+      } else if (missing.length) {
+        const last = Math.max(...[...known.keys()]);
+        // An external guide can be incomplete or use different numbering.
+        // Do not skip requested episodes before checking MovieBox.
+        await extra.reply(`ℹ️ The episode guide lists up to E${pad(last)}; checking all requested episodes.`);
+      }
+    }
+
+    await react('⏳');
+  }
 
   let sent = 0;
   const failures = [];
 
-  for (const ep of episodes) {
+  for (let idx = 0; idx < episodes.length; idx++) {
+    const ep = episodes[idx];
     const tag = `S${pad(season)}E${pad(ep)}`;
     let epReservation = null;
     let epFile = null;
     let epHold = null;
     try {
-      // Episodes in this request are sequential; other requests start immediately.
-      const done = await engine.enqueue(
-        chatId,
-        `${meta.title} ${tag}`,
-        () => fetchEpisodeSource(meta, season, ep, job.quality),
-        { timeoutMs: MOVIES().jobTimeoutMs }
-      );
+      const done = (idx === 0 && prefetchedFirst)
+        ? prefetchedFirst
+        : await engine.enqueue(
+          chatId,
+          `${meta.title} ${tag}`,
+          () => fetchEpisodeSource(meta, season, ep, job.quality),
+          { timeoutMs: MOVIES().jobTimeoutMs },
+        );
 
       const { res, file, reservation, releaseHold } = done;
       epReservation = reservation || null;
@@ -608,6 +655,10 @@ async function deliver(sock, msg, extra, meta, job) {
       epFile = null;
       sent++;
     } catch (e) {
+      if (stopAtSeasonEnd && sent > 0 && e.code !== 'NOT_ENOUGH_DISK') {
+        log.debug(`${meta.title} ${tag} · season ended after ${sent} episode(s)`);
+        break;
+      }
       log.error(`${meta.title} ${tag} · ${e.code || 'FAIL'} · ${e.message}`);
       const reason = e.code === 'NOT_ENOUGH_DISK'
         ? 'server storage busy'
@@ -618,6 +669,14 @@ async function deliver(sock, msg, extra, meta, job) {
       epReservation?.release?.();
       epHold?.();
     }
+  }
+
+  if (guideMissingAll && sent === 0) {
+    require('../../lib/telemetry').recordFailure('series', failures.length || 1);
+    await react('❌');
+    return extra.reply(
+      `❌ *${meta.title}* S${pad(season)} has ${guideMissingAll.count} episode(s), so ${guideMissingAll.missing.map((e) => `E${pad(e)}`).join(', ')} does not exist.`
+    );
   }
 
   const telemetry = require('../../lib/telemetry');
@@ -664,7 +723,10 @@ module.exports = {
       if (!matches.length) return extra.reply(`❌ No series found for *${job.title}*.`);
       job.matches = matches;
 
-      if (matches.length === 1) return resolveTargetAndQuality(sock, msg, extra, matches[0], job);
+      if (matches.length === 1 || job.year) {
+        const best = (job.year && matches.find((m) => String(m.year) === String(job.year))) || matches[0];
+        return resolveTargetAndQuality(sock, msg, extra, best, job);
+      }
       return offerChoices(sock, msg, extra, matches, job);
     } catch (e) {
       log.error(`${job.title || 'search'} · ${e.code || 'FAIL'} · ${String(e.message || '').split('\n')[0]}`);
@@ -678,5 +740,6 @@ module.exports = {
   _parseArgs: parseArgs,
   _askQuality: askQuality,
   _resolveTargetAndQuality: resolveTargetAndQuality,
+  _fetchEpisodeSource: fetchEpisodeSource,
   _deliver: deliver,
 };
