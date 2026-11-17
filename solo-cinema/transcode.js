@@ -58,7 +58,14 @@ function bundledFfmpeg(platform=process.platform,arch=process.arch,report=proces
   const name=`@seydx/node-av-ffmpeg-light-linux-${arch}${libc==='musl'?'-musl':''}`;
   try{const executable=path.join(path.dirname(require.resolve(`${name}/package.json`)),'ffmpeg');return fs.existsSync(executable)?executable:null;}catch{return null;}
 }
-function ffmpegCandidates(){if(process.env.CINEMA_FFMPEG)return [{label:'Configured FFmpeg',path:process.env.CINEMA_FFMPEG}];const bundled=bundledFfmpeg();return [...(bundled?[{label:'Bundled FFmpeg',path:bundled}]:[]),{label:'System FFmpeg',path:'ffmpeg'}];}
+function ffmpegCandidates(platform=process.platform,arch=process.arch,bundled=bundledFfmpeg()){
+  if(process.env.CINEMA_FFMPEG)return [{label:'Configured FFmpeg',path:process.env.CINEMA_FFMPEG}];
+  const system={label:'System FFmpeg',path:'ffmpeg'},packaged=bundled?{label:'Bundled FFmpeg',path:bundled}:null;
+  // The ARM64 bundle links Rockchip MPP, whose initializers can write to
+  // system logs even for software-only jobs on non-Rockchip machines.
+  if(platform==='linux' && arch==='arm64')return [system,...(packaged?[packaged]:[])];
+  return [...(packaged?[packaged]:[]),system];
+}
 function executableError(error){
   if(error?.code==='ENOENT')return 'FFmpeg executable or its system loader was not found';
   if(error?.code==='EACCES' || error?.code==='EPERM')return 'FFmpeg execution was denied (permissions or noexec filesystem)';
@@ -85,6 +92,8 @@ async function probeFfmpeg(executable){
   if(!/^\s*[A-Z.]{2,3}\s+scale\s/m.test(filters) || !/^\s*[A-Z.]{2,3}\s+pad\s/m.test(filters))throw Error('FFmpeg is missing the scale or pad filter');
   const hls=await probeCommand(executable,['-hide_banner','-h','muxer=hls']);
   if(!/\btemp_file\b/.test(hls))throw Error('FFmpeg HLS muxer lacks temp_file support');
+  const demuxer=await probeCommand(executable,['-hide_banner','-h','demuxer=hls']);
+  for(const option of ['allowed_extensions','allowed_segment_extensions','extension_picky','seg_max_retry'])if(!new RegExp(`\\b${option}\\b`).test(demuxer))throw Error(`FFmpeg HLS demuxer lacks ${option} support`);
 }
 
 async function chooseFfmpeg(candidates){const failures=[];for(const candidate of candidates){try{await probeFfmpeg(candidate.path);return candidate.path;}catch(err){failures.push(`${candidate.label}: ${err.message}`);}}throw Error(failures.join('; '));}
