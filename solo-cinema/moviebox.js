@@ -75,8 +75,8 @@ module.exports = function createMoviebox({ request, safeUrl }) {
           const data = response.json?.data || {};
           const list = [];
           for (const stream of Array.isArray(data.streams) ? data.streams.slice(0,30) : []) {
-            if (Number(stream?.duration) && Number(stream.duration) < (candidate.type === 'series' ? 300 : 2400)) continue;
-            try { const url=safeUrl(stream.url).href; list.push({ url, format: /\.m3u8(?:\?|$)/i.test(url) ? 'hls' : 'file', quality: Number(stream.resolutions) || 0, duration: Number.isFinite(Number(stream.duration)) && Number(stream.duration)>0 && Number(stream.duration)<=86400 ? Number(stream.duration) : null }); } catch { /* unsafe or unsupported URL */ }
+            if (candidate.type==='movie' && Number(stream?.duration) && Number(stream.duration)<2400) continue;
+            try { const url=safeUrl(stream.url).href; list.push({ url, format: /\.m3u8(?:\?|$)/i.test(url) ? 'hls' : 'file', quality: Number(stream.resolutions) || 0, duration: Number.isFinite(Number(stream.duration)) && Number(stream.duration)>0 ? Number(stream.duration) : null }); } catch { /* unsafe or unsupported URL */ }
           }
           for (const stream of Array.isArray(data.hls) ? data.hls.slice(0,30) : []) {
             try { list.push({ url:safeUrl(typeof stream === 'string' ? stream : stream.url).href, format:'hls', quality:Number(stream?.resolutions) || 0 }); } catch { /* unsafe or unsupported URL */ }
