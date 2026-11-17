@@ -459,9 +459,16 @@ test('relay playback starts the provider stream immediately without converting',
   assert.equal(transcodes.length,0,'no conversion job for a healthy relay');
   assert.equal(player.url,'/media/first','hls.js loads the relayed provider playlist');
   player.emit('manifest',{levels:[{height:360},{height:720},{height:1080}]});
-  assert.deepEqual([...d.getElementById('quality').options].map(o=>o.value),['auto','360','720','1080'],'real provider levels, not a fake 240p/360p ladder');
+  // 240p and 360p stay selectable even though this stream has no such level,
+  // and the provider's real levels are added alongside them.
+  assert.deepEqual([...d.getElementById('quality').options].map(o=>o.value),['auto','240','360','720','1080']);
   d.getElementById('quality').value='720';d.getElementById('quality').dispatchEvent(new w.Event('change'));
   assert.equal(player.currentLevel,1);
+  // Asking for a level the stream lacks caps to the nearest lower one and says so.
+  d.getElementById('quality').value='240';d.getElementById('quality').dispatchEvent(new w.Event('change'));
+  assert.equal(player.currentLevel,0);
+  assert.match(d.getElementById('playError').textContent,/no 240p/);
+  assert.equal(w.localStorage.getItem('solo-quality-height'),'240');
   assert.equal(d.getElementById('video').getAttribute('src'),null,'hls.js path does not set a native src');
  }finally{w.close()}
 });
@@ -518,3 +525,35 @@ test('native progressive relay seeks natively across the whole file',async()=>{
  }finally{w.close()}
 });
 function window_timeline_seek(w,t){w.troyTimeline.seek(t)}
+
+test('quality selector always offers 240p and 360p and never claims conversion',async()=>{
+ const html=fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8');
+ // Static guard: the shipped markup must not tell a relay-mode user that video
+ // is being converted, which is what confused the live deployment.
+ assert.doesNotMatch(html,/converted automatically|unconverted part/i);
+ const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window,d=w.document;
+ w.scrollTo=()=>{};relayEnv(w);let player;
+ class Hls{constructor(){player=this;this.listeners={}}static isSupported(){return true}loadSource(){}attachMedia(){}on(e,cb){this.listeners[e]=cb}destroy(){}emit(e,data){this.listeners[e]?.(e,data)}}
+ Hls.Events={MANIFEST_PARSED:'manifest',SUBTITLE_TRACKS_UPDATED:'subs',AUDIO_TRACKS_UPDATED:'audio',ERROR:'error'};Hls.ErrorTypes={MEDIA_ERROR:'mediaError'};w.Hls=Hls;
+ w.fetch=async(url)=>({ok:true,json:async()=>{
+   if(url==='/api/session')return {authenticated:true,relay:true};
+   if(url==='/api/search')return {results:[{id:'a',title:'Film',type:'movie'}]};
+   if(url==='/api/resolve')return {title:'Film',providers:[],streams:[{provider:'moviebox',format:'hls',url:'/media/a'}]};
+   return {sections:[]};
+ }});
+ try{
+  w.localStorage.setItem('solo-quality-height','240');
+  w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));
+  w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));
+  await tick();
+  d.getElementById('query').value='Film';d.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();
+  d.querySelector('.result').click();await tick();
+  const before=[...d.getElementById('quality').options].map(o=>o.value);
+  assert.ok(before.includes('240') && before.includes('360'),'both presets are offered before the manifest arrives');
+  assert.equal(d.getElementById('quality').value,'240','the saved preference is preselected');
+  player.emit('manifest',{levels:[{height:1080}]});
+  const after=[...d.getElementById('quality').options].map(o=>o.value);
+  assert.ok(after.includes('240')&&after.includes('360')&&after.includes('1080'));
+  assert.equal(player.currentLevel,-1,'nothing at or below 240, so Auto is used rather than an unrelated level');
+ }finally{w.close()}
+});

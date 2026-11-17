@@ -102,6 +102,31 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     return await playConverted({...item,proxy:url,isActive,fail},offset);
   } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
 }
+// Quality: 240p and 360p are always selectable. When the provider exposes real
+// levels (many HLS masters do) those are added too, sorted, with Auto on top.
+// A choice the stream cannot deliver falls back to the nearest available level
+// rather than being silently ignored.
+function renderQualityOptions(levels){
+  const select=$('quality');
+  const heights=[...new Set((levels||[]).map(l=>Number(l.height)).filter(h=>Number.isFinite(h)&&h>0))].sort((a,b)=>a-b);
+  for(const base of [240,360]) if(!heights.includes(base)) heights.push(base);
+  heights.sort((a,b)=>a-b);
+  const previous=select.value;
+  select.replaceChildren(new Option('Auto','auto'));
+  for(const h of heights) select.add(new Option(`${h}p`,String(h)));
+  select.value=[...select.options].some(o=>o.value===previous)?previous:'auto';
+  return heights;
+}
+function nearestLevelIndex(height){
+  if(!activeLevels.length)return -1;
+  let best=0,bestDelta=Infinity;
+  activeLevels.forEach((level,index)=>{
+    const delta=Math.abs((level.height||0)-height);
+    if(delta<bestDelta){bestDelta=delta;best=index;}
+  });
+  return best;
+}
+
 // Direct playback through Troy's same-origin relay. The browser receives the
 // provider's own bytes, so no encoding, no waiting and no temporary disk use;
 // seeking is native. Conversion remains the fallback for sources the relay or
@@ -124,8 +149,8 @@ async function playRelay(item,offset){
     $('server').disabled=variants.length<2;
     const serverIndex=variants.findIndex(source=>source.proxy?source.proxy===item.proxy:source===item);
     $('server').value=String(Math.max(0,serverIndex));
-    $('quality').replaceChildren(new Option('Auto','auto'));
-    $('quality').value='auto';
+    renderQualityOptions([]);
+    $('quality').value=[240,360].includes(preferredHeight)?String(preferredHeight):'auto';
     $('subtitles').replaceChildren(new Option('Off','-1'));
     $('audio').replaceChildren(new Option('Default','-1'));
     if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});}
@@ -149,9 +174,20 @@ async function playRelay(item,offset){
       player.on(Hls.Events.MANIFEST_PARSED,(_event,data)=>{
         if(current!==item||hls!==player)return;
         activeLevels=(data.levels||[]).slice().sort((a,b)=>(a.height||0)-(b.height||0));
-        const select=$('quality');select.replaceChildren(new Option('Auto','auto'));
-        const seen=new Set();for(const level of activeLevels){if(!level.height||seen.has(level.height))continue;seen.add(level.height);select.add(new Option(`${level.height}p`,String(level.height)));}
-        select.value='auto';play();
+        renderQualityOptions(activeLevels);
+        const select=$('quality');
+        const wanted=[240,360].includes(preferredHeight)?preferredHeight:null;
+        if(wanted!==null){
+          // Prefer an exact level; otherwise the closest one at or below it.
+          const exact=activeLevels.findIndex(level=>level.height===wanted);
+          if(exact>=0){player.currentLevel=exact;select.value=String(wanted);}
+          else{
+            const capped=activeLevels.map((level,index)=>({level,index})).filter(x=>(x.level.height||0)<=wanted).pop();
+            if(capped){player.currentLevel=capped.index;select.value=String(capped.level.height);}
+            else{select.value='auto';player.currentLevel=-1;}
+          }
+        } else {select.value='auto';player.currentLevel=-1;}
+        play();
       });
       let recovered=false;
       player.on(Hls.Events.ERROR,(_event,data)=>{
@@ -250,11 +286,22 @@ async function playConverted(item,offset){
   } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
 }
 $('quality').onchange=()=>{ const value=$('quality').value;
- if(value==='auto'){ preferredHeight=240; try{localStorage.setItem('solo-quality-height','240');}catch{} if(hls){hls.currentLevel=-1;} return; }
+ if(value==='auto'){ if(hls)hls.currentLevel=-1; return; }
  const height=Number(value); if(![240,360,480,720,1080,1440,2160].includes(height))return;
- if(hls){const index=activeLevels.findIndex(level=>level.height===height);if(index>=0)hls.currentLevel=index;
-  // The converted ladder is only 240p/360p; remember that choice for restarts.
-  if([240,360].includes(height) && current?.transcodeId){preferredHeight=height;try{localStorage.setItem('solo-quality-height',String(height));}catch{}}
+ // Remember 240p/360p permanently: those are the choices that survive source
+ // changes and restarts, and they are what the operator expects to stick.
+ if([240,360].includes(height)){preferredHeight=height;try{localStorage.setItem('solo-quality-height',String(height));}catch{}}
+ if(hls){
+  const index=activeLevels.findIndex(level=>level.height===height);
+  if(index>=0){hls.currentLevel=index;}
+  else{
+   // The stream has no such level. Cap to the nearest one at or below the
+   // request and say so, instead of leaving the selection meaningless.
+   const capped=nearestLevelIndex(height);
+   if(capped>=0)hls.currentLevel=capped;
+   const actual=activeLevels[capped]?.height;
+   $('playError').textContent=actual?`This stream has no ${height}p; using the closest available (${actual}p).`:`This stream does not report quality levels; it adapts automatically.`;
+  }
   return;}
  if(!current?.transcodeId) return;
  preferredHeight=height; try{localStorage.setItem('solo-quality-height',String(height));}catch{} if(hls){const index=activeLevels.findIndex(level=>level.height===height);if(index>=0)hls.currentLevel=index;}else if(current?.transcodeId){const video=$('video'),paused=video.paused,time=video.currentTime,item=current;video.addEventListener('loadedmetadata',()=>{if(current!==item || !Number.isFinite(time))return;try{if(Number.isFinite(video.duration) && time<=video.duration)video.currentTime=time;}catch{}},{once:true});video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();if(!paused)video.play().catch(()=>{});$('playError').textContent='Quality changed; seeking is limited to the converted portion.';} };
