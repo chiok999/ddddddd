@@ -102,31 +102,16 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     return await playConverted({...item,proxy:url,isActive,fail},offset);
   } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
 }
-// Quality: 240p and 360p are always selectable. When the provider exposes real
-// levels (many HLS masters do) those are added too, sorted, with Auto on top.
-// A choice the stream cannot deliver falls back to the nearest available level
-// rather than being silently ignored.
-function renderQualityOptions(levels){
+// The quality menu is exactly 240p and 360p: the two renditions this server
+// actually produces. Provider levels are deliberately not offered -- they vary
+// by source and made the menu unpredictable.
+function renderQualityOptions(){
   const select=$('quality');
-  const heights=[...new Set((levels||[]).map(l=>Number(l.height)).filter(h=>Number.isFinite(h)&&h>0))].sort((a,b)=>a-b);
-  for(const base of [240,360]) if(!heights.includes(base)) heights.push(base);
-  heights.sort((a,b)=>a-b);
   const previous=select.value;
-  select.replaceChildren(new Option('Auto','auto'));
-  for(const h of heights) select.add(new Option(`${h}p`,String(h)));
-  select.value=[...select.options].some(o=>o.value===previous)?previous:'auto';
-  return heights;
+  select.replaceChildren(new Option('240p','240'),new Option('360p','360'));
+  select.value=['240','360'].includes(previous)?previous:String(preferredHeight);
+  return [240,360];
 }
-function nearestLevelIndex(height){
-  if(!activeLevels.length)return -1;
-  let best=0,bestDelta=Infinity;
-  activeLevels.forEach((level,index)=>{
-    const delta=Math.abs((level.height||0)-height);
-    if(delta<bestDelta){bestDelta=delta;best=index;}
-  });
-  return best;
-}
-
 // Direct playback through Troy's same-origin relay. The browser receives the
 // provider's own bytes, so no encoding, no waiting and no temporary disk use;
 // seeking is native. Conversion remains the fallback for sources the relay or
@@ -149,8 +134,7 @@ async function playRelay(item,offset){
     $('server').disabled=variants.length<2;
     const serverIndex=variants.findIndex(source=>source.proxy?source.proxy===item.proxy:source===item);
     $('server').value=String(Math.max(0,serverIndex));
-    renderQualityOptions([]);
-    $('quality').value=[240,360].includes(preferredHeight)?String(preferredHeight):'auto';
+    renderQualityOptions();
     $('subtitles').replaceChildren(new Option('Off','-1'));
     $('audio').replaceChildren(new Option('Default','-1'));
     if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});}
@@ -187,19 +171,11 @@ async function playRelay(item,offset){
       player.on(Hls.Events.MANIFEST_PARSED,(_event,data)=>{
         if(current!==item||hls!==player)return;
         activeLevels=(data.levels||[]).slice().sort((a,b)=>(a.height||0)-(b.height||0));
-        renderQualityOptions(activeLevels);
-        const select=$('quality');
-        const wanted=[240,360].includes(preferredHeight)?preferredHeight:null;
-        if(wanted!==null){
-          // Prefer an exact level; otherwise the closest one at or below it.
-          const exact=activeLevels.findIndex(level=>level.height===wanted);
-          if(exact>=0){player.currentLevel=exact;select.value=String(wanted);}
-          else{
-            const capped=activeLevels.map((level,index)=>({level,index})).filter(x=>(x.level.height||0)<=wanted).pop();
-            if(capped){player.currentLevel=capped.index;select.value=String(capped.level.height);}
-            else{select.value='auto';player.currentLevel=-1;}
-          }
-        } else {select.value='auto';player.currentLevel=-1;}
+        // A relayed provider stream is whatever the provider encodes. The
+        // 240p/360p menu belongs to conversion, so start from the smallest
+        // level available and let the viewer switch deliberately.
+        player.currentLevel=-1;
+        renderQualityOptions();
         play();
       });
       let recovered=false;
@@ -281,14 +257,8 @@ async function playConverted(item,offset){
     $('playError').textContent='';
     current=item; pendingFailure=null; const keepUpload=!!(item.keepUpload && uploadUrl);subtitleTouched=keepUpload; if(uploadUrl && !keepUpload){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
     $('server').replaceChildren(); const variants=item.variants || [item]; variants.forEach((source,i)=>$('server').add(new Option(`${source.provider || 'Direct'} · ${source.quality ? source.quality+'p' : 'source'} · ${(source.format || 'file').toUpperCase()}`,String(i)))); $('server').disabled=variants.length<2; const serverIndex=variants.findIndex(source=>source.proxy ? source.proxy===item.proxy : source===item); $('server').value=String(Math.max(0,serverIndex));
-    // Auto returns to the provider's own stream, so leaving conversion is
-    // always one click away once the server has started encoding.
-    // Auto only exists when there is a direct stream to go back to; without the
-    // relay, conversion is the only way to play and a bare Auto would be a dead
-    // option.
-    const convertedOptions=relaySupported?[new Option('Auto','auto')]:[];
-    convertedOptions.push(new Option('240p','240'),new Option('360p','360'));
-    $('quality').replaceChildren(...convertedOptions); $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});} $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
+    $('quality').replaceChildren(new Option('240p','240'),new Option('360p','360'));
+    $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});} $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
     video.onloadedmetadata=null; video.playbackRate=Number($('speed').value); pendingFailure=fail;
     if (item.subtitleRequest) {
       post(item.subtitleRequest.path,item.subtitleRequest.data).then(result=>{
@@ -310,60 +280,29 @@ async function playConverted(item,offset){
     } else { video.src=outputUrl.replace('master.m3u8',`${preferredHeight}/index.m3u8`); nativeSubtitleOptions(); nativeAudioOptions(); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); }
   } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
 }
-$('quality').onchange=()=>{ const value=$('quality').value;
- if(!current) return;
+$('quality').onchange=()=>{
+ const height=Number($('quality').value);
+ if(![240,360].includes(height) || !current) return;
+ preferredHeight=height;try{localStorage.setItem('solo-quality-height',String(height));}catch{}
  const video=$('video');
  const resumeAt=Number.isFinite(video.currentTime)&&video.currentTime>1?video.currentTime:0;
  const wasPaused=video.paused;
-
- // Auto releases any pinned version. Server-encoded levels drop back to the
- // provider's own bytes so the viewer is watching the best available copy.
- if(value==='auto'){
-  if(hls){hls.currentLevel=-1;return;}
-  if(!relaySupported) return;
-  if(current.transcodeId){
-   const item={...current,seekAt:resumeAt,wasPaused,keepUpload:!!uploadTrack};
-   if(hls){hls.destroy();hls=null;}
-   playRelay(item,resumeAt);
-   return;
-  }
+ // Already converting: switch rendition in place and keep the position.
+ if(current.transcodeId && hls){
+  const index=activeLevels.findIndex(level=>level.height===height);
+  if(index>=0){hls.currentLevel=index;return;}
+ }
+ if(current.transcodeId && !hls){
+  const item=current;
+  video.addEventListener('loadedmetadata',()=>{if(current!==item)return;try{if(resumeAt<=video.duration)video.currentTime=resumeAt;}catch{}},{once:true});
+  video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();
+  if(!wasPaused)video.play().catch(()=>{});
   return;
  }
-
- const height=Number(value); if(![240,360,480,720,1080,1440,2160].includes(height))return;
-
- // 240p and 360p are real conversions the server can produce. Picking them is
- // how you deliberately spend the 3 GB box's CPU on a small picture; it is
- // remembered for the next title.
- if([240,360].includes(height)){
-  preferredHeight=height;try{localStorage.setItem('solo-quality-height',String(height));}catch{}
-  // Already converting at this height: just swap rendition.
-  if(current.transcodeId && hls){
-   const index=activeLevels.findIndex(level=>level.height===height);
-   if(index>=0){hls.currentLevel=index;return;}
-  }
-  if(current.transcodeId && !hls){
-   const item=current;
-   video.addEventListener('loadedmetadata',()=>{if(current!==item)return;try{if(resumeAt<=video.duration)video.currentTime=resumeAt;}catch{}},{once:true});
-   video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();
-   if(!wasPaused)video.play().catch(()=>{});
-   return;
-  }
-  // Relay or a higher provider level: start a conversion at this height.
-  if(hls){hls.destroy();hls=null;}
-  const item={...current,seekAt:resumeAt,wasPaused,keepUpload:!!uploadTrack};
-  playConverted({...item,convertRetried:true},resumeAt);
-  return;
- }
-
- // Any other level can only come from the provider's own ladder.
- if(!hls) return;
- const index=activeLevels.findIndex(level=>level.height===height);
- if(index>=0){hls.currentLevel=index;return;}
- const capped=nearestLevelIndex(height);
- if(capped>=0)hls.currentLevel=capped;
- const actual=activeLevels[capped]?.height;
- $('playError').textContent=actual?`This stream has no ${height}p; using the closest available (${actual}p).`:`This stream does not report quality levels; it adapts automatically.`;
+ // Playing the provider's own stream: start a conversion at this height.
+ if(hls){hls.destroy();hls=null;}
+ const item={...current,seekAt:resumeAt,wasPaused,keepUpload:!!uploadTrack};
+ playConverted({...item,convertRetried:true},resumeAt);
 };
 function nativeSubtitleOptions(){
   if(hls || !current) return;

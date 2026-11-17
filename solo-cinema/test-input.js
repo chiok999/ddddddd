@@ -96,10 +96,16 @@ for(const explicit of [true,false])test(`HTTP 426 ${explicit?'with h2 upgrade':'
 });
 
 test('HTTP 426 retries only where safe and preserves URL validation',async()=>{
- const {getRemote,getWithH2Fallback}=require('./network');let count=0;const response=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('no',{status:426})},{},{h2:true});assert.equal(response.response.status,426);assert.equal(count,2);
+ // Budget: the first request, one HTTP/2 retry, one fresh HTTP/1 replay. An
+ // edge that refuses all three still yields its 426 rather than looping.
+ const {getRemote,getWithH2Fallback}=require('./network');let count=0;const response=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('no',{status:426})},{},{h2:true});assert.equal(response.response.status,426);assert.equal(count,3);
+ // Without an HTTP/2 agent there is still exactly one plain replay.
+ count=0;const plain=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('no',{status:426})},{},null);assert.equal(plain.response.status,426);assert.equal(count,2);
+ // An Upgrade header naming something other than h2 is not retried at all.
  count=0;await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('no',{status:426,headers:{upgrade:'websocket'}})},{},{h2:true});assert.equal(count,1);
  count=0;await getWithH2Fallback('https://example.com',{method:'POST'},async()=>{count++;return new Response('no',{status:426})},{},{});assert.equal(count,1);
- let attempt=0;const result=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{if(++attempt===1)return new Response('no',{status:426});throw Error('connection failure');},{},{h2:true});assert.equal(result.response.status,426);assert.equal(attempt,2);
+ // A retry that throws is not fatal and does not skip the remaining budget.
+ let attempt=0;const result=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{if(++attempt===1)return new Response('no',{status:426});throw Error('connection failure');},{},{h2:true});assert.equal(result.response.status,426);assert.equal(attempt,3);
  const controller=new AbortController();await assert.rejects(()=>getWithH2Fallback('https://example.com', {signal:controller.signal},async()=>{if(!controller.signal.aborted){controller.abort();return new Response('no',{status:426})}throw Error('aborted');},{},{}),/aborted/);
  await assert.rejects(()=>getRemote('https://127.0.0.1/video',{},new AbortController().signal,()=>{}, {},{}),/Only public HTTPS/);
 });
@@ -128,4 +134,24 @@ test('source requests use the bot user agent unless a provider supplies one',asy
  assert.equal((await open({url:'https://example.com/movie',referer:'https://player.example/'},signal)).status,200);
  assert.equal((await open({url:'https://example.com/episode',userAgent:'provider-agent'},signal)).status,200);
  assert.equal(seen[0]['user-agent'],DEFAULT_USER_AGENT);assert.equal(seen[0].referer,'https://player.example/');assert.equal(seen[1]['user-agent'],'provider-agent');
+});
+
+test('a 426 edge that accepts a replayed connection now plays instead of failing every source',async t=>{
+ // This reproduces the reported failure: the first connection to the media host
+ // is refused with 426, so every provider looks broken and playback gives up.
+ // Browsers simply reconnect; the server must do the same.
+ const {getRemote}=require('./network');
+ const sequence=[426,200,200];
+ let seen=[];
+ const result=await getRemote('https://example.com/video',{range:'bytes=0-'},new AbortController().signal,
+  async()=>{seen.push(1);const status=sequence[seen.length-1];return new Response(status===200?'video':'' ,{status});},
+  {name:'h1'},{name:'h2'});
+ assert.equal(result.response.status,200,'the replayed connection is used');
+ assert.equal(seen.length,2,'exactly one retry was needed');
+ assert.equal(await result.response.text(),'video');
+ // A source that refuses forever still reports 426 once, not an endless loop.
+ let count=0;
+ const stubborn=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('',{status:426});},{},{name:'h2'});
+ assert.equal(stubborn.response.status,426);
+ assert.equal(count,3,'bounded: one HTTP/2 retry and one replay, then report the truth');
 });
