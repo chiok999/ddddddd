@@ -80,6 +80,7 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     const result=await enqueueTranscode(async()=>{
       if(sequence!==transcodeSequence || !isActive()) return null;
       const job=await post('/api/transcode',{url});
+      if(!job || typeof job.id!=='string' || !/^[A-Za-z0-9_-]+$/.test(job.id) || job.url!==`/transcode/${job.id}/master.m3u8`){if(typeof job?.id==='string' && /^[A-Za-z0-9_-]+$/.test(job.id))await post('/api/transcode/stop',{id:job.id}).catch(()=>{});throw Error('Invalid conversion response');}
       if(sequence!==transcodeSequence || !isActive() || route!=='watch'){await post('/api/transcode/stop',{id:job.id}).catch(()=>{});return null;}
       return job;
     });
@@ -119,7 +120,7 @@ function nativeSubtitleOptions(){
 }
 $('video').textTracks?.addEventListener?.('addtrack',nativeSubtitleOptions);
 $('video').textTracks?.addEventListener?.('removetrack',nativeSubtitleOptions);
-$('subtitles').onchange=()=>{ subtitleTouched=true; const value=$('subtitles').value; if(!hls){const tracks=$('video').textTracks;for(let i=0;i<tracks.length;i++){const track=tracks[i];if(track!==uploadTrack?.track && track!==externalTrack?.track && ['subtitles','captions'].includes(track.kind))track.mode=value===`native:${i}`?'showing':'disabled';}} if(uploadTrack) uploadTrack.track.mode=value==='upload'?'showing':'disabled'; if(externalTrack) externalTrack.track.mode=value==='external'?'showing':'disabled'; if(hls) hls.subtitleTrack=(value==='external'||value==='upload')?-1:Number(value); };
+$('subtitles').onchange=()=>{ subtitleTouched=true; const value=$('subtitles').value; if(!hls){const tracks=$('video').textTracks;for(let i=0;i<tracks.length;i++){const track=tracks[i];if(track!==uploadTrack?.track && track!==externalTrack?.track && ['subtitles','captions'].includes(track.kind))track.mode=value===`native:${i}`?'showing':'disabled';}} if(uploadTrack?.track) uploadTrack.track.mode=value==='upload'?'showing':'disabled'; if(externalTrack?.track) externalTrack.track.mode=value==='external'?'showing':'disabled'; if(hls) hls.subtitleTrack=(value==='external'||value==='upload')?-1:Number(value); };
 function nativeAudioOptions(){
   if(hls || !current) return; const tracks=$('video').audioTracks;if(!tracks)return;
   const select=$('audio'), previous=select.value;select.replaceChildren(new Option('Default','-1'));

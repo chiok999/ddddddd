@@ -459,3 +459,15 @@ test('local seekable MP4 input-side seek produces the later scene', {skip:!testF
   const seek=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-ss','12','-i',file,'-t','1','-vf','scale=2:2','-f','rawvideo','-pix_fmt','rgb24','pipe:1'],{maxBuffer:1024*1024,timeout:15000});assert.equal(seek.status,0,String(seek.stderr));assert.ok(seek.stdout.length>=3);assert.ok(seek.stdout[2]>200 && seek.stdout[0]<30,'frame at 12s should be blue');
  }finally{await fs.rm(dir,{recursive:true,force:true})}
 });
+
+test('FFmpeg EVENT retains early segments and ends a completed short fixture', {skip:!testFfmpeg,timeout:30000},async()=>{
+ const {spawnSync}=require('node:child_process'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-event-proof-'));
+ try {
+  const file=path.join(dir,'index.m3u8');
+  const run=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','12','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-g','10','-sc_threshold','0','-f','hls','-hls_time','1','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','independent_segments','-hls_segment_filename',path.join(dir,'index%d.ts'),file],{encoding:'utf8',timeout:20000});
+  assert.equal(run.status,0,run.stderr);
+  const manifest=await fs.readFile(file,'utf8');const segments=manifest.split('\n').filter(x=>/^index\d+\.ts$/.test(x));assert.match(manifest,/#EXT-X-PLAYLIST-TYPE:EVENT/);assert.match(manifest,/#EXT-X-ENDLIST/);assert.ok(segments.length>8);assert.equal(segments[0],'index0.ts');const first=await fs.readFile(path.join(dir,segments[0]));assert.ok(first.length>0);
+  const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-frames:v','1','-f','null','-'],{input:first,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
