@@ -13,6 +13,7 @@ test('login, origin, and private URL protections', async () => {
   const post=(p,data,extra={})=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...extra},body:JSON.stringify(data)});
   assert.equal((await post('/api/source',{url:'https://example.com/video'})).status,401);
   const page=await fetch(base+'/'); assert.match(page.headers.get('content-security-policy'),/frame-src 'none'/);
+  for(const asset of ['/player-ui.js','/player.css']){const response=await fetch(base+asset);assert.equal(response.status,200);assert.match(response.headers.get('content-type'),asset.endsWith('.css')?/text\/css/:/javascript/);}
   assert.equal((await post('/api/login',{password:'wrong'})).status,401);
   assert.equal((await post('/api/login',{password:'a-strong-test-password'},{origin:'https://evil.test'})).status,403);
   const login=await post('/api/login',{password:'a-strong-test-password'}); assert.equal(login.status,200);
