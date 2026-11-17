@@ -234,20 +234,22 @@ async function findStreams(autoplay = false) {
   try {
     const data=await post('/api/resolve',{id:chosen.id, season, episode});
     if (selected!==chosen || sequence!==resolveSequence) return;
-    $('providersNotice').textContent=data.providers.map(p=>`${p.provider}: ${p.count ? p.count+' stream(s)' : (p.error || 'no streams')}`).join(' · ');
-    const items=data.streams.map(stream=>({title:`${data.title}${chosen.type === 'series' ? ` S${season} E${episode}` : ''}`,proxy:stream.url,format:stream.format,subtitleRequest:chosen.source==='kisskh'?{path:'/api/kiss-subtitle',data:{id:chosen.id,season,episode}}:stream.captionId?{path:stream.provider.startsWith('movy:')?'/api/movy-subtitle':stream.provider==='7movies'?'/api/vidlink-subtitle':'/api/moviebox-subtitle',data:{id:stream.captionId}}:null,progressKey:`${chosen.source}:${chosen.title}:${chosen.year}:${chosen.type}:${season}:${episode}`,provider:stream.provider,quality:stream.quality,context:chosen.type==='series'?{id:chosen.id,season,episode}:null}));
+    const unsupported=data.streams.filter(s=>s.format==='hls');
+    $('providersNotice').textContent=[...data.providers.map(p=>`${p.provider}: ${p.count ? p.count+' stream(s)' : (p.error || 'no streams')}`),...(unsupported.length?[`${unsupported.length} HLS source(s) cannot be converted`]:[])].join(' · ');
+    const items=data.streams.filter(s=>s.format!=='hls').map(stream=>({title:`${data.title}${chosen.type === 'series' ? ` S${season} E${episode}` : ''}`,proxy:stream.url,format:stream.format,subtitleRequest:chosen.source==='kisskh'?{path:'/api/kiss-subtitle',data:{id:chosen.id,season,episode}}:stream.captionId?{path:stream.provider.startsWith('movy:')?'/api/movy-subtitle':stream.provider==='7movies'?'/api/vidlink-subtitle':'/api/moviebox-subtitle',data:{id:stream.captionId}}:null,progressKey:`${chosen.source}:${chosen.title}:${chosen.year}:${chosen.type}:${season}:${episode}`,provider:stream.provider,quality:stream.quality,context:chosen.type==='series'?{id:chosen.id,season,episode}:null}));
     items.sort((a,b)=>(a.quality || Infinity)-(b.quality || Infinity)); items.forEach(item=>{item.variants=items;});
     for(let i=0;i<items.length;i++){
       const item=items[i], btn=document.createElement('button'); btn.textContent=`${item.provider} · ${item.quality ? item.quality+'p' : 'Auto'} · ${item.format.toUpperCase()}`;
       btn.onclick=()=>fallback.play([item,...items.filter((_,n)=>n!==i)]);
       $('streams').append(btn);
     }
-    if(items.length){ const auto=document.createElement('button'); auto.textContent='Play automatically →'; auto.onclick=()=>fallback.play(items); $('streams').prepend(auto); if (autoplay) fallback.play(items); } else { $('playError').textContent='No playable streams found for this title or episode. Player options have provider details.'; $('placeholder').querySelector('p').textContent='No stream available'; }
+    if(items.length){ const auto=document.createElement('button'); auto.textContent='Play automatically →'; auto.onclick=()=>fallback.play(items); $('streams').prepend(auto); if (autoplay) fallback.play(items); } else { $('playError').textContent=unsupported.length?'Only HLS sources were found; HLS input conversion is not supported.':'No playable streams found for this title or episode. Player options have provider details.'; $('placeholder').querySelector('p').textContent='No stream available'; }
 
   } catch(err) { if(selected===chosen && sequence===resolveSequence){ $('playError').textContent=err.message; $('placeholder').querySelector('p').textContent='Could not find a stream';} }
   finally { if(sequence===resolveSequence){$('findStreams').disabled=false; $('findStreams').textContent=chosen.type==='series'?'Play selected episode':'Play again';} }
 }
 $('findStreams').onclick=()=>findStreams(true);
+$('reclaimTranscode').onclick=async()=>{if(!confirm('Stop the current conversion, even if another session is using it?'))return;try{const result=await post('/api/transcode/reclaim',{});$('playError').textContent=result.stopped?'Conversion stopped. Press Play again.':'No conversion was active.';}catch(err){$('playError').textContent=err.message;}};
 
 $('video').addEventListener('ended',()=>{ if(current && !current.noResume){const key=current.progressKey || current.url; if(key) try{save('solo-progress',load('solo-progress').filter(x=>x.url!==key));}catch{}} const ctx=current?.context; if(ctx && selected?.id===ctx.id && episodes.some(e=>e.season>ctx.season || (e.season===ctx.season && e.episode>ctx.episode))) $('nextEpisode').click(); });
 function updateNext(){

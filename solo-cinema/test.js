@@ -12,12 +12,14 @@ test('login, origin, and private URL protections', async () => {
   const base=`http://127.0.0.1:${port}`;
   const post=(p,data,extra={})=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...extra},body:JSON.stringify(data)});
   assert.equal((await post('/api/source',{url:'https://example.com/video'})).status,401);
+  assert.equal((await post('/api/transcode/reclaim',{})).status,401);
   const page=await fetch(base+'/'); assert.match(page.headers.get('content-security-policy'),/frame-src 'none'/);
   for(const asset of ['/player-ui.js','/player.css']){const response=await fetch(base+asset);assert.equal(response.status,200);assert.match(response.headers.get('content-type'),asset.endsWith('.css')?/text\/css/:/javascript/);}
   assert.equal((await post('/api/login',{password:'wrong'})).status,401);
   assert.equal((await post('/api/login',{password:'a-strong-test-password'},{origin:'https://evil.test'})).status,403);
   const login=await post('/api/login',{password:'a-strong-test-password'}); assert.equal(login.status,200);
   const cookie=login.headers.get('set-cookie').split(';')[0];
+  assert.equal((await post('/api/transcode/reclaim',{},{cookie})).status,200);
   assert.equal((await post('/api/vidrift',{id:'x'},{cookie})).status,404);
   assert.equal((await post('/api/embed',{id:'x'},{cookie})).status,404);
   for(const url of ['http://127.0.0.1/','https://127.0.0.1/','https://localhost/','https://example.com:8443/','https://user:pass@example.com/']) {
@@ -400,7 +402,7 @@ test('transcode API rejects unauthenticated and invalid source requests',async()
 test('transcoder reports missing ffmpeg and rejects playlist content',async()=>{
  const {createTranscoder}=require('./transcode');const {Readable}=require('node:stream');const make=(type)=>({ok:true,status:200,headers:new Headers({'content-type':type}),body:Readable.toWeb(Readable.from(Buffer.from('0000000866747970000000086d6f6f76','hex')))});
  let opened=0;const bad=createTranscoder({executable:'/definitely/not/a/real/ffmpeg',open:async()=>{opened++;return make('video/mp4')},startupMs:5000});try{await assert.rejects(bad.start({},'a'),/FFmpeg executable or its system loader was not found/);assert.equal(opened,0);assert.equal(await bad.read('bad','a','master.m3u8'),null);}finally{await bad.close()}
- const hls=createTranscoder({open:async()=>make('application/vnd.apple.mpegurl')});try{await assert.rejects(hls.start({},'a'),/Only direct MP4/)}finally{await hls.close()}
+ const hls=createTranscoder({open:async()=>make('application/vnd.apple.mpegurl')});try{await assert.rejects(hls.start({},'a'),/Only uncompressed direct MP4/)}finally{await hls.close()}
 });
 
 const testFfmpeg=process.env.CINEMA_TEST_FFMPEG || require('./transcode').bundledFfmpeg();
@@ -410,11 +412,16 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  let opened=0;const t=createTranscoder({tmpdir:dir,executable:bin,startupMs:35000,open:async()=>{opened++;return {ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(fixture))}}});
  try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
  for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.data.length>0);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:segment.data,encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
- assert.equal(await t.stopFor(job.id,'bob'),false);assert.equal(await t.stopFor(job.id,'alice'),true);assert.equal(await t.read(job.id,'alice','master.m3u8'),null);assert.deepEqual((await fsp.readdir(dir)).sort(),['sample.mp4']);
+ assert.equal(await t.stopFor(job.id,'bob'),false);
+ // Hold a segment read across stop: cleanup must not remove the file mid-read.
+ const originalRead=fsp.readFile;let entered,release;const reading=new Promise(r=>entered=r),gate=new Promise(r=>release=r);
+ fsp.readFile=async function(file,...args){if(String(file).endsWith('/240/index0.ts')){entered();await gate;}return originalRead.call(this,file,...args)};
+ try{const inflight=t.read(job.id,'alice','240/index0.ts');await reading;let finished=false;const stopping=t.stopFor(job.id,'alice').then(value=>{finished=true;return value;});await new Promise(r=>setTimeout(r,50));assert.equal(finished,false);release();assert.ok((await inflight).data.length);assert.equal(await stopping,true);}finally{release();fsp.readFile=originalRead;}
+ assert.equal(await t.read(job.id,'alice','master.m3u8'),null);assert.deepEqual((await fsp.readdir(dir)).sort(),['sample.mp4']);
  const silent=path.join(dir,'silent.mp4');const noAudio=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-t','10','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart',silent],{encoding:'utf8'});assert.equal(noAudio.status,0,noAudio.stderr);
- const statfs=fsp.statfs;let calls=0;fsp.statfs=async()=>{calls++;throw Error('statfs unavailable')};
- const uncapped=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,maxMs:1,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
- try{const small=await uncapped.start({},'alice');await new Promise(r=>setTimeout(r,3000));assert.ok(await uncapped.read(small.id,'alice','master.m3u8'));assert.equal(calls,0);assert.equal(uncapped.status(small.id,'alice').active,true);}finally{fsp.statfs=statfs;await uncapped.close();}
+ const limited=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
+ try{const small=await limited.start({},'alice');await new Promise(r=>setTimeout(r,2500));assert.match(limited.status(small.id,'alice').error,/storage limit/);}finally{await limited.close();}
+
  }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true})}
 });
 
@@ -495,10 +502,10 @@ test('production transcoder starts a new conversion at an unconverted MP4 timest
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
  const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-offset-')),file=path.join(dir,'source.mp4');
  const input=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','color=red:s=160x90:r=10:d=10','-f','lavfi','-i','color=blue:s=160x90:r=10:d=10','-f','lavfi','-i','sine=frequency=440:duration=20','-filter_complex','[0:v][1:v]concat=n=2:v=1:a=0[v]','-map','[v]','-map','2:a','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-c:a','aac','-movflags','+faststart',file],{encoding:'utf8',timeout:15000});assert.equal(input.status,0,input.stderr);
- const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,startupMs:10000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(file))})});
+ let requestedOffset=null;const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,startupMs:10000,open:async(_entry,_signal,offset=0)=>{requestedOffset=offset;return {ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(file))}}});
  try{
   await assert.rejects(t.start({},'alice',-1),/Invalid seek/);
-  const job=await t.start({},'alice',12);assert.equal(job.offset,12);assert.ok(Math.abs(job.duration-20)<0.1,job.duration);
+  const job=await t.start({},'alice',12);assert.equal(requestedOffset,0,'seek still opens input at byte zero');assert.equal(job.offset,12);assert.ok(Math.abs(job.duration-20)<0.1,job.duration);
   for(const quality of ['240','360']){const list=await t.read(job.id,'alice',`${quality}/index.m3u8`);const first=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${quality}/${first}`);
    const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-frames:v','1','-vf','scale=2:2','-f','rawvideo','-pix_fmt','rgb24','pipe:1'],{input:segment.data,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));assert.ok(decode.stdout[2]>200 && decode.stdout[0]<30,`first frame should be blue, got ${[...decode.stdout.subarray(0,3)]}`);
    const audio=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:a:0','-f','null','-'],{input:segment.data,timeout:10000});assert.equal(audio.status,0,String(audio.stderr));}
@@ -533,6 +540,8 @@ if(process.argv.includes('-version')) console.log('fixture');
 else if(process.argv.includes('-encoders')) console.log(' V..... libx264\n A..... aac');
 else if(process.argv.includes('-muxers')) console.log(' E hls');
 else if(process.argv.includes('-filters')) console.log(' ... scale\n ... pad');
+else if(process.argv.includes('full')) console.log('-readrate <speed>\n-readrate_initial_burst <seconds>');
+else if(process.argv.includes('muxer=hls')) console.log('temp_file');
 else {process.stderr.write('No space left on device\n');process.exit(1);}
 `;
  await fs.writeFile(exe,script,{mode:0o755});const box=name=>{const b=Buffer.alloc(8);b.writeUInt32BE(8);b.write(name,4);return b};
@@ -563,4 +572,20 @@ test('a session can replace its abandoned conversion without cancelling another 
   assert.equal(await t.stopRequest('first','owner'),false);
   await t.stopSession('owner');await assert.rejects(second,/aborted|stopped/);
  }finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
+});
+
+test('disconnected startup is cancelled and authenticated manual reclaim can stop an abandoned job', {skip:!testFfmpeg,timeout:20000},async()=>{
+ const {createTranscoder}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-disconnect-'));let notify;const opened=new Promise(r=>notify=r);
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async(_source,signal)=>{notify();return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}))}});
+ try{
+  const controller=new AbortController();const pending=t.start({},'owner',0,'req',controller.signal);pending.catch(()=>{});await opened;controller.abort();await assert.rejects(pending,/aborted|stopped/);assert.deepEqual(await fs.readdir(dir),[]);
+  const cancelled=new AbortController();cancelled.abort();await assert.rejects(t.start({},'owner',0,'req',cancelled.signal),/disconnected/);
+  const next=t.start({},'owner',0,'next');next.catch(()=>{});await new Promise(resolve=>{notify=resolve});assert.equal(await t.stopAny(),true);await assert.rejects(next,/aborted|stopped/);assert.equal(await t.stopAny(),false);
+ }finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
+});
+
+test('storage reserve is checked before conversion and expired sessions cannot claim jobs',async()=>{
+ const {createTranscoder}=require('./transcode');let opened=0;
+ const t=createTranscoder({minFreeBytes:Number.MAX_SAFE_INTEGER,authorize:sid=>sid==='live',open:async()=>{opened++;throw Error('should not open')}});
+ try{await assert.rejects(t.start({},'expired'),e=>e.status===401);await assert.rejects(t.start({},'live'),/Not enough free temporary storage/);assert.equal(opened,0);}finally{await t.close();}
 });

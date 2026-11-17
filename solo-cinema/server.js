@@ -24,14 +24,15 @@ const captions = new Map();
 const captionSources = new Map();
 const agent = new Agent({ connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
-function remember(url, sid, referer = null, format = null, origin = null, userAgent = null) {
+function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null) {
   if (sources.size > 10000) for (const [id, entry] of sources) { if (entry.expires < Date.now()) sources.delete(id); }
   if (sources.size > 12000) fail('Too many media links; restart the server');
   const id = crypto.randomBytes(24).toString('base64url');
-  sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, expires: Date.now() + 6 * 3600000 });
+  sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, refresh, expires: Date.now() + 6 * 3600000 });
   return `/media/${id}`;
 }
-const transcoder=require('./transcode').createTranscoder({open:async(entry,signal)=>{const headers={};if(entry.userAgent)headers['user-agent']=entry.userAgent;if(entry.referer)headers.referer=entry.referer;if(entry.origin)headers.origin=entry.origin;return (await getRemote(entry.url,headers,signal,fetch,agent)).response;}});
+const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent)).response});
+const transcoder=require('./transcode').createTranscoder({open:openSource,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
 async function providerRequest(url, opts = {}) {
@@ -63,6 +64,13 @@ async function enrichItem(entry) {
   if (!entry.enriched) { entry.enriched = await enrich(entry.item).catch(() => entry.item); }
   return entry.enriched;
 }
+async function resolveTitle(selected, season, episode) {
+  if (selected.item.source === 'kisskh') {
+    try { const r=await kisskh.resolve(selected.item,season,episode);return {streams:r.streams.map(s=>({...s,provider:'kisskh',referer:r.referer,origin:r.origin})),providers:[{provider:'kisskh',count:r.streams.length,error:null}]}; }
+    catch(err){return {streams:[],providers:[{provider:'kisskh',count:0,error:String(err?.message || 'Unavailable').slice(0,160)}]};}
+  }
+  return resolveProviders({moviebox,providers,movy,vidlink,item:await enrichItem(selected),season,episode});
+}
 async function body(req, max = 16384) {
   const chunks = []; let size = 0;
   for await (const chunk of req) { size += chunk.length; if (size > max) fail('Request too large'); chunks.push(chunk); }
@@ -84,7 +92,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://local');
   const sid = /(?:^|;\s*)cinema=([\w-]+)/.exec(req.headers.cookie || '')?.[1];
   const session = sessions.get(sid);
-  if (session && session < Date.now()) sessions.delete(sid);
+  if (session && session < Date.now()) { sessions.delete(sid); void transcoder.stopSession(sid); }
   const authorized = session && session >= Date.now();
   try {
     if (req.method === 'POST' && !sameOrigin(req)) return send(res, 403, { error: 'Origin rejected' });
@@ -188,16 +196,18 @@ const server = http.createServer(async (req, res) => {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const data = await body(req); const selected = catalog.get(data.id);
       if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
-      let result;
-      if (selected.item.source === 'kisskh') {
-        try { const r=await kisskh.resolve(selected.item,Number(data.season),Number(data.episode)); result={ streams:r.streams.map(s=>({...s,provider:'kisskh',referer:r.referer,origin:r.origin})), providers:[{provider:'kisskh',count:r.streams.length,error:null}] }; }
-        catch (err) { result={streams:[],providers:[{provider:'kisskh',count:0,error:String(err?.message || 'Unavailable').slice(0,160)}]}; }
-      } else result = await resolveProviders({ moviebox, providers, movy, vidlink, item:await enrichItem(selected), season:Number(data.season), episode:Number(data.episode) });
+      const season=Number(data.season),episode=Number(data.episode);
+      const result=await resolveTitle(selected,season,episode);
       for (const [id, entry] of captionSources) if (entry.expires<Date.now()) captionSources.delete(id);
       const streams = result.streams.map(stream => {
         let captionId=null;
         if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
-        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 && stream.duration<=86400 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent) };
+        const refresh=async()=>{
+          const refreshed=await resolveTitle(selected,season,episode);
+          const matching=refreshed.streams.filter(s=>s.provider===stream.provider && s.format===stream.format && s.quality===stream.quality);
+          return matching.length===1?matching[0]:null;
+        };
+        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 && stream.duration<=86400 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent, refresh) };
       });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }
@@ -232,12 +242,18 @@ const server = http.createServer(async (req, res) => {
       const entry=sources.get(data.url.slice(7));if(!entry || entry.sid!==sid || entry.expires<Date.now())return send(res,404,{error:'Source expired'});
       if(entry.format==='hls')return send(res,400,{error:'Transcoding currently supports direct MP4 sources, not HLS playlists'});
       if(data.requestId!==undefined && (typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId)))return send(res,400,{error:'Invalid request ID'});
-      try{return send(res,200,await transcoder.start(entry,sid,data.offset===undefined?0:data.offset,data.requestId || null));}catch(e){return send(res,e.status||502,{error:e.message});}
+      const disconnected=new AbortController();
+      const onClose=()=>{if(!res.writableEnded)disconnected.abort();};res.once('close',onClose);
+      try{return send(res,200,await transcoder.start(entry,sid,data.offset===undefined?0:data.offset,data.requestId || null,disconnected.signal));}catch(e){if(!res.destroyed)return send(res,e.status||502,{error:e.message});}finally{res.removeListener('close',onClose);}
     }
     if (url.pathname === '/api/transcode/cancel' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
       const data=await body(req);if(typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId))return send(res,400,{error:'Invalid request ID'});
       return send(res,200,{stopped:await transcoder.stopRequest(data.requestId,sid)});
+    }
+    if (url.pathname === '/api/transcode/reclaim' && req.method === 'POST') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      await body(req); return send(res,200,{stopped:await transcoder.stopAny()});
     }
     if (url.pathname === '/api/transcode/status' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
@@ -251,7 +267,7 @@ const server = http.createServer(async (req, res) => {
     if(url.pathname.startsWith('/transcode/') && req.method==='GET'){
       if(!authorized)return send(res,401,{error:'Login required'});const match=/^\/transcode\/([A-Za-z0-9_-]{32})\/(master\.m3u8|(?:240|360)\/(?:index\.m3u8|index\d+\.ts))$/.exec(url.pathname);
       if(!match)return send(res,404,{error:'Not found'});const result=await transcoder.read(match[1],sid,match[2]);if(!result)return send(res,404,{error:'Transcode unavailable'});
-      res.writeHead(200,{'Content-Type':result.type,'Cache-Control':'no-store'});return res.end(result.data);
+      res.writeHead(200,{'Content-Type':result.type,'Cache-Control':match[2].endsWith('.ts')?'private, max-age=3600, immutable':'no-store'});return res.end(result.data);
     }
     if (url.pathname.startsWith('/media/') && req.method === 'GET') return send(res, authorized ? 403 : 401, {error:authorized ? 'Direct playback is disabled; conversion is required' : 'Login required'});
     if (req.method === 'GET' && staticFiles[url.pathname]) {
