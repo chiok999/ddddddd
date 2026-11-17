@@ -62,7 +62,7 @@ function showRoute(name, updateHash=true) {
     el.classList.toggle('hidden',filtered && !el.querySelector('.catalog-card:not(.hidden)') && (el.querySelector('.catalog-card') || !(el.dataset.groups||'').split(',').includes(name)));
   });
   refreshCards();if(view==='home'){renderContinue();updateHero();}
-  if(previous==='watch' && view!=='watch') {stopTranscode(); ++resolveSequence; fallback.cancel(); directControls(true); $('findStreams').disabled=false; $('video').pause();}
+  if(previous==='watch' && view!=='watch') {$('screen').classList.remove('player-expanded');$('playerEpisodeDrawer').classList.add('hidden');stopTranscode(); ++resolveSequence; fallback.cancel(); directControls(true); $('findStreams').disabled=false; $('video').pause();}
   if(updateHash && location.hash!=='#'+name) location.hash=name;
   if(typeof window.scrollTo==='function') window.scrollTo(0,0);
 }
@@ -89,7 +89,7 @@ const fallback = createFallback((item, index, total, fail, isActive) => {
   playItem(item, ()=>{if(isActive()){recordProvider(item.provider,false);fail();}}, index>0, isActive);
 }, () => { pendingFailure=null; stopTranscode(); if(hls){hls.destroy();hls=null;} const video=$('video');video.pause();video.removeAttribute('src');video.load(); $('playError').textContent='Unable to transcode any available source. '+lastTranscodeError; });
 async function playItem(item, fail, isFallback = false, isActive = () => true) {
-  stopTranscode(); const sequence=transcodeSequence; const oldVideo=$('video'); if(hls){hls.destroy();hls=null;} oldVideo.pause();oldVideo.removeAttribute('src');oldVideo.load();
+  $('screen').classList.add('player-expanded');stopTranscode(); const sequence=transcodeSequence; const oldVideo=$('video'); if(hls){hls.destroy();hls=null;} oldVideo.pause();oldVideo.removeAttribute('src');oldVideo.load();
   directControls(true);
   if (!isFallback) $('playError').textContent=''; $('playing').textContent='Preparing…';
   try {
@@ -240,7 +240,7 @@ async function searchTitles(query, saved = null) {
   } catch(err) { if(sequence===searchSequence) { if(saved) showRoute('search'); $('searchError').textContent=err.message; $('resultCount').textContent='Search unavailable'; } }
 }
 $('searchForm').onsubmit=e=>{ e.preventDefault(); showRoute('search'); searchTitles($('query').value.trim()); };
-function openTitle(item,resume=null){ stopTranscode(); if(route!=='watch') watchReturn=route; fallback.cancel(); directControls(true);  ++resolveSequence; if(hls){hls.destroy();hls=null;} current=null; pendingFailure=null; $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('placeholder').querySelector('p').textContent='Looking for a stream…'; $('playError').textContent=''; showRoute('watch'); selectTitle(item); if(resume && item.type==='series' && Number.isInteger(resume.season) && Number.isInteger(resume.episode) && resume.season>0 && resume.episode>0){$('season').value=String(resume.season);$('episode').value=String(resume.episode);} findStreams(true); }
+function openTitle(item,resume=null){ stopTranscode(); if(route!=='watch') watchReturn=route; fallback.cancel(); directControls(true);  ++resolveSequence; if(hls){hls.destroy();hls=null;} current=null; pendingFailure=null; $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('placeholder').querySelector('p').textContent='Looking for a stream…'; $('playError').textContent=''; showRoute('watch'); $('screen').classList.add('player-expanded'); selectTitle(item); if(resume && item.type==='series' && Number.isInteger(resume.season) && Number.isInteger(resume.episode) && resume.season>0 && resume.episode>0){$('season').value=String(resume.season);$('episode').value=String(resume.episode);} findStreams(true); }
 $('episodeSelect').onchange=()=>{ const [s,e]=$('episodeSelect').value.split(':').map(Number); if(s && e){ $('season').value=s; $('episode').value=e; } };
 async function findStreams(autoplay = false) {
   stopTranscode();
