@@ -1,4 +1,4 @@
-> Update: conversion is automatic and original `/media/` GET playback is disabled. HLS input and full-timeline seeking remain unsupported. This document contains historical test details.
+> Update: conversion is automatic and original `/media/` GET playback is disabled. Output now accumulates as a bounded EVENT playlist; seeking is limited to the already-converted portion. HLS input, arbitrary future seeking and cross-session caching remain unsupported. Historical notes below predate this change.
 
 # On-demand transcoding audit
 
@@ -9,3 +9,10 @@
 - Testing in this environment: synthetic fast-start MP4 with video/audio was read as a stream and FFmpeg encoded both variants; each generated TS segment was then decoded with video and audio mappings. A silent MP4 was encoded, a one-byte output limit stopped its job, and tests covered session isolation, concurrent-job rejection, missing FFmpeg, HLS rejection, unsafe input gating, stop/cleanup and simulated UI switching (older direct-play fixtures require updating). The integration test automatically uses the installed bundled binary, or a `CINEMA_TEST_FFMPEG` override. Tested the Linux x64 glibc packaged FFmpeg 8.1.3; ARM64 and musl builds were not run. A real browser, live provider source, Botkeep performance, privacy isolation and long-duration playback were not verified.
 
 - Screenshot diagnosis: the former code mapped **every** subprocess spawn error to the same message, so the screenshot alone cannot distinguish a missing executable from a permission, loader or other spawn error. Troy now probes execution and the required encoders, muxer and filters before fetching video, attempts a packaged binary then a system binary, and reports missing-loader and permission failures separately. If npm omits the optional dependency or the filesystem prevents execution, transcoding can still fail; neither Botkeep architecture nor installation has been inspected.
+
+
+## EVENT output update
+
+- `transcode.js` now emits growing EVENT playlists with all produced segments retained; normal completion includes ENDLIST. The session remains bound to its owner and is cleaned on stop, timeout and errors. HLS.js requests the start of the event rather than starting at the live edge. Native-HLS quality changes attempt to retain the current position. No unconverted future segments are fabricated.
+- The output monitor defaults to 1 GiB across both encodes and stops the job if less than 256 MiB is free on the temp filesystem. Measurements run every two seconds and are not a hard quota. Monitored capacity may be exceeded between checks, so deploy with a filesystem quota if necessary. When a known conversion failure occurs, its message is available briefly to the same session; the browser uses it when playback fails.
+- A real synthetic 44-second MP4 was streamed to the actual `createTranscoder` job: both output manifests retained more than eight segments, still exposed their first segments, and had ENDLIST at completion. First and last segments of both outputs were decoded with video and audio. Cross-session reads failed. A one-byte output threshold test confirms cleanup and same-session failure status. Simulated UI tests cover HLS configuration and native quality position restoration; no actual browser, live provider, 1 GiB saturation, long-pause, or Botkeep test was performed.

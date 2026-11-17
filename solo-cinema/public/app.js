@@ -11,6 +11,10 @@ const post = (url, data) => api(url, { method:'POST', headers:{ 'Content-Type':'
 let route='home', resolveSequence=0, watchReturn='search', discoveryEpoch=0;
 let transcodeJob=null, transcodeSequence=0, transcodeQueue=Promise.resolve(), lastTranscodeError='';
 function enqueueTranscode(fn){const task=transcodeQueue.then(fn,fn);transcodeQueue=task.catch(()=>{});return task;}
+async function conversionFailed(item,fail){
+  const sequence=transcodeSequence;let message='Converted playback failed.';try{const result=await post('/api/transcode/status',{id:item.transcodeId});if(result.error)message=result.error;}catch{}
+  if(current!==item || route!=='watch' || sequence!==transcodeSequence)return;lastTranscodeError=message;fail();
+}
 function stopTranscode(){++transcodeSequence;const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
 
 let dataSaver = (()=>{try{const v=localStorage.getItem('solo-data-saver'); return v===null ? !!navigator.connection?.saveData : v==='true';}catch{return !!navigator.connection?.saveData;}})();
@@ -88,7 +92,7 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     transcodeJob=result.id;
     item={...item,format:'hls',transcodeId:result.id,noResume:true};
     const outputUrl=result.url;
-    $('playError').textContent='Live conversion: seeking and resume are limited; pause may lose older segments.';
+    $('playError').textContent='Conversion is growing: seek within the portion converted so far. Long pauses or storage limits can end the session.';
     current=item; pendingFailure=null; subtitleTouched=false; if(uploadUrl){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
     $('server').replaceChildren(); const variants=item.variants || [item]; variants.forEach((source,i)=>$('server').add(new Option(`${source.provider || 'Direct'} · ${source.quality ? source.quality+'p' : 'source'} · ${(source.format || 'file').toUpperCase()}`,String(i)))); $('server').disabled=variants.length<2; const serverIndex=variants.findIndex(source=>source.proxy ? source.proxy===item.proxy : source===item); $('server').value=String(Math.max(0,serverIndex));
     $('quality').replaceChildren(new Option('240p', '240'),new Option('360p', '360')); $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
@@ -102,15 +106,15 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     }
     // hls.js can detect a playlist whose URL itself is opaque.
     if (item.format === 'hls' && Hls.isSupported()) {
-      activeLevels=[]; hls=new Hls({startLevel:0,maxBufferLength:45,maxMaxBufferLength:60,backBufferLength:30}); const player=hls; player.loadSource(outputUrl); player.attachMedia(video);
+      activeLevels=[]; hls=new Hls({startLevel:0,startPosition:0,liveDurationInfinity:false,maxBufferLength:45,maxMaxBufferLength:60,backBufferLength:30}); const player=hls; player.loadSource(outputUrl); player.attachMedia(video);
       player.on(Hls.Events.MANIFEST_PARSED, (_event, data)=>{ if(current!==item || hls!==player) return; activeLevels=data.levels || []; const index=activeLevels.findIndex(level=>level.height===preferredHeight); if(index<0){lastTranscodeError='The converted quality is unavailable.';pendingFailure=null;fail();return;} player.currentLevel=index; $('quality').value=String(preferredHeight); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); });
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('subtitles').value; $('subtitles').replaceChildren(new Option('Off', '-1')); (data.subtitleTracks || []).forEach((track,i)=>$('subtitles').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if(externalTrack) $('subtitles').add(new Option('English (provider)','external')); if(uploadTrack) $('subtitles').add(new Option('Uploaded subtitles','upload')); if([...$('subtitles').options].some(o=>o.value===previous)) $('subtitles').value=previous; });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('audio').value; $('audio').replaceChildren(new Option('Default', '-1')); (data.audioTracks || []).forEach((track,i)=>$('audio').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if([...$('audio').options].some(o=>o.value===previous)) $('audio').value=previous; });
-      hls.on(Hls.Events.ERROR, (_event,data)=>{ if(data.fatal && current===item && pendingFailure===fail) { lastTranscodeError='Converted playback failed.'; pendingFailure=null; fail(); } });
+      hls.on(Hls.Events.ERROR, (_event,data)=>{ if(data.fatal && current===item && pendingFailure===fail) { pendingFailure=null; void conversionFailed(item,fail); } });
     } else { video.src=outputUrl.replace('master.m3u8',`${preferredHeight}/index.m3u8`); nativeSubtitleOptions(); nativeAudioOptions(); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); }
   } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
 }
-$('quality').onchange=()=>{ const height=Number($('quality').value); if(![240,360].includes(height))return; preferredHeight=height; try{localStorage.setItem('solo-quality-height',String(height));}catch{} if(hls){const index=activeLevels.findIndex(level=>level.height===height);if(index>=0)hls.currentLevel=index;}else if(current?.transcodeId){const video=$('video'),paused=video.paused;video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();if(!paused)video.play().catch(()=>{});$('playError').textContent='Quality changed; live conversion may resume at the live edge.';} };
+$('quality').onchange=()=>{ const height=Number($('quality').value); if(![240,360].includes(height))return; preferredHeight=height; try{localStorage.setItem('solo-quality-height',String(height));}catch{} if(hls){const index=activeLevels.findIndex(level=>level.height===height);if(index>=0)hls.currentLevel=index;}else if(current?.transcodeId){const video=$('video'),paused=video.paused,time=video.currentTime,item=current;video.addEventListener('loadedmetadata',()=>{if(current!==item || !Number.isFinite(time))return;try{if(Number.isFinite(video.duration) && time<=video.duration)video.currentTime=time;}catch{}},{once:true});video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();if(!paused)video.play().catch(()=>{});$('playError').textContent='Quality changed; seeking is limited to the converted portion.';} };
 function nativeSubtitleOptions(){
   if(hls || !current) return;
   const select=$('subtitles'), previous=select.value, tracks=$('video').textTracks;
@@ -167,7 +171,7 @@ $('subtitleFile').onchange=async()=>{
   } catch { if(current===item) $('playError').textContent='Could not read that subtitle file.'; }
 };
 $('video').ontimeupdate=()=>{ if(!current || current.noResume || Date.now()-lastSave<5000) return; lastSave=Date.now(); const key=current.progressKey || current.url; const progress=load('solo-progress').filter(x=>x.url!==key); progress.unshift({url:key,time:$('video').currentTime}); save('solo-progress', progress.slice(0,100)); };
-$('video').onerror=()=>{ if(current && pendingFailure && $('video').currentSrc) { const fail=pendingFailure; pendingFailure=null; fail(); } };
+$('video').onerror=()=>{ if(current && pendingFailure && $('video').currentSrc) { const fail=pendingFailure, item=current; pendingFailure=null; void conversionFailed(item,fail); } };
 api('/api/session').then(x=>loggedIn(x.authenticated)).catch(()=>loggedIn(false));
 
 async function selectTitle(item) {
