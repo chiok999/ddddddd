@@ -18,7 +18,11 @@ function showRoute(name, updateHash=true) {
   const view=['movies','shows','anime'].includes(name)?'home':name;
   for(const id of ['home','search','watch','list']) $('view-'+id).classList.toggle('hidden',id!==view);
   document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===name));
-  document.querySelectorAll('#catalogRows .catalog-section').forEach(el=>{ const groups={movies:['popular-movies','new-movies','top-rated'],shows:['popular-series','new-series'],anime:['anime','animation']}; el.classList.toggle('hidden',!!groups[name]&&!groups[name].includes(el.id)); });
+  document.querySelectorAll('#catalogRows .catalog-section').forEach(el=>{
+    const filtered=['movies','shows','anime'].includes(name);
+    el.querySelectorAll('.catalog-card').forEach(card=>{card.classList.toggle('hidden',filtered && (name==='anime' ? card.dataset.anime!=='true' : card.dataset.type!==(name==='movies'?'movie':'series')));});
+    el.classList.toggle('hidden',filtered && !el.querySelector('.catalog-card:not(.hidden)') && (el.querySelector('.catalog-card') || !(el.dataset.groups||'').split(',').includes(name)));
+  });
   if(previous==='watch' && view!=='watch') {++resolveSequence; fallback.cancel(); clearEmbed(); directControls(true); $('findStreams').disabled=false; $('video').pause();}
   if(updateHash && location.hash!=='#'+name) location.hash=name;
   if(typeof window.scrollTo==='function') window.scrollTo(0,0);
@@ -193,13 +197,8 @@ $('nextEpisode').onclick=async()=>{
   await findStreams(true);
 };
 
-const rowLabels = {
-  'popular-movies':['Trending & popular movies','Cinemeta popular · not a live trend chart'], 'popular-series':['TV shows','Popular on Cinemeta'],
-  'new-movies':['New movies','Current release year'], 'new-series':['New shows','Current release year'],
-  'animation':['Cartoons & animation','Popular animated series'], 'anime':['Anime','Popular anime from Cinemeta'], 'top-rated':['Featured movies','Cinemeta featured catalog']
-};
-function titleCard(item){
-  const card=document.createElement('button'); card.type='button'; card.className='catalog-card';
+function titleCard(item, animeSection=false){
+  const card=document.createElement('button'); card.type='button'; card.className='catalog-card'; card.dataset.type=item.type; card.dataset.anime=String(animeSection || !!item.anime);
   const art=document.createElement('div'); art.className='catalog-art';
   if(item.poster){ const img=document.createElement('img'); img.loading='lazy'; img.decoding='async'; img.alt=''; img.referrerPolicy='no-referrer'; img.src=item.poster; img.onerror=()=>img.remove(); art.append(img); }
   const fallback=document.createElement('span'); fallback.className='art-fallback'; fallback.textContent=item.title; art.append(fallback);
@@ -212,11 +211,12 @@ async function loadDiscovery(){
   if(discoveryLoading || discoveryLoaded) return; discoveryLoading=true; const epoch=discoveryEpoch;
   try {
     const data=await api('/api/discover'); if(epoch!==discoveryEpoch) return; const root=$('catalogRows'); root.replaceChildren();
-    for(const section of data.sections){ const info=rowLabels[section.id]; if(!info) continue;
-      const row=document.createElement('section'); row.className='catalog-section'; row.id=section.id;
-      const heading=document.createElement('div'); heading.className='row-head'; const title=document.createElement('h2'); title.textContent=info[0]; const note=document.createElement('span'); note.textContent=info[1]; heading.append(title,note); row.append(heading);
-      const rail=document.createElement('div'); rail.className='catalog-rail'; rail.setAttribute('role','group'); rail.setAttribute('aria-label',info[0]); rail.tabIndex=0;
-      for(const item of section.items) rail.append(titleCard(item)); if(!section.items.length){ const empty=document.createElement('p'); empty.className='catalog-status'; empty.textContent=section.error || 'No titles available right now.'; rail.append(empty); }
+    for(const section of data.sections){ if(!/^[a-z0-9-]{1,60}$/.test(section.id||'') || !Array.isArray(section.items)) continue;
+      const label=section.title || section.id; const groups=Array.isArray(section.groups)?section.groups:section.id==='anime'?['anime']:[...new Set(section.items.map(i=>i.type==='movie'?'movies':'shows'))];
+      const row=document.createElement('section'); row.className='catalog-section'; row.id=section.id; row.dataset.groups=groups.join(',');
+      const heading=document.createElement('div'); heading.className='row-head'; const title=document.createElement('h2'); title.textContent=label; const note=document.createElement('span'); note.textContent=section.source || 'Catalog'; heading.append(title,note); row.append(heading);
+      const rail=document.createElement('div'); rail.className='catalog-rail'; rail.setAttribute('role','group'); rail.setAttribute('aria-label',label); rail.tabIndex=0;
+      for(const item of section.items) rail.append(titleCard(item,section.id==='anime')); if(!section.items.length){ const empty=document.createElement('p'); empty.className='catalog-status'; empty.textContent=section.error || 'No titles available right now.'; rail.append(empty); }
       row.append(rail); root.append(row);
     }
     showRoute(route,false); discoveryLoaded=data.sections.every(section=>!section.error);
