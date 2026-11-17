@@ -85,7 +85,7 @@ async function probeFfmpeg(executable){
 async function chooseFfmpeg(candidates){const failures=[];for(const candidate of candidates){try{await probeFfmpeg(candidate.path);return candidate.path;}catch(err){failures.push(`${candidate.label}: ${err.message}`);}}throw Error(failures.join('; '));}
 
 function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=90000, startupMs=45000}={}){
-  let active=null;const failures=new Map();
+  let active=null;const failures=new Map();let admission=Promise.resolve();
   // Reap abandoned private directories after a crash, without touching a live Troy process.
   async function reap(){
     for(const name of await fsp.readdir(tmpdir).catch(()=>[])){
@@ -107,8 +107,14 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=90000, s
 
   async function start(source,sid,seekOffset=0,requestId=null){
     if(typeof seekOffset!=='number' || !Number.isFinite(seekOffset) || seekOffset<0 || seekOffset>86400)throw Object.assign(Error('Invalid seek position'),{status:400});
-    if(active)throw Object.assign(Error('A transcode is already active; stop it first'),{status:409});
-    const job={sid,requestId,id:crypto.randomBytes(24).toString('base64url'),controller:new AbortController(),lastAccess:Date.now(),stopped:false,error:null,proc:null,dir:null,ready:false};active=job;
+    // Serialize admission so a reload or retry can replace its own abandoned job
+    // without stopping another authenticated session or creating overlapping jobs.
+    const claim=admission.then(async()=>{
+      if(active && active.sid!==sid)throw Object.assign(Error('Another session is watching; stop it first'),{status:409});
+      if(active)await stop(active);
+      const next={sid,requestId,id:crypto.randomBytes(24).toString('base64url'),controller:new AbortController(),lastAccess:Date.now(),stopped:false,error:null,proc:null,dir:null,ready:false};active=next;return next;
+    });
+    admission=claim.then(()=>{},()=>{});const job=await claim;
     try{
       const binary=await chooseFfmpeg(executable?[{label:'FFmpeg',path:executable}]:ffmpegCandidates());if(job.stopped)throw Error('Transcode stopped');
       job.dir=await fsp.mkdtemp(path.join(tmpdir,`troy-transcode-${process.pid}-`));if(job.stopped)throw Error('Transcode stopped');for(const d of ['240','360']){await fsp.mkdir(path.join(job.dir,d));if(job.stopped)throw Error('Transcode stopped');}

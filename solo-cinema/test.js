@@ -539,3 +539,28 @@ else {process.stderr.write('No space left on device\n');process.exit(1);}
  const t=createTranscoder({tmpdir:dir,executable:exe,startupMs:5000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(Readable.from([Buffer.concat([box('ftyp'),box('moov')])]))})});
  try{await assert.rejects(t.start({},'owner'),/filesystem is full or its quota has been exceeded/);assert.deepEqual(await fs.readdir(dir),['ffmpeg-fixture']);}finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
 });
+
+test('MovieBox detail seasons are bounded and tied to the selected subject', async () => {
+  const createMoviebox=require('./moviebox'); let subject='42';
+  const adapter=createMoviebox({safeUrl:u=>new URL(u),request:async url=>{
+    if(url.includes('/home?'))return {headers:new Headers({'x-user':JSON.stringify({token:'test'})})};
+    assert.match(url,/\/detail\?detailPath=/);
+    return {json:{data:{subject:{subjectId:subject,subjectType:2},resource:{seasons:[{se:1,maxEp:2},{se:2,maxEp:1},{se:2,maxEp:20},{se:3,maxEp:100000}]}}}};
+  }});
+  const item={subjectId:'42',detailPath:'show-42',type:'series'};
+  assert.deepEqual(await adapter.episodes(item),[{season:1,episode:1,title:'Episode 1'},{season:1,episode:2,title:'Episode 2'},{season:2,episode:1,title:'Episode 1'}]);
+  subject='99';assert.deepEqual(await adapter.episodes(item),[]);
+});
+
+test('a session can replace its abandoned conversion without cancelling another session', {skip:!testFfmpeg,timeout:20000},async()=>{
+ const {createTranscoder}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-replace-'));let notify;const opened=new Promise(r=>notify=r);let count=0;
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async(_source,signal)=>{count++;notify();return new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}))}});
+ try{
+  const first=t.start({},'owner',0,'first');first.catch(()=>{});await opened;
+  await assert.rejects(t.start({},'other',0,'other'),/Another session/);
+  const second=t.start({},'owner',0,'second');second.catch(()=>{});
+  await assert.rejects(first,/aborted|stopped/);
+  assert.equal(await t.stopRequest('first','owner'),false);
+  await t.stopSession('owner');await assert.rejects(second,/aborted|stopped/);
+ }finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
+});
