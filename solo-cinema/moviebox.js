@@ -6,7 +6,7 @@ module.exports = function createMoviebox({ request, safeUrl }) {
   const base = 'https://h5-api.aoneroom.com/wefeed-h5api-bff';
   const headers = { 'user-agent': 'Mozilla/5.0', referer: 'https://moviebox.ph/', origin: 'https://moviebox.ph', accept: 'application/json', 'content-type': 'application/json', 'x-client-info': '{"timezone":"Africa/Blantyre"}', 'x-request-lang': 'en' };
   let token = null, expires = 0;
-  async function bff(route, payload, refresh = false, referer = null) {
+  async function bff(route, payload, refresh = false) {
     if (refresh || !token || expires < Date.now()) {
       const response = await request(`${base}/home?host=moviebox.ph`, { headers, timeoutMs:7000 });
       const xuser = response.headers.get('x-user');
@@ -20,9 +20,9 @@ module.exports = function createMoviebox({ request, safeUrl }) {
       expires = Date.now() + 50 * 60000;
     }
     try {
-      return await request(`${base}${route}`, { timeoutMs:7000, method: payload ? 'POST' : 'GET', headers: { ...headers, ...(referer ? {referer} : {}), authorization: `Bearer ${token}` }, body: payload ? JSON.stringify(payload) : undefined });
+      return await request(`${base}${route}`, { timeoutMs:7000, method: payload ? 'POST' : 'GET', headers: { ...headers, authorization: `Bearer ${token}` }, body: payload ? JSON.stringify(payload) : undefined });
     } catch (e) {
-      if (e.status === 401 && !refresh) return bff(route, payload, true, referer);
+      if (e.status === 401 && !refresh) return bff(route, payload, true);
       throw e;
     }
   }
@@ -70,19 +70,13 @@ module.exports = function createMoviebox({ request, safeUrl }) {
           const qs = new URLSearchParams({ subjectId:candidate.subjectId, detailPath:candidate.detailPath, se:String(se), ep:String(ep) });
           const referer = `${player}/spa/videoPlayPage/movies/${encodeURIComponent(candidate.detailPath)}?${new URLSearchParams({ id:candidate.subjectId, type:'/movie/detail', detailSe:String(se), detailEp:String(ep), lang:'en' })}`;
           let response;
-          // Match the bot: ask the player domain first, with the BFF as fallback.
-          try { response=await request(`${player}/wefeed-h5api-bff/subject/play?${qs}`,{headers:{...headers,referer,'x-source':''}}); }
-          catch(e) { if(e.name==='AbortError')throw e; }
-          if(!response?.json?.data?.streams?.length && !response?.json?.data?.hls?.length){
-            const bffQuery=new URLSearchParams(qs);bffQuery.set('host','moviebox.ph');
-            try { response=await bff(`/subject/play?${bffQuery}`,null,refresh>0,referer); }
-            catch(e){if([403,404].includes(e.status) && refresh===0)continue;throw e;}
-          }
+          try { response = await request(`${player}/wefeed-h5api-bff/subject/play?${qs}`, { headers: { ...headers, referer, 'x-source': '' } }); }
+          catch(e) { if ((e.status === 403 || e.status === 404) && refresh === 0) continue; throw e; }
           const data = response.json?.data || {};
           const list = [];
           for (const stream of Array.isArray(data.streams) ? data.streams.slice(0,30) : []) {
-            if (candidate.type==='movie' && Number(stream?.duration) && Number(stream.duration)<2400) continue;
-            try { const url=safeUrl(stream.url).href; list.push({ url, format: /\.m3u8(?:\?|$)/i.test(url) ? 'hls' : 'file', quality: Number(stream.resolutions) || 0, duration: Number.isFinite(Number(stream.duration)) && Number(stream.duration)>0 ? Number(stream.duration) : null }); } catch { /* unsafe or unsupported URL */ }
+            if (Number(stream?.duration) && Number(stream.duration) < (candidate.type === 'series' ? 300 : 2400)) continue;
+            try { const url=safeUrl(stream.url).href; list.push({ url, format: /\.m3u8(?:\?|$)/i.test(url) ? 'hls' : 'file', quality: Number(stream.resolutions) || 0, duration: Number.isFinite(Number(stream.duration)) && Number(stream.duration)>0 && Number(stream.duration)<=86400 ? Number(stream.duration) : null }); } catch { /* unsafe or unsupported URL */ }
           }
           for (const stream of Array.isArray(data.hls) ? data.hls.slice(0,30) : []) {
             try { list.push({ url:safeUrl(typeof stream === 'string' ? stream : stream.url).href, format:'hls', quality:Number(stream?.resolutions) || 0 }); } catch { /* unsafe or unsupported URL */ }

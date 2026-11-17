@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { Agent, fetch } = require('undici');
-const { safeUrl, publicLookup, getRemote, getWithH2Fallback } = require('./network');
+const { safeUrl, publicLookup, getRemote } = require('./network');
 const { describe } = require('./diagnostics');
 const {scope:providerScope}=require('./provider-timeout');
 
@@ -21,11 +21,9 @@ const sources = require('./source-store').createSourceStore();
 const loginLimiter=require('./login-limiter').createLoginLimiter();
 let activeRangeProbes = 0;
 const catalog = new Map();
-const captions = require('./source-store').createSourceStore({perSession:100,maxEntries:1000});
-const captionSources = require('./source-store').createSourceStore({perSession:1000,maxEntries:4000});
+const captions = new Map();
+const captionSources = new Map();
 const agent = new Agent({ connect: { lookup: publicLookup() } });
-// Used for a single GET retry after HTTP 426; it retains pinned DNS validation.
-const h2Agent = new Agent({ allowH2:true, connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
 function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null, refreshAfterMs = null) {
   const id = crypto.randomBytes(24).toString('base64url');
@@ -35,35 +33,15 @@ function remember(url, sid, referer = null, format = null, origin = null, userAg
 // Informational only: never prevent playback based on storage detection.
 const transcodeTmp=process.env.CINEMA_TMPDIR || require('node:os').tmpdir();
 if(process.platform==='linux') fs.statfs(transcodeTmp,(err,stat)=>{if(!err && Number(stat.type)===0x01021994)console.warn('Troy temporary output is on tmpfs and may consume RAM.');});
-const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent,h2Agent)).response});
-const openHlsResource=async(source,signal,range)=>{
-  const headers={'accept-encoding':'identity','user-agent':source.userAgent || require('./source-opener').DEFAULT_USER_AGENT};if(range)headers.range=range;
-  if(source.userAgent)headers['user-agent']=source.userAgent;if(source.referer)headers.referer=source.referer;if(source.origin)headers.origin=source.origin;
-  return (await getRemote(source.url,headers,signal,fetch,agent,h2Agent)).response;
-};
-const transcoder=require('./transcode').createTranscoder({open:openSource,openHlsResource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
-// Same-origin relay for direct playback. Provider CDNs often reject requests
-// that do not come from a browser, and a browser cannot add Referer headers to
-// cross-origin media while satisfying CORS. Set CINEMA_RELAY=0 to keep the old
-// conversion-only behaviour.
-const relayEnabled=process.env.CINEMA_RELAY!=='0';
-const mediaProxy=require('./media-proxy').createMediaProxy({
-  safeUrl,
-  openMedia:(entry,headers,signal,head)=>getRemote(entry.url,headers,signal,fetch,agent,h2Agent,{method:head?'HEAD':'GET'}),
-  createHandle:(entry,sid)=>remember(entry.url,sid,entry.referer,entry.format,entry.origin,entry.userAgent),
-  perSession:Number(process.env.CINEMA_RELAY_STREAMS)||6,
-});
+const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent)).response});
+const transcoder=require('./transcode').createTranscoder({open:openSource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
 async function providerRequest(url, opts = {}) {
   safeUrl(url);
   const { timeoutMs = 15000, ...fetchOpts } = opts;
   const signals=[AbortSignal.timeout(Math.max(1, Math.min(15000, timeoutMs))),providerScope.getStore(),fetchOpts.signal].filter(Boolean);
-  const options={...fetchOpts,redirect:'manual',signal:AbortSignal.any(signals)};
-  // Provider GETs can return the same 426 as media requests. Do not replay POSTs.
-  const response=(!options.method || options.method.toUpperCase()==='GET')
-    ? await getWithH2Fallback(url,options,fetch,agent,h2Agent)
-    : await fetch(url,{...options,dispatcher:agent});
+  const response = await fetch(url, { ...fetchOpts, dispatcher: agent, redirect: 'manual', signal: AbortSignal.any(signals) });
   if (!response.ok) { await response.body?.cancel(); throw Object.assign(new Error(`Provider HTTP ${response.status}`), { status: response.status }); }
   const reader = response.body.getReader(); const chunks = []; let total = 0;
   while (true) {
@@ -134,7 +112,7 @@ const server = http.createServer(async (req, res) => {
       res.setHeader('Set-Cookie', `cinema=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : ''}`);
       return send(res, 200, { ok: true });
     }
-    if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized, relay: relayEnabled });
+    if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized });
     if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); await transcoder.stopSession(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
     if (url.pathname === '/api/discover' && req.method === 'GET') {
       if (!authorized) return send(res,401,{error:'Login required'});
@@ -188,6 +166,8 @@ const server = http.createServer(async (req, res) => {
       if (!selected || selected.sid !== sid || selected.expires < Date.now() || selected.item.source !== 'kisskh') return send(res, 404, { error:'Search result expired; search again' });
       const text=await kisskh.subtitle(selected.item,Number(data.season),Number(data.episode));
       if (!text) return send(res,200,{ url:null });
+      for (const [id, entry] of captions) if (entry.expires < Date.now()) captions.delete(id);
+      if (captions.size > 100) fail('Too many subtitles; restart the server');
       const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
       return send(res,200,{url:`/caption/${id}`});
     }
@@ -204,6 +184,8 @@ const server = http.createServer(async (req, res) => {
         if(raw.includes('-->') && !/^<(!doctype|html)/i.test(raw)) {const converted=raw.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g,'$1.$2'); text=/^WEBVTT(?:\s|$)/i.test(converted)?converted:`WEBVTT\n\n${converted}`;}
       } else text=await moviebox.subtitle(source.info);
       if (!text) return send(res,200,{url:null});
+      for (const [id, entry] of captions) if (entry.expires < Date.now()) captions.delete(id);
+      if (captions.size > 100) fail('Too many subtitles; restart the server');
       const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
       return send(res,200,{url:`/caption/${id}`});
     }
@@ -219,15 +201,16 @@ const server = http.createServer(async (req, res) => {
       if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
       const season=Number(data.season),episode=Number(data.episode);
       const result=await resolveTitle(selected,season,episode);
+      for (const [id, entry] of captionSources) if (entry.expires<Date.now()) captionSources.delete(id);
       const streams = result.streams.map(stream => {
         let captionId=null;
-        if(stream.captionInfo){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
+        if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
         const refresh=async()=>{
           const refreshed=await resolveTitle(selected,season,episode,stream.provider);
           const matching=refreshed.streams.filter(s=>s.provider===stream.provider && s.format===stream.format && s.quality===stream.quality);
           return matching.length===1?matching[0]:null;
         };
-        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent, refresh, stream.refreshAfterMs) };
+        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 && stream.duration<=86400 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent, refresh, stream.refreshAfterMs) };
       });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }
@@ -251,7 +234,7 @@ const server = http.createServer(async (req, res) => {
           if(source.userAgent)headers['user-agent']=source.userAgent;
           if(source.referer)headers.referer=source.referer;
           if(source.origin)headers.origin=source.origin;
-          return (await getRemote(source.url,headers,signal,fetch,agent,h2Agent)).response;
+          return (await getRemote(source.url,headers,signal,fetch,agent)).response;
         },entry);
         return send(res,200,result);
       } catch {return send(res,502,{error:'Range probe failed'});} finally {activeRangeProbes--;}
@@ -260,6 +243,7 @@ const server = http.createServer(async (req, res) => {
       if (!authorized) return send(res,401,{error:'Login required'});
       const data=await body(req);if(typeof data.url!=='string' || !/^\/media\/[A-Za-z0-9_-]+$/.test(data.url)) return send(res,400,{error:'Select an existing direct source'});
       const entry=sources.get(data.url.slice(7));if(!entry || entry.sid!==sid || entry.expires<Date.now())return send(res,404,{error:'Source expired'});
+      if(entry.format==='hls')return send(res,400,{error:'Transcoding currently supports direct MP4 sources, not HLS playlists'});
       if(data.requestId!==undefined && (typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId)))return send(res,400,{error:'Invalid request ID'});
       const disconnected=new AbortController();
       const onClose=()=>{if(!res.writableEnded)disconnected.abort();};res.once('close',onClose);
@@ -277,8 +261,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/transcode/status' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
       const data=await body(req);if(typeof data.id!=='string' || !/^[A-Za-z0-9_-]{32}$/.test(data.id))return send(res,400,{error:'Invalid job ID'});
-      if(data.playhead!==undefined && (typeof data.playhead!=='number' || !Number.isFinite(data.playhead) || data.playhead<0))return send(res,400,{error:'Invalid playhead'});
-      const status=transcoder.status(data.id,sid,data.playhead);if(!status)return send(res,404,{error:'Conversion unavailable'});return send(res,200,status);
+      const status=transcoder.status(data.id,sid);if(!status)return send(res,404,{error:'Conversion unavailable'});return send(res,200,status);
     }
     if (url.pathname === '/api/transcode/stop' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});const data=await body(req);if(typeof data.id!=='string')return send(res,400,{error:'Missing job ID'});
@@ -289,15 +272,7 @@ const server = http.createServer(async (req, res) => {
       if(!match)return send(res,404,{error:'Not found'});const result=await transcoder.read(match[1],sid,match[2]);if(!result)return send(res,404,{error:'Transcode unavailable'});
       res.writeHead(200,{'Content-Type':result.type,'Cache-Control':match[2].endsWith('.ts')?'private, max-age=3600, immutable':'no-store'});return res.end(result.data);
     }
-    if (url.pathname.startsWith('/media/') && ['GET','HEAD'].includes(req.method)) {
-      if (!authorized) return send(res, 401, { error: 'Login required' });
-      const entry=sources.get(url.pathname.slice(7));
-      if (!entry || entry.sid!==sid || entry.expires<Date.now()) return send(res, 404, { error:'Source expired; find the stream again' });
-      if (!relayEnabled) return send(res, 403, { error: 'Direct playback is disabled; conversion is required' });
-      const result=await mediaProxy.relay(req,res,entry,sid);
-      if (!res.headersSent) return send(res, result.status, { error: result.error });
-      return;
-    }
+    if (url.pathname.startsWith('/media/') && req.method === 'GET') return send(res, authorized ? 403 : 401, {error:authorized ? 'Direct playback is disabled; conversion is required' : 'Login required'});
     if (req.method === 'GET' && staticFiles[url.pathname]) {
       const [file, mime] = staticFiles[url.pathname]; res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-store' }); return fs.createReadStream(path.join(__dirname, file)).pipe(res);
     }
