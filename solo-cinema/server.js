@@ -256,7 +256,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/transcode/status' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
       const data=await body(req);if(typeof data.id!=='string' || !/^[A-Za-z0-9_-]{32}$/.test(data.id))return send(res,400,{error:'Invalid job ID'});
-      const status=transcoder.status(data.id,sid);if(!status)return send(res,404,{error:'Conversion unavailable'});return send(res,200,status);
+      if(data.playhead!==undefined && (typeof data.playhead!=='number' || !Number.isFinite(data.playhead) || data.playhead<0))return send(res,400,{error:'Invalid playhead'});
+      const status=transcoder.status(data.id,sid,data.playhead);if(!status)return send(res,404,{error:'Conversion unavailable'});return send(res,200,status);
     }
     if (url.pathname === '/api/transcode/stop' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});const data=await body(req);if(typeof data.id!=='string')return send(res,400,{error:'Missing job ID'});
