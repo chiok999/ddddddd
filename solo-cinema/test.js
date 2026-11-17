@@ -627,3 +627,44 @@ test('KissKh episode details are cached, coalesced and returned as copies',async
 test('Movy reports malformed detail metadata without leaking its contents',async()=>{
  const {createMovy}=require('./movy');const {safeUrl}=require('./network');const resolve=createMovy({safeUrl,request:async()=>({text:'<script id="__NEXT_DATA__">{bad and private}</script>'})});await assert.rejects(resolve({tmdbId:'123',type:'movie'},1,1),e=>e.message==='Movy detail data is invalid');
 });
+
+test('an unroutable IPv6 answer cannot be chosen when IPv4 is preferred', async () => {
+  // A host with no working IPv6 route still receives AAAA records. The resolver
+  // legitimately answers with an address this machine cannot reach, and every
+  // safety check passes because the address is public and unicast.
+  const fresh = () => { delete require.cache[require.resolve('./network')]; return require('./network'); };
+  const dualStack = async () => [{ address: '2600:9000::1', family: 6 }, { address: '18.65.238.40', family: 4 }];
+
+  const previous = process.env.CINEMA_IPV4;
+  try {
+    process.env.CINEMA_IPV4 = '1';
+    const { publicLookup } = fresh();
+    const pick = options => new Promise((ok, bad) => publicLookup(dualStack)('cdn.example', options, (e, a) => e ? bad(e) : ok(a)));
+    assert.equal(await pick({}), '18.65.238.40', 'IPv4 is chosen over an earlier IPv6 answer');
+    // An IPv6-only network still works when it asks for that family explicitly.
+    assert.equal(await pick({ family: 6 }), '2600:9000::1');
+
+    // Default stays hands-off: the resolver order is preserved.
+    delete process.env.CINEMA_IPV4;
+    const auto = fresh();
+    const autoPick = options => new Promise((ok, bad) => auto.publicLookup(dualStack)('cdn.example', options, (e, a) => e ? bad(e) : ok(a)));
+    assert.equal(await autoPick({}), '2600:9000::1');
+    assert.equal(auto.forceIPv4, false);
+  } finally {
+    if (previous === undefined) delete process.env.CINEMA_IPV4; else process.env.CINEMA_IPV4 = previous;
+    delete require.cache[require.resolve('./network')];
+  }
+});
+
+test('preferring IPv4 never relaxes the private-address check', async () => {
+  process.env.CINEMA_IPV4 = '1';
+  delete require.cache[require.resolve('./network')];
+  try {
+    const { publicLookup } = require('./network');
+    const lookup = publicLookup(async () => [{ address: '18.65.238.40', family: 4 }, { address: '10.0.0.5', family: 4 }]);
+    await assert.rejects(new Promise((ok, bad) => lookup('cdn.example', {}, (e, a) => e ? bad(e) : ok(a))), /Private/);
+  } finally {
+    delete process.env.CINEMA_IPV4;
+    delete require.cache[require.resolve('./network')];
+  }
+});

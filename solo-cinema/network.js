@@ -9,12 +9,30 @@ function safeUrl(input) {
   if (url.protocol !== 'https:' || url.username || url.password || url.port || url.href.length > 8192 || net.isIP(host.replace(/^\[|\]$/g, '')) || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) throw Error('Only public HTTPS URLs are allowed');
   return url;
 }
+// DNS answers arrive in server order, which is not reachability order. Many
+// cheap VPS hosts, and many consumer networks, publish an AAAA record that the
+// machine cannot actually route: the address is valid and unicast, so every
+// safety check passes, and the connection then dies or is answered by an edge
+// that refuses it. The host that only has working IPv4 looks fine; the host
+// with a broken IPv6 route fails on every source.
+//
+// CINEMA_IPV4=1 forces IPv4 for all outbound source and provider traffic.
+// "auto" (the default) keeps both families, because a dual-stack host works
+// either way and IPv6-only networks must not be broken.
+const preferIPv4 = (process.env.CINEMA_IPV4 || 'auto').toLowerCase();
+const forceIPv4 = ['1','true','yes','ipv4'].includes(preferIPv4);
 function publicLookup(resolve = dns.lookup) {
   return (host, options, callback) => {
     Promise.resolve().then(() => resolve(host, { all: true, verbatim: true })).then(rows => {
       if (!rows.length || rows.some(r => { try { return ipaddr.process(r.address).range() !== 'unicast'; } catch { return true; } })) throw Error('Private or invalid address');
-      const matches = options.family ? rows.filter(r => r.family === options.family) : rows;
+      let matches = options.family ? rows.filter(r => r.family === options.family) : rows;
       if (!matches.length) throw Error('No address');
+      // Deterministic family preference: IPv4 first when asked for, otherwise
+      // keep the resolver's order rather than silently reordering DNS.
+      if (forceIPv4 && !options.family) {
+        const v4 = matches.filter(r => r.family === 4);
+        if (v4.length) matches = v4;
+      }
       if (options.all) callback(null, matches); else callback(null, matches[0].address, matches[0].family);
     }).catch(callback);
   };
@@ -33,4 +51,4 @@ async function getRemote(input, headers, signal, fetch, agent) {
     url=next;
   }
 }
-module.exports = { safeUrl, publicLookup, getRemote };
+module.exports = { safeUrl, publicLookup, getRemote, forceIPv4 };
