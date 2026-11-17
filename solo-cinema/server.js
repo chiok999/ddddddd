@@ -31,8 +31,11 @@ function remember(url, sid, referer = null, format = null, origin = null, userAg
   sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, refresh, expires: Date.now() + 6 * 3600000 });
   return `/media/${id}`;
 }
+// Informational only: never prevent playback based on storage detection.
+const transcodeTmp=process.env.CINEMA_TMPDIR || require('node:os').tmpdir();
+if(process.platform==='linux') fs.statfs(transcodeTmp,(err,stat)=>{if(!err && Number(stat.type)===0x01021994)console.warn('Troy temporary output is on tmpfs and may consume RAM.');});
 const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent)).response});
-const transcoder=require('./transcode').createTranscoder({open:openSource,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
+const transcoder=require('./transcode').createTranscoder({open:openSource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
 async function providerRequest(url, opts = {}) {

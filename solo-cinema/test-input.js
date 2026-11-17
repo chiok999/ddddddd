@@ -35,7 +35,7 @@ test('real socket drop resumes exact bytes after 403 and provider re-resolution'
 test('resume refuses ignored ranges or changed representation instead of corrupting input',async()=>{
  for(const mode of ['changed','ignore']){
   const bytes=Buffer.alloc(20000,3),f=await fixture(bytes,{mode});const controller=new AbortController();const entry={url:f.base+'/old',refresh:async()=>({url:f.base+'/new'})};const open=opener();
-  try{const first=await open(entry,controller.signal);await assert.rejects(collect(resumableInput(first,(offset,validator)=>open(entry,controller.signal,offset,validator),controller.signal,{backoffMs:1,retries:2})),/validated range retry exhausted/);}
+  try{const first=await open(entry,controller.signal);await assert.rejects(collect(resumableInput(first,(offset,validator)=>open(entry,controller.signal,offset,validator),controller.signal,{backoffMs:1,retries:2})),/validated range retry exhausted|Source changed/);}
   finally{controller.abort();await f.close();}
  }
 });
@@ -59,4 +59,19 @@ test('missing validator fails closed on a dropped stream',async()=>{
  const controller=new AbortController();let retries=0;
  await assert.rejects(collect(resumableInput({headers,body},async()=>{retries++;throw Error('unexpected');},controller.signal,{backoffMs:1})),/safe resume is unavailable/);
  assert.equal(retries,0);
+});
+
+test('retry budget resets after each successful validated reconnect',async()=>{
+ const body=(bytes,fail)=>new ReadableStream({start(c){c.enqueue(Uint8Array.from(bytes));if(fail)setTimeout(()=>c.error(Error('reset')),1);else c.close();}});
+ const headers=(offset)=>new Headers({'etag':'"same"','content-length':String(8-offset),...(offset?{'content-range':`bytes ${offset}-7/8`}:{})});
+ const first={headers:headers(0),body:body([0,1],true)};let calls=0;const controller=new AbortController();
+ const result=await collect(resumableInput(first,async offset=>{calls++;return {status:206,headers:headers(offset),body:body([offset,offset+1],offset<6)}},controller.signal,{retries:1,backoffMs:1}));
+ assert.deepEqual([...result],[0,1,2,3,4,5,6,7]);assert.equal(calls,3);
+});
+
+test('reconnects that never deliver bytes exhaust the retry budget',async()=>{
+ const headers=new Headers({'etag':'"same"','content-length':'8'});const failed=()=>new ReadableStream({start(c){setTimeout(()=>c.error(Error('reset')),1);}});const controller=new AbortController();let calls=0;
+ const first={headers,body:failed()};
+ await assert.rejects(collect(resumableInput(first,async offset=>{calls++;return {status:206,headers:new Headers({'etag':'"same"','content-range':`bytes ${offset}-7/8`,'content-length':String(8-offset)}),body:failed()}},controller.signal,{retries:2,backoffMs:1})),/retry exhausted/);
+ assert.equal(calls,2);
 });

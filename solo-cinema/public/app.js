@@ -21,11 +21,14 @@ async function conversionFailed(item,fail){
     void playItem({...item,format:'file',seekAt:position,playbackRetried:true,keepUpload:!!uploadTrack,wasPaused:$('video').paused},fail,true,item.isActive);
   } else fail();
 }
+// Keep finished EVENT output available while the player is open, including paused playback.
+setInterval(()=>{if(route==='watch' && current?.transcodeId)post('/api/transcode/status',{id:current.transcodeId}).catch(()=>{});},45000);
 function stopTranscode(){++transcodeSequence;const pending=pendingRequestId;pendingRequestId=null;if(pending)post('/api/transcode/cancel',{requestId:pending}).catch(()=>{});const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
 
 let dataSaver = (()=>{try{const v=localStorage.getItem('solo-data-saver'); return v===null ? !!navigator.connection?.saveData : v==='true';}catch{return !!navigator.connection?.saveData;}})();
 let preferredHeight = (()=>{try{return Number(localStorage.getItem('solo-quality-height'))===360?360:240;}catch{return 240;}})();
 let activeLevels=[];
+function loadPolicy(retries,firstByte,maxLoad){const retry=()=>({maxNumRetry:retries,retryDelayMs:1000,maxRetryDelayMs:8000,backoff:'exponential'});return {default:{maxTimeToFirstByteMs:firstByte,maxLoadTimeMs:maxLoad,timeoutRetry:retry(),errorRetry:retry()}};}
 function posterUrl(input){
   try {const u=new URL(input); if(u.protocol!=='https:' || u.username || u.password || u.port || !['images.metahub.space','live.metahub.space','pbcdn.aoneroom.com','pbcdnw.aoneroom.com'].includes(u.hostname)) return null;
     const p=new URL('https://wsrv.nl/'); p.searchParams.set('url',u.href); p.searchParams.set('w',dataSaver?'140':'240'); p.searchParams.set('q',dataSaver?'45':'60'); p.searchParams.set('output','webp'); return p.href;
@@ -86,7 +89,8 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     const url = item.proxy || (await post('/api/source', {url:item.url, format:item.format})).url;
     if (!isActive()) return;
     if(!item.proxy) item.proxy=url;
-    const offset=Number.isFinite(item.seekAt) ? item.seekAt : 0;
+    const saved=load('solo-progress').find(x=>x.url===(item.progressKey || item.url));
+    const offset=Number.isFinite(item.seekAt) ? item.seekAt : (Number.isFinite(saved?.time) && saved.time>0 ? saved.time : 0);
     $('playError').textContent=offset ? 'Seeking: preparing conversion at the selected point…' : 'Preparing 240p / 360p conversion…';
     const result=await enqueueTranscode(async()=>{
       if(sequence!==transcodeSequence || !isActive()) return null;
@@ -104,8 +108,7 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     current=item; pendingFailure=null; const keepUpload=!!(item.keepUpload && uploadUrl);subtitleTouched=keepUpload; if(uploadUrl && !keepUpload){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
     $('server').replaceChildren(); const variants=item.variants || [item]; variants.forEach((source,i)=>$('server').add(new Option(`${source.provider || 'Direct'} · ${source.quality ? source.quality+'p' : 'source'} · ${(source.format || 'file').toUpperCase()}`,String(i)))); $('server').disabled=variants.length<2; const serverIndex=variants.findIndex(source=>source.proxy ? source.proxy===item.proxy : source===item); $('server').value=String(Math.max(0,serverIndex));
     $('quality').replaceChildren(new Option('240p', '240'),new Option('360p', '360')); $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});} $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
-    const resume=()=>{ if(item.noResume)return; const progress=load('solo-progress'); const match=progress.find(x=>x.url===(item.progressKey || item.url)); const time=Number.isFinite(item.resumeAt) ? item.resumeAt : match?.time; if(Number.isFinite(time) && time>0 && (!Number.isFinite(video.duration) || time<video.duration-1)) video.currentTime=time; };
-    video.onloadedmetadata=resume; video.playbackRate=Number($('speed').value); pendingFailure=fail;
+    video.onloadedmetadata=null; video.playbackRate=Number($('speed').value); pendingFailure=fail;
     if (item.subtitleRequest) {
       post(item.subtitleRequest.path,item.subtitleRequest.data).then(result=>{
         if (!result.url || current!==item) return;
@@ -114,11 +117,15 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     }
     // hls.js can detect a playlist whose URL itself is opaque.
     if (item.format === 'hls' && Hls.isSupported()) {
-      activeLevels=[]; hls=new Hls({startLevel:0,startPosition:0,liveDurationInfinity:false,maxBufferLength:45,maxMaxBufferLength:60,backBufferLength:30}); const player=hls; player.loadSource(outputUrl); player.attachMedia(video);
+      activeLevels=[]; hls=new Hls({startLevel:0,startPosition:0,liveDurationInfinity:false,maxBufferLength:60,maxMaxBufferLength:120,backBufferLength:30,fragLoadPolicy:loadPolicy(10,10000,120000),playlistLoadPolicy:loadPolicy(8,10000,20000),manifestLoadPolicy:loadPolicy(6,10000,20000),nudgeMaxRetry:30}); const player=hls; player.loadSource(outputUrl); player.attachMedia(video);
       player.on(Hls.Events.MANIFEST_PARSED, (_event, data)=>{ if(current!==item || hls!==player) return; activeLevels=data.levels || []; const index=activeLevels.findIndex(level=>level.height===preferredHeight); if(index<0){lastTranscodeError='The converted quality is unavailable.';pendingFailure=null;fail();return;} player.currentLevel=index; $('quality').value=String(preferredHeight); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); });
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('subtitles').value; $('subtitles').replaceChildren(new Option('Off', '-1')); (data.subtitleTracks || []).forEach((track,i)=>$('subtitles').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if(externalTrack) $('subtitles').add(new Option('English (provider)','external')); if(uploadTrack) $('subtitles').add(new Option('Uploaded subtitles','upload')); if([...$('subtitles').options].some(o=>o.value===previous)) $('subtitles').value=previous; });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('audio').value; $('audio').replaceChildren(new Option('Default', '-1')); (data.audioTracks || []).forEach((track,i)=>$('audio').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if([...$('audio').options].some(o=>o.value===previous)) $('audio').value=previous; });
-      hls.on(Hls.Events.ERROR, (_event,data)=>{ if(data.fatal && current===item && pendingFailure===fail) { pendingFailure=null; void conversionFailed(item,fail); } });
+      let recoveredStall=false;
+      hls.on(Hls.Events.ERROR, (_event,data)=>{ if(!data.fatal || current!==item || pendingFailure!==fail)return;
+        if(!recoveredStall && (data.details==='bufferStalledError' || (data.details==='bufferAppendError' && typeof player.recoverMediaError==='function'))){recoveredStall=true;if(data.details==='bufferAppendError')player.recoverMediaError();else player.startLoad?.();if(!video.paused)video.play().catch(()=>{});$('playError').textContent='Buffering…';return;}
+        pendingFailure=null; void conversionFailed(item,fail);
+      });
     } else { video.src=outputUrl.replace('master.m3u8',`${preferredHeight}/index.m3u8`); nativeSubtitleOptions(); nativeAudioOptions(); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); }
   } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
 }
@@ -170,7 +177,7 @@ $('video').addEventListener('timeupdate',syncCaptionPosition);
 function applyCaptionAppearance(){ const video=$('video'); for(const value of ['small','large','xlarge','yellow']) video.classList.remove(`caption-${value}`); const size=$('subtitleSize').value, color=$('subtitleColor').value, position=Number($('subtitlePosition').value); if(['small','large','xlarge'].includes(size)) video.classList.add(`caption-${size}`); if(color==='yellow') video.classList.add('caption-yellow'); syncCaptionPosition(); try {localStorage.setItem('solo-caption-style',JSON.stringify({size,color,position}));} catch {} }
 $('subtitleSize').onchange=applyCaptionAppearance; $('subtitleColor').onchange=applyCaptionAppearance; $('subtitlePosition').onchange=applyCaptionAppearance;
 try {const settings=JSON.parse(localStorage.getItem('solo-caption-style') || '{}'); if(['normal','small','large','xlarge'].includes(settings.size)) $('subtitleSize').value=settings.size; if(['white','yellow'].includes(settings.color)) $('subtitleColor').value=settings.color; if([...$('subtitlePosition').options].some(option=>option.value===String(settings.position))) $('subtitlePosition').value=String(settings.position);} catch {} applyCaptionAppearance();
-$('server').onchange=()=>{ if(!current?.variants) return; const picked=current.variants[Number($('server').value)]; if(!picked || picked.proxy===current.proxy) return; const video=$('video'); fallback.play([{...picked,resumeAt:video.currentTime,wasPaused:video.paused},...current.variants.filter(x=>x!==picked)]); };
+$('server').onchange=()=>{ if(!current?.variants) return; const picked=current.variants[Number($('server').value)]; if(!picked || picked.proxy===current.proxy) return; const video=$('video'); const target=(current.seekBase||0)+(video.currentTime||0);fallback.play([picked,...current.variants.filter(x=>x!==picked)].map(source=>({...source,seekAt:target,wasPaused:video.paused,keepUpload:!!uploadTrack}))); };
 $('subtitleFile').onchange=async()=>{
   const file=$('subtitleFile').files[0], item=current; if(!file) return; if(!item){ $('playError').textContent='Start a stream before uploading subtitles.'; $('subtitleFile').value=''; return; }
   if(file.size>2*1024*1024 || !/\.(srt|vtt)$/i.test(file.name)){ $('playError').textContent='Choose an SRT or VTT subtitle file under 2 MB.'; return; }
@@ -183,7 +190,7 @@ $('subtitleFile').onchange=async()=>{
     $('subtitles').querySelector('option[value="upload"]')?.remove(); $('subtitles').add(new Option('Uploaded subtitles','upload')); $('subtitles').value='upload'; $('subtitles').dispatchEvent(new Event('change')); const track=uploadTrack; track.addEventListener('load',()=>{if(uploadTrack===track && $('subtitles').value==='upload') {shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}}); $('playError').textContent='';
   } catch { if(current===item) $('playError').textContent='Could not read that subtitle file.'; }
 };
-$('video').ontimeupdate=()=>{ if(!current || current.noResume || Date.now()-lastSave<5000) return; lastSave=Date.now(); const key=current.progressKey || current.url; const progress=load('solo-progress').filter(x=>x.url!==key); progress.unshift({url:key,time:$('video').currentTime}); save('solo-progress', progress.slice(0,100)); };
+$('video').ontimeupdate=()=>{ if(!current || Date.now()-lastSave<5000) return; const key=current.progressKey || current.url;if(!key)return;lastSave=Date.now(); const progress=load('solo-progress').filter(x=>x.url!==key); progress.unshift({url:key,time:(current.seekBase||0)+($('video').currentTime||0)}); save('solo-progress', progress.slice(0,100)); };
 $('video').onerror=()=>{ if(current && pendingFailure && $('video').currentSrc) { const fail=pendingFailure, item=current; pendingFailure=null; void conversionFailed(item,fail); } };
 api('/api/session').then(x=>loggedIn(x.authenticated)).catch(()=>loggedIn(false));
 
@@ -251,7 +258,7 @@ async function findStreams(autoplay = false) {
 $('findStreams').onclick=()=>findStreams(true);
 $('reclaimTranscode').onclick=async()=>{if(!confirm('Stop the current conversion, even if another session is using it?'))return;try{const result=await post('/api/transcode/reclaim',{});$('playError').textContent=result.stopped?'Conversion stopped. Press Play again.':'No conversion was active.';}catch(err){$('playError').textContent=err.message;}};
 
-$('video').addEventListener('ended',()=>{ if(current && !current.noResume){const key=current.progressKey || current.url; if(key) try{save('solo-progress',load('solo-progress').filter(x=>x.url!==key));}catch{}} const ctx=current?.context; if(ctx && selected?.id===ctx.id && episodes.some(e=>e.season>ctx.season || (e.season===ctx.season && e.episode>ctx.episode))) $('nextEpisode').click(); });
+$('video').addEventListener('ended',()=>{ if(current){const key=current.progressKey || current.url; if(key) try{save('solo-progress',load('solo-progress').filter(x=>x.url!==key));}catch{}} const ctx=current?.context; if(ctx && selected?.id===ctx.id && episodes.some(e=>e.season>ctx.season || (e.season===ctx.season && e.episode>ctx.episode))) $('nextEpisode').click(); });
 function updateNext(){
   const ctx=current?.context;
   $('nextEpisode').disabled=!ctx || !selected || selected.id!==ctx.id;
@@ -259,15 +266,17 @@ function updateNext(){
 }
 // Video time is relative to the current conversion; the overlay owns the full timeline.
 window.troyTimeline={
- duration(){const v=$('video');return current?.totalDuration || (Number.isFinite(v.duration)?v.duration:0);},
+ duration(){const v=$('video');if(current?.totalDuration)return current.totalDuration;if(Number.isFinite(v.duration))return (current?.seekBase||0)+v.duration;try{return v.seekable.length?(current?.seekBase||0)+v.seekable.end(v.seekable.length-1):0;}catch{return 0;}},
  time(){return (current?.seekBase || 0)+($('video').currentTime || 0);},
  seek(value){
   const item=current,video=$('video');if(!item || !Number.isFinite(value))return;
   const duration=this.duration();if(duration<=0){if(!item.totalDuration)video.currentTime=Math.max(0,value);return;}
   const target=Math.max(0,Math.min(Math.max(0,duration-1),value)),base=item.seekBase||0,relative=target-base;
-  if(relative>=0 && Number.isFinite(video.duration) && relative<video.duration-0.1){video.currentTime=relative;return;}
+  let available=Number.isFinite(video.duration)?video.duration:0;try{for(let i=0;i<video.seekable.length;i++){if(relative>=video.seekable.start(i) && relative<video.seekable.end(i)-0.1){video.currentTime=relative;return;}available=Math.max(available,video.seekable.end(i));}}catch{}
+  if(relative>=0 && Number.isFinite(video.duration) && relative<available-0.1){video.currentTime=relative;return;}
   if(!item.totalDuration){$('playError').textContent='This source has no usable duration for seeking beyond converted video.';return;}
-  fallback.play([{...item,format:'file',seekAt:target,transcodeId:null,wasPaused:video.paused,keepUpload:!!uploadTrack}]);
+  const rest=(item.variants||[]).filter(source=>source.proxy!==item.proxy);
+  fallback.play([{...item,format:'file',seekAt:target,transcodeId:null,wasPaused:video.paused,keepUpload:!!uploadTrack},...rest.map(source=>({...source,seekAt:target,wasPaused:video.paused,keepUpload:!!uploadTrack}))]);
  }
 };
 function skip(seconds){if(current)window.troyTimeline.seek(window.troyTimeline.time()+seconds);}
