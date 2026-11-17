@@ -87,7 +87,7 @@ const fallback = createFallback((item, index, total, fail, isActive) => {
   if(index===0){attemptErrors=[];$('sourceFailures').textContent='';}
   $('playError').textContent=index ? `Trying another source (${index+1}/${total})…` : '';
   playItem(item, ()=>{if(isActive()){recordProvider(item.provider,false);const reason=String(lastTranscodeError || 'Playback failed').replace(/https?:\/\/\S+/g,'[source]').slice(0,150);attemptErrors.push(`${item.provider || 'Direct'}: ${reason}`);fail();}}, index>0, isActive);
-}, () => { pendingFailure=null; stopTranscode(); if(hls){hls.destroy();hls=null;} const video=$('video');video.pause();video.removeAttribute('src');video.load(); $('playing').textContent=selected?.title || 'Playback unavailable';$('placeholder').classList.remove('hidden');$('placeholder').querySelector('p').textContent='Playback unavailable';$('playError').textContent='Unable to transcode any available source. '+lastTranscodeError; $('sourceFailures').textContent=attemptErrors.join(' · '); });
+}, () => { pendingFailure=null; stopTranscode(); if(hls){hls.destroy();hls=null;} const video=$('video');video.pause();video.removeAttribute('src');video.load(); $('playing').textContent=selected?.title || 'Playback unavailable';$('placeholder').classList.remove('hidden');$('placeholder').querySelector('p').textContent='Playback unavailable';$('playError').textContent='No source could be played. '+lastTranscodeError; $('sourceFailures').textContent=attemptErrors.join(' · '); });
 async function playItem(item, fail, isFallback = false, isActive = () => true) {
   $('screen').classList.add('player-expanded');stopTranscode(); const sequence=transcodeSequence; const oldVideo=$('video'); if(hls){hls.destroy();hls=null;} oldVideo.pause();oldVideo.removeAttribute('src');oldVideo.load();
   directControls(true);
@@ -98,11 +98,124 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     if(!item.proxy) item.proxy=url;
     const saved=load('solo-progress').find(x=>x.url===(item.progressKey || item.url));
     const offset=Number.isFinite(item.seekAt) ? item.seekAt : (Number.isFinite(saved?.time) && saved.time>0 ? saved.time : 0);
-    $('playError').textContent=offset ? 'Seeking: preparing conversion at the selected point…' : 'Preparing 240p / 360p conversion…';
+    if(relaySupported) return await playRelay({...item,proxy:url,isActive,fail},offset);
+    return await playConverted({...item,proxy:url,isActive,fail},offset);
+  } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
+}
+// Direct playback through Troy's same-origin relay. The browser receives the
+// provider's own bytes, so no encoding, no waiting and no temporary disk use;
+// seeking is native. Conversion remains the fallback for sources the relay or
+// the browser cannot handle (unsupported codecs, or a CDN that refuses even a
+// server-side request).
+async function playRelay(item,offset){
+  const fail=item.fail,isActive=item.isActive;
+  try{
+    if(!isActive())return;
+    transcodeJob=null;
+    item={...item,isActive,reliabilityRecorded:false,seekBase:0,totalDuration:null,relay:true};
+    current=item; pendingFailure=()=>relayFailed(item,fail);
+    const keepUpload=!!(item.keepUpload && uploadUrl);subtitleTouched=keepUpload;
+    if(uploadUrl && !keepUpload){URL.revokeObjectURL(uploadUrl);uploadUrl=null;uploadTrack=null;}
+    const video=$('video');
+    $('playError').textContent='';
+    $('back10').disabled=false;$('forward10').disabled=false;updateNext();
+    $('server').replaceChildren();const variants=item.variants||[item];
+    variants.forEach((source,i)=>$('server').add(new Option(`${source.provider||'Direct'} · ${source.quality?source.quality+'p':'source'} · ${(source.format||'file').toUpperCase()}`,String(i))));
+    $('server').disabled=variants.length<2;
+    const serverIndex=variants.findIndex(source=>source.proxy?source.proxy===item.proxy:source===item);
+    $('server').value=String(Math.max(0,serverIndex));
+    $('quality').replaceChildren(new Option('Auto','auto'));
+    $('quality').value='auto';
+    $('subtitles').replaceChildren(new Option('Off','-1'));
+    $('audio').replaceChildren(new Option('Default','-1'));
+    if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});}
+    $('placeholder').classList.add('hidden');video.classList.remove('hidden');$('playing').textContent=item.title;
+    video.playbackRate=Number($('speed').value);
+    const resume=Number.isFinite(offset)&&offset>0?offset:0;
+    if(resume) video.addEventListener('loadedmetadata',()=>{try{if(resume<video.duration-1)video.currentTime=resume;}catch{}},{once:true});
+    if (item.subtitleRequest) {
+      post(item.subtitleRequest.path,item.subtitleRequest.data).then(result=>{
+        if(!result.url || current!==item)return;
+        const track=document.createElement('track');track.kind='subtitles';track.label='English (provider)';track.srclang='en';track.src=result.url;track.default=!uploadTrack && !subtitleTouched;externalTrack=track;video.append(track);
+        $('subtitles').add(new Option('English (provider)','external'));
+        if(!uploadTrack && !subtitleTouched){$('subtitles').value='external';if(hls)hls.subtitleTrack=-1;}
+        track.addEventListener('load',()=>{if(current===item && $('subtitles').value==='external'){track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});
+      }).catch(()=>{});
+    }
+    const play=()=>{if(item.wasPaused!==true)video.play().catch(()=>{if(current===item)$('playError').textContent='Tap play on the video to start.';});};
+    if(item.format==='hls' && window.Hls && Hls.isSupported()){
+      activeLevels=[];hls=new Hls({liveDurationInfinity:false,maxBufferLength:60,maxMaxBufferLength:120,backBufferLength:30,fragLoadPolicy:loadPolicy(10,10000,120000),playlistLoadPolicy:loadPolicy(8,10000,20000),manifestLoadPolicy:loadPolicy(6,10000,20000),nudgeMaxRetry:30});
+      const player=hls;player.loadSource(item.proxy);player.attachMedia(video);
+      player.on(Hls.Events.MANIFEST_PARSED,(_event,data)=>{
+        if(current!==item||hls!==player)return;
+        activeLevels=(data.levels||[]).slice().sort((a,b)=>(a.height||0)-(b.height||0));
+        const select=$('quality');select.replaceChildren(new Option('Auto','auto'));
+        const seen=new Set();for(const level of activeLevels){if(!level.height||seen.has(level.height))continue;seen.add(level.height);select.add(new Option(`${level.height}p`,String(level.height)));}
+        select.value='auto';play();
+      });
+      let recovered=false;
+      player.on(Hls.Events.ERROR,(_event,data)=>{
+        if(!data.fatal||current!==item||hls!==player)return;
+        if(!recovered && data.details==='bufferStalledError'){recovered=true;player.startLoad?.();if(!video.paused)video.play().catch(()=>{});return;}
+        if(!recovered && data.type===Hls.ErrorTypes?.MEDIA_ERROR && typeof player.recoverMediaError==='function'){recovered=true;player.recoverMediaError();return;}
+        void relayFailed(item,fail);
+      });
+      player.on(Hls.Events.SUBTITLE_TRACKS_UPDATED,(_event,data)=>{
+        if(current!==item||hls!==player)return;const previous=$('subtitles').value;
+        $('subtitles').replaceChildren(new Option('Off','-1'));
+        (data.subtitleTracks||[]).forEach((track,i)=>$('subtitles').add(new Option(track.name||track.lang||`Track ${i+1}`,String(i))));
+        if(externalTrack)$('subtitles').add(new Option('English (provider)','external'));
+        if(uploadTrack)$('subtitles').add(new Option('Uploaded subtitles','upload'));
+        if([...$('subtitles').options].some(o=>o.value===previous))$('subtitles').value=previous;
+      });
+      player.on(Hls.Events.AUDIO_TRACKS_UPDATED,(_event,data)=>{
+        if(current!==item||hls!==player)return;const previous=$('audio').value;
+        $('audio').replaceChildren(new Option('Default','-1'));
+        (data.audioTracks||[]).forEach((track,i)=>$('audio').add(new Option(track.name||track.lang||`Track ${i+1}`,String(i))));
+        if([...$('audio').options].some(o=>o.value===previous))$('audio').value=previous;
+      });
+    } else {
+      video.src=item.proxy;nativeSubtitleOptions();nativeAudioOptions();
+      video.onerror=()=>{if(current===item)void relayFailed(item,fail);};
+      play();
+    }
+  } catch(e) { if(isActive()){lastTranscodeError=e.message;pendingFailure=null;fail();} }
+}
+// One tiny ranged request tells us whether the relay can reach the source, and
+// why not. It reuses the session-bound handle, so no URL is exposed.
+async function relayReason(item){
+  try{
+    const response=await fetch(item.proxy,{headers:{Range:'bytes=0-1'}});
+    if(response.ok){response.body?.cancel?.();return null;}
+    $('sourceFailures').textContent=`${item.provider||'Source'}: HTTP ${response.status}`;
+    try{const body=await response.json();if(body?.error)return body.error;}catch{}
+    return `the media host returned HTTP ${response.status}`;
+  }catch{return null;}
+}
+// One conversion attempt per source, then move to the next source.
+async function relayFailed(item,fail){
+  if(current!==item || route!=='watch')return;
+  const position=(item.seekBase||0)+($('video').currentTime||0);
+  // Ask the server why. A 426/403 is a provider refusal, not a codec problem,
+  // and saying so avoids pointless repeated conversion attempts.
+  const reason=await relayReason(item);
+  if(!item.convertRetried){
+    pendingFailure=null;
+    lastTranscodeError=reason ? `Direct playback failed: ${reason}` : 'Direct playback failed';
+    $('playError').textContent=reason ? `${reason}. Converting this source instead…` : 'Direct playback is not possible for this source; converting it instead…';
+    if(hls){hls.destroy();hls=null;}
+    return playConverted({...item,convertRetried:true,seekAt:position>1?position:0,wasPaused:$('video').paused,keepUpload:!!uploadTrack},position>1?position:0);
+  }
+  fail();
+}
+async function playConverted(item,offset){
+  const fail=item.fail,isActive=item.isActive;
+  try{
+    const sequence=transcodeSequence;
     const result=await enqueueTranscode(async()=>{
       if(sequence!==transcodeSequence || !isActive()) return null;
       const requestId=Array.from(crypto.getRandomValues(new Uint8Array(16)),n=>n.toString(16).padStart(2,'0')).join('');pendingRequestId=requestId;
-      let job;try{job=await post('/api/transcode',{url,offset,requestId});}finally{if(pendingRequestId===requestId)pendingRequestId=null;}
+      let job;try{job=await post('/api/transcode',{url:item.proxy,offset,requestId});}finally{if(pendingRequestId===requestId)pendingRequestId=null;}
       if(!job || typeof job.id!=='string' || !/^[A-Za-z0-9_-]+$/.test(job.id) || job.url!==`/transcode/${job.id}/master.m3u8`){if(typeof job?.id==='string' && /^[A-Za-z0-9_-]+$/.test(job.id))await post('/api/transcode/stop',{id:job.id}).catch(()=>{});throw Error('Invalid conversion response');}
       if(sequence!==transcodeSequence || !isActive() || route!=='watch'){await post('/api/transcode/stop',{id:job.id}).catch(()=>{});return null;}
       return job;
@@ -111,7 +224,7 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     transcodeJob=result.id;
     item={...item,isActive,reliabilityRecorded:false,format:'hls',transcodeId:result.id,noResume:true,seekBase:offset,totalDuration:Number.isFinite(result.duration) && result.duration>0 ? result.duration : (Number.isFinite(item.totalDuration)?item.totalDuration:null)};
     const outputUrl=result.url;
-    $('playError').textContent=item.totalDuration?'Seeking to an unconverted point restarts conversion and may take time.':'Duration unavailable: seeking is limited to the converted portion.';
+    $('playError').textContent='';
     current=item; pendingFailure=null; const keepUpload=!!(item.keepUpload && uploadUrl);subtitleTouched=keepUpload; if(uploadUrl && !keepUpload){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
     $('server').replaceChildren(); const variants=item.variants || [item]; variants.forEach((source,i)=>$('server').add(new Option(`${source.provider || 'Direct'} · ${source.quality ? source.quality+'p' : 'source'} · ${(source.format || 'file').toUpperCase()}`,String(i)))); $('server').disabled=variants.length<2; const serverIndex=variants.findIndex(source=>source.proxy ? source.proxy===item.proxy : source===item); $('server').value=String(Math.max(0,serverIndex));
     $('quality').replaceChildren(new Option('240p', '240'),new Option('360p', '360')); $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});} $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
@@ -136,7 +249,15 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     } else { video.src=outputUrl.replace('master.m3u8',`${preferredHeight}/index.m3u8`); nativeSubtitleOptions(); nativeAudioOptions(); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); }
   } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
 }
-$('quality').onchange=()=>{ const height=Number($('quality').value); if(![240,360].includes(height))return; preferredHeight=height; try{localStorage.setItem('solo-quality-height',String(height));}catch{} if(hls){const index=activeLevels.findIndex(level=>level.height===height);if(index>=0)hls.currentLevel=index;}else if(current?.transcodeId){const video=$('video'),paused=video.paused,time=video.currentTime,item=current;video.addEventListener('loadedmetadata',()=>{if(current!==item || !Number.isFinite(time))return;try{if(Number.isFinite(video.duration) && time<=video.duration)video.currentTime=time;}catch{}},{once:true});video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();if(!paused)video.play().catch(()=>{});$('playError').textContent='Quality changed; seeking is limited to the converted portion.';} };
+$('quality').onchange=()=>{ const value=$('quality').value;
+ if(value==='auto'){ preferredHeight=240; try{localStorage.setItem('solo-quality-height','240');}catch{} if(hls){hls.currentLevel=-1;} return; }
+ const height=Number(value); if(![240,360,480,720,1080,1440,2160].includes(height))return;
+ if(hls){const index=activeLevels.findIndex(level=>level.height===height);if(index>=0)hls.currentLevel=index;
+  // The converted ladder is only 240p/360p; remember that choice for restarts.
+  if([240,360].includes(height) && current?.transcodeId){preferredHeight=height;try{localStorage.setItem('solo-quality-height',String(height));}catch{}}
+  return;}
+ if(!current?.transcodeId) return;
+ preferredHeight=height; try{localStorage.setItem('solo-quality-height',String(height));}catch{} if(hls){const index=activeLevels.findIndex(level=>level.height===height);if(index>=0)hls.currentLevel=index;}else if(current?.transcodeId){const video=$('video'),paused=video.paused,time=video.currentTime,item=current;video.addEventListener('loadedmetadata',()=>{if(current!==item || !Number.isFinite(time))return;try{if(Number.isFinite(video.duration) && time<=video.duration)video.currentTime=time;}catch{}},{once:true});video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();if(!paused)video.play().catch(()=>{});$('playError').textContent='Quality changed; seeking is limited to the converted portion.';} };
 function nativeSubtitleOptions(){
   if(hls || !current) return;
   const select=$('subtitles'), previous=select.value, tracks=$('video').textTracks;
@@ -200,7 +321,10 @@ $('subtitleFile').onchange=async()=>{
 $('video').addEventListener('playing',()=>{if(current && !current.reliabilityRecorded){current.reliabilityRecorded=true;recordProvider(current.provider,true);}});
 $('video').ontimeupdate=()=>{ if(!current || Date.now()-lastSave<5000) return; const key=current.progressKey || current.url;if(!key)return;lastSave=Date.now(); const progress=load('solo-progress').filter(x=>x.url!==key); progress.unshift({url:key,time:(current.seekBase||0)+($('video').currentTime||0),...(selected ? {kind:'catalog',title:selected.title,type:selected.type,year:selected.year || '',source:selected.source || '',poster:selected.poster || null,season:current.context?.season || null,episode:current.context?.episode || null} : {})}); save('solo-progress', progress.slice(0,100)); };
 $('video').onerror=()=>{ if(current && pendingFailure && $('video').currentSrc) { const fail=pendingFailure, item=current; pendingFailure=null; void conversionFailed(item,fail); } };
-api('/api/session').then(x=>loggedIn(x.authenticated)).catch(()=>loggedIn(false));
+// Direct same-origin relay is the default playback path; conversion is the
+// fallback when a source cannot be relayed or the operator disabled the relay.
+let relaySupported=true;
+api('/api/session').then(x=>{relaySupported=x.relay!==false;loggedIn(x.authenticated);}).catch(()=>loggedIn(false));
 
 function catalogMatches(a,b){return a.kind==='catalog' && a.title===b.title && a.type===b.type && (a.year||'')===(b.year||'') && (a.source||'')===(b.source||'');}
 function updateCatalogSave(){const saved=selected && load('solo-watchlist').some(x=>catalogMatches(x,selected));$('saveTitle').textContent=saved?'Remove from watchlist':'Add to watchlist';$('saveTitle').setAttribute('aria-pressed',String(!!saved));}
@@ -272,6 +396,9 @@ window.troyTimeline={
  time(){return (current?.seekBase || 0)+($('video').currentTime || 0);},
  seek(value){
   const item=current,video=$('video');if(!item || !Number.isFinite(value))return;
+  // Relayed media is the provider's own file, so the browser seeks natively
+  // across the whole timeline without restarting anything.
+  if(item.relay){const duration=this.duration();const target=Math.max(0,duration?Math.min(duration-1,value):value);try{video.currentTime=target;}catch{}return;}
   const duration=this.duration();if(duration<=0){if(!item.totalDuration)video.currentTime=Math.max(0,value);return;}
   const target=Math.max(0,Math.min(Math.max(0,duration-1),value)),base=item.seekBase||0,relative=target-base;
   let available=Number.isFinite(video.duration)?video.duration:0;try{for(let i=0;i<video.seekable.length;i++){if(relative>=video.seekable.start(i) && relative<video.seekable.end(i)-0.1){video.currentTime=relative;return;}available=Math.max(available,video.seekable.end(i));}}catch{}
