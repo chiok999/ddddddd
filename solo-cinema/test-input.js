@@ -82,3 +82,20 @@ test('provider TTL refresh runs before open without bypassing range validator ch
  const original={headers:new Headers({'etag':'"original"','content-length':'5'}),body:new ReadableStream({start(c){c.enqueue(Uint8Array.from([1,2]));setTimeout(()=>c.error(Error('disconnect')),1);}})};
  await assert.rejects(collect(resumableInput(original,()=>Promise.resolve(response),controller.signal,{retries:1,backoffMs:1})),/Source changed/);
 });
+
+test('HTTP 426 explicitly advertising h2 retries through the HTTP/2 dispatcher', async t=>{
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process'),http2=require('node:http2');const {Agent,fetch}=require('undici');const {getRemote}=require('./network');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'troy-h2-')),key=path.join(dir,'key.pem'),cert=path.join(dir,'cert.pem');
+ const generated=spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',key,'-out',cert,'-days','1','-subj','/CN=fixture.test'],{stdio:'ignore'});if(generated.error||generated.status!==0){fs.rmSync(dir,{recursive:true,force:true});return t.skip('openssl unavailable');}
+ const server=http2.createSecureServer({key:fs.readFileSync(key),cert:fs.readFileSync(cert),allowHTTP1:true});let seen=[];
+ server.on('request',(req,res)=>{seen.push(req.httpVersionMajor);if(req.httpVersionMajor===1){res.writeHead(426,{upgrade:'h2'});res.end();}else{res.writeHead(200,{'content-type':'video/mp4'});res.end('fixture bytes');}});server.listen(0,'127.0.0.1');await once(server,'listening');
+ const lookup=(name,options,cb)=>options.all?cb(null,[{address:'127.0.0.1',family:4}]):cb(null,'127.0.0.1',4),connect={lookup,rejectUnauthorized:false};const h1=new Agent({connect}),h2=new Agent({connect,allowH2:true});
+ const fixtureFetch=(url,options)=>{const rewritten=new URL(url);rewritten.port=String(server.address().port);return fetch(rewritten,options)};
+ try{const {response}=await getRemote('https://fixture.test/video',{},AbortSignal.timeout(10000),fixtureFetch,h1,h2);assert.equal(response.status,200);assert.equal(await response.text(),'fixture bytes');assert.deepEqual(seen,[1,2]);}
+ finally{await h1.close();await h2.close();server.closeAllConnections?.();await new Promise(r=>server.close(r));fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('HTTP 426 without an explicit h2 upgrade does not retry or weaken URL validation',async()=>{
+ const {getRemote}=require('./network');let count=0;const response=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('no',{status:426})},{},{h2:true});assert.equal(response.response.status,426);assert.equal(count,1);
+ await assert.rejects(()=>getRemote('https://127.0.0.1/video',{},new AbortController().signal,()=>{}, {},{}),/Only public HTTPS/);
+});

@@ -19,11 +19,17 @@ function publicLookup(resolve = dns.lookup) {
     }).catch(callback);
   };
 }
-async function getRemote(input, headers, signal, fetch, agent) {
+async function getRemote(input, headers, signal, fetch, agent, h2Agent = null) {
   let url = safeUrl(input);
   let forwarded=new Headers(headers);
   for (let n = 0; n <= 5; n++) {
-    const response = await fetch(url, { dispatcher: agent, headers:forwarded, redirect: 'manual', signal });
+    let response = await fetch(url, { dispatcher: agent, headers:forwarded, redirect: 'manual', signal });
+    // Retry only when the origin explicitly requests HTTP/2. Both dispatchers
+    // use the same validated DNS lookup; redirects remain individually checked.
+    if (h2Agent && response.status===426 && /(?:^|[,\s])h2(?:$|[,\s])/i.test(response.headers.get('upgrade') || '')) {
+      await response.body?.cancel();
+      response = await fetch(url, { dispatcher:h2Agent, headers:forwarded, redirect:'manual', signal });
+    }
     if (![301,302,303,307,308].includes(response.status)) return { response, url };
     const location = response.headers.get('location');
     await response.body?.cancel();
