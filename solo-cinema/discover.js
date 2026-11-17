@@ -18,7 +18,7 @@ module.exports = function createDiscover({request, now = () => new Date()}) {
           if(catalog==='year' && releaseYear!==String(year)) return [];
           let poster=null;
           try { const u=new URL(m.poster); if(u.protocol==='https:' && ['images.metahub.space','live.metahub.space'].includes(u.hostname) && !u.username && !u.password && !u.port && u.href.length<2048) poster=u.href; } catch {}
-          return [{title:m.name.slice(0,150),type,year:releaseYear,poster}];
+          return [{title:m.name.slice(0,150),type,year:releaseYear,poster,imdbId:m.id,tmdbId:/^[1-9]\d{0,11}$/.test(String(m.moviedb_id||''))?String(m.moviedb_id):null,overview:typeof m.description==='string'?m.description.slice(0,1000):''}];
         });
         return {id,items,error:null};
       }));

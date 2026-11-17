@@ -367,3 +367,9 @@ test('documented alternate embeds accept only fixed providers and validated IDs'
  assert.equal(embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vixsrc'),'https://vixsrc.to/movie/tt1375666');assert.equal(embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vidfast'),'https://vidfast.vc/movie/tt1375666');
  assert.throws(()=>embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vidlink'),/ID unavailable/);assert.throws(()=>embedUrl(item,2,3,'https://evil.example'),/Unknown/);assert.throws(()=>embedUrl({...item,tmdbId:'https://evil'},0,1,'vidlink'));
 });
+
+test('discovery produces per-session title IDs without changing the shared metadata cache',()=>{
+ const {bindDiscovery}=require('./catalog-session');const item={title:'Film',type:'movie',year:'2024',imdbId:'tt123',tmdbId:'321',poster:null};const sections=[{id:'popular-movies',items:[item],error:null}],catalog=new Map();
+ const first=bindDiscovery(sections,catalog,'alice',1000),second=bindDiscovery(sections,catalog,'bob',1000);
+ assert.notEqual(first[0].items[0].id,second[0].items[0].id);assert.equal(catalog.get(first[0].items[0].id).sid,'alice');assert.equal(catalog.get(second[0].items[0].id).sid,'bob');assert.equal(catalog.get(first[0].items[0].id).item.imdbId,'tt123');assert.equal(catalog.get(first[0].items[0].id).item.tmdbId,'321');assert.equal(item.id,undefined);assert.equal(catalog.get(first[0].items[0].id).expires,1000+24*3600000);
+});
