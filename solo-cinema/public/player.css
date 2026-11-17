@@ -18,3 +18,5 @@
 #screen button svg{width:24px;height:24px;fill:currentColor;display:block}#screen .player-play svg{width:32px;height:32px}
 
 #screen .player-menu .player-menu-row{width:100%;height:auto;min-height:44px;padding:10px 4px;display:flex;justify-content:space-between;text-align:left;gap:10px;border-radius:0;border-bottom:1px solid #ffffff1f;font-size:14px;font-weight:400}#screen .player-menu .player-menu-row span:last-child{color:#a3a7b5;text-align:right;font-size:12px}#screen .player-menu .player-menu-row.selected,#screen .player-menu .player-menu-row.selected span{color:#ff4d5e}
+
+#screen .player-menu .player-transcode{width:100%;height:auto;min-height:40px;border-radius:6px;background:#333842;font-size:13px;margin:8px 0}

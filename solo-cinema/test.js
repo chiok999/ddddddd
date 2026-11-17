@@ -382,3 +382,34 @@ test('discovery prefers MovieBox live sections, fills missing anime from Cinemet
 test('session-bound MovieBox cards retain the subject needed by the real resolver',()=>{
  const {bindDiscovery}=require('./catalog-session');const catalog=new Map();const source={title:'MovieBox row',items:[{source:'moviebox',subjectId:'123',detailPath:'actual-123',type:'movie',title:'Title'}]};const rows=bindDiscovery([source],catalog,'session',1);const card=rows[0].items[0];assert.equal(card.source,'moviebox');assert.equal(card.subjectId,undefined);const entry=catalog.get(card.id);assert.equal(entry.item.subjectId,'123');assert.equal(entry.item.detailPath,'actual-123');assert.equal(entry.item.source,'moviebox');
 });
+
+test('transcode API rejects unauthenticated and invalid source requests',async()=>{
+ // Reuse an isolated instance: the transcoder only accepts authenticated, session-bound /media handles.
+ const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));
+ const child=spawn(process.execPath,['server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'a-strong-test-password'},stdio:['ignore','pipe','pipe']});
+ try{await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject)});const base=`http://127.0.0.1:${port}`;const post=(p,data,cookie)=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});assert.equal((await post('/api/transcode',{url:'/media/whatever'})).status,401);const login=await post('/api/login',{password:'a-strong-test-password'}),cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await post('/api/transcode',{url:'https://example.com/video'},cookie)).status,400);assert.equal((await post('/api/transcode',{url:'/media/not-yours'},cookie)).status,404);assert.equal((await fetch(base+'/transcode/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/master.m3u8')).status,401);}finally{child.kill();}
+});
+
+test('transcoder reports missing ffmpeg and rejects playlist content',async()=>{
+ const {createTranscoder}=require('./transcode');const {Readable}=require('node:stream');const make=(type)=>({ok:true,status:200,headers:new Headers({'content-type':type}),body:Readable.toWeb(Readable.from(Buffer.from('0000000866747970000000086d6f6f76','hex')))});
+ const bad=createTranscoder({executable:'/definitely/not/a/real/ffmpeg',open:async()=>make('video/mp4'),startupMs:5000});try{await assert.rejects(bad.start({},'a'),/FFmpeg could not start|Transcoding failed/);assert.equal(await bad.read('bad','a','master.m3u8'),null);}finally{await bad.close()}
+ const hls=createTranscoder({open:async()=>make('application/vnd.apple.mpegurl')});try{await assert.rejects(hls.start({},'a'),/Only direct MP4/)}finally{await hls.close()}
+});
+
+test('real FFmpeg creates two session-bound playable HLS renditions and cleans up', {skip:!process.env.CINEMA_TEST_FFMPEG,timeout:60000},async()=>{
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const bin=process.env.CINEMA_TEST_FFMPEG;const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-test-'));const fixture=path.join(dir,'sample.mp4');
+ const input=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-f','lavfi','-i','sine=frequency=440','-t','12','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac',fixture],{encoding:'utf8'});assert.equal(input.status,0,input.stderr);
+ let opened=0;const t=createTranscoder({tmpdir:dir,executable:bin,startupMs:35000,open:async()=>{opened++;return {ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(fixture))}}});
+ try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
+ for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.data.length>0);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:segment.data,encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
+ assert.equal(await t.stopFor(job.id,'bob'),false);assert.equal(await t.stopFor(job.id,'alice'),true);assert.equal(await t.read(job.id,'alice','master.m3u8'),null);assert.deepEqual((await fsp.readdir(dir)).sort(),['sample.mp4']);
+ const silent=path.join(dir,'silent.mp4');const noAudio=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-t','10','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart',silent],{encoding:'utf8'});assert.equal(noAudio.status,0,noAudio.stderr);
+ const limited=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
+ try{const small=await limited.start({},'alice');await new Promise(r=>setTimeout(r,3000));assert.equal(await limited.read(small.id,'alice','master.m3u8'),null);}finally{await limited.close();}
+ }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true})}
+});
+
+test('fast-start gate rejects unsafe or non-seekable MP4 inputs without consuming the file',async()=>{
+ const {fastStartGate}=require('./transcode'),{Readable}=require('node:stream'),{pipeline}=require('node:stream/promises'),{Writable}=require('node:stream');const box=(name,payload=Buffer.alloc(0))=>{const b=Buffer.alloc(8+payload.length);b.writeUInt32BE(b.length);b.write(name,4);payload.copy(b,8);return b};const read=async chunks=>{const data=[];await pipeline(Readable.from(chunks),fastStartGate(1024),new Writable({write(c,e,cb){data.push(c);cb()}}));return Buffer.concat(data)};
+ const ok=Buffer.concat([box('ftyp'),box('free'),box('moov',Buffer.from('meta')),box('mdat',Buffer.from('data'))]);assert.deepEqual(await read([ok.subarray(0,3),ok.subarray(3,15),ok.subarray(15)]),ok);await assert.rejects(read([box('ftyp'),box('mdat'),box('moov')]),/not fast-start/);await assert.rejects(read([Buffer.from('#EXTM3U\n')]),/fast-start/);const giant=Buffer.alloc(8);giant.writeUInt32BE(2048);giant.write('moov',4);await assert.rejects(read([box('ftyp'),giant]),/limit/);
+});
