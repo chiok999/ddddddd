@@ -1,6 +1,6 @@
 # Full-length seeking and mandatory transcoding investigation
 
-**Status: not implemented.** Normal direct playback remains available and the existing opt-in transcoder is still a rolling live HLS window. This report is not a change to player behavior.
+**Status:** mandatory conversion was added after this investigation; full-length VOD seeking remains unimplemented. The transcoder is still a rolling live HLS window.
 
 ## Confirmed trigger
 
@@ -24,3 +24,7 @@ A synthetic HLS playlist referencing `http://127.0.0.1:9999/segment.ts`, sent to
 ## Remaining work
 
 A complete implementation needs session-bound source duration and full-timeline seek semantics, a secure seekable/range-aware source adapter for MP4, a separately validated HLS VOD adapter for playlists, segments and encryption, cancellation/cleanup, subtitle synchronization and automatic conversion of every playable result with no direct-play fallback. Unsupported or unsafe inputs must fail explicitly. Changing the browser's displayed duration without supplying seekable media would be misleading. These behaviors, long-video resource usage and Botkeep playback have not been implemented or verified here.
+
+## Mandatory conversion update
+
+Automatic conversion and blocking original media playback were subsequently implemented. The remainder of this report still applies: HLS inputs and full-timeline seeking are not implemented. The focused conversion, fail-closed, stale-job and HTTP tests passed, along with the real synthetic FFmpeg integration. The full suite currently has 13 failing simulated UI tests; many still mock direct playback rather than a successful transcode and include obsolete direct-quality expectations. These failures have not been fully audited, so they cannot be dismissed as fixture-only or taken as proof the remaining UI is healthy. Real-browser and Botkeep playback have not been verified.
