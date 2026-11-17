@@ -668,3 +668,47 @@ test('preferring IPv4 never relaxes the private-address check', async () => {
     delete require.cache[require.resolve('./network')];
   }
 });
+
+test('a 426 from the source is retried at offset 0 and never mid-file',async()=>{
+  // The CDN edge refuses the first connection and accepts the next, which is
+  // what a browser retry does. Mid-file a replay would leave a hole, so only
+  // the opening request may be retried.
+  const {createTranscoder}=require('./transcode');const {Readable}=require('node:stream');
+  const {createSourceOpener}=require('./source-opener');
+  const {safeUrl}=require('./network');
+  const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'troy-ffstub-'));
+  const stub=path.join(dir,'ffmpeg');
+  // Satisfies every capability probe and then produces no output, so the job
+  // reaches the source-open path and stops there on the startup deadline.
+  fs.writeFileSync(stub,`#!/bin/sh
+case "$*" in
+  *"-encoders"*) printf ' V....D libx264\\n A....D aac\\n'; exit 0;;
+  *"-muxers"*) printf ' E  hls\\n'; exit 0;;
+  *"-filters"*) printf ' ..C scale\\n ..C pad\\n'; exit 0;;
+  *"-h muxer=hls"*) printf ' temp_file\\n'; exit 0;;
+  *"-h full"*) printf ' -readrate\\n -readrate_initial_burst\\n'; exit 0;;
+  *"-version"*) printf 'ffmpeg version stub\\n'; exit 0;;
+esac
+exit 0
+`);
+  fs.chmodSync(stub,0o755);
+  const head='0000000866747970000000086d6f6f76';
+  const respond=status=>({ok:status===200,status,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(Readable.from(Buffer.from(head,'hex')))});
+  try{
+    let opens=0;
+    const open=createSourceOpener({safeUrl,remote:async()=>{opens++;return respond(opens===1?426:200);}});
+    const t=createTranscoder({executable:stub,open,startupMs:4000,tmpdir:dir});
+    try{await assert.rejects(t.start({},'a'),/did not start in time|Source returned/);}
+    finally{await t.close()}
+    assert.ok(opens>=2,'the refused opening request was retried rather than failing the source');
+
+    // Mid-file the 426 is reported immediately, with no replay.
+    let midFile=0;
+    const open2=createSourceOpener({safeUrl,remote:async()=>{midFile++;return respond(426);}});
+    const t2=createTranscoder({executable:stub,open:open2,startupMs:4000,tmpdir:dir});
+    try{await assert.rejects(t2.start({},'a',120),/Source returned 426 \(the host refused this connection/);}
+    finally{await t2.close()}
+    assert.equal(midFile,1,'no replay once bytes may already have been consumed');
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
