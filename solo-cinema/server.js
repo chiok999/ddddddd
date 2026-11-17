@@ -205,7 +205,7 @@ const server = http.createServer(async (req, res) => {
           const matching=refreshed.streams.filter(s=>s.provider===stream.provider && s.format===stream.format && s.quality===stream.quality);
           return matching.length===1?matching[0]:null;
         };
-        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 && stream.duration<=86400 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent, refresh, stream.refreshAfterMs) };
+        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent, refresh, stream.refreshAfterMs) };
       });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }

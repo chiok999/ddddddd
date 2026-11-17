@@ -397,7 +397,7 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const bin=testFfmpeg;const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-test-'));const fixture=path.join(dir,'sample.mp4');
  const input=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-f','lavfi','-i','sine=frequency=440','-t','12','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac',fixture],{encoding:'utf8'});assert.equal(input.status,0,input.stderr);
  let opened=0;const t=createTranscoder({tmpdir:dir,executable:bin,startupMs:35000,open:async()=>{opened++;return {ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(fixture))}}});
- try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
+ try{const job=await t.start({},'alice');assert.equal(opened,1);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
  for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.data.length>0);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:segment.data,encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
  assert.equal(await t.stopFor(job.id,'bob'),false);
  // Hold a segment read across stop: cleanup must not remove the file mid-read.
@@ -549,16 +549,13 @@ test('MovieBox detail seasons are bounded and tied to the selected subject', asy
   subject='99';assert.deepEqual(await adapter.episodes(item),[]);
 });
 
-test('a session can replace its abandoned conversion without cancelling another session', {skip:!testFfmpeg,timeout:20000},async()=>{
- const {createTranscoder}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-replace-'));let notify;const opened=new Promise(r=>notify=r);let count=0;
- const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async(_source,signal)=>{count++;notify();return new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}))}});
+test('concurrent session requests are independently cancellable', {skip:!testFfmpeg,timeout:20000},async()=>{
+ const {createTranscoder}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-replace-'));let count=0,notify;const opened=new Promise(r=>notify=r);
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async(_source,signal)=>{if(++count===3)notify();return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}))}});
  try{
-  const first=t.start({},'owner',0,'first');first.catch(()=>{});await opened;
-  await assert.rejects(t.start({},'other',0,'other'),/Another session/);
-  const second=t.start({},'owner',0,'second');second.catch(()=>{});
-  await assert.rejects(first,/aborted|stopped/);
-  assert.equal(await t.stopRequest('first','owner'),false);
-  await t.stopSession('owner');await assert.rejects(second,/aborted|stopped/);
+  const a=t.start({},'owner',0,'first'),b=t.start({},'owner',0,'second'),c=t.start({},'other',0,'third');for(const p of [a,b,c])p.catch(()=>{});await opened;
+  assert.equal(await t.stopRequest('first','other'),false);assert.equal(await t.stopRequest('first','owner'),true);await assert.rejects(a,/aborted|stopped/);
+  await t.stopSession('owner');await assert.rejects(b,/aborted|stopped/);assert.equal(await t.stopRequest('third','other'),true);await assert.rejects(c,/aborted|stopped/);
  }finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
 });
 
@@ -581,7 +578,7 @@ test('expired sessions cannot claim jobs',async()=>{
 test('a running converter is not expired just because the viewer pauses', {skip:!testFfmpeg,timeout:30000},async()=>{
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-pause-')),file=path.join(dir,'source.mp4');
  try{const generated=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','20','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:15000});assert.equal(generated.status,0,String(generated.stderr));
- const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,idleMs:1,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,idleMs:1,open:async()=>({status:200,body:Readable.toWeb(Readable.from((async function*(){yield await fsp.readFile(file);await new Promise(r=>setTimeout(r,6000));})())),headers:new Headers({'content-type':'video/mp4'})})});
  try{const job=await t.start({},'owner');await new Promise(r=>setTimeout(r,2300));assert.equal(t.status(job.id,'owner')?.active,true);}finally{await t.close();}
  }finally{await fsp.rm(dir,{recursive:true,force:true});}
 });
@@ -639,4 +636,29 @@ test('subtitle handle stores keep accepting entries past their limits and evict 
   assert.equal(store.size,maxEntries);assert.ok(store.get(`z${maxEntries+9}`));
   now=101;assert.equal(store.get(`z${maxEntries+9}`),null);put('fresh','c',200);assert.equal(store.size,1);now=0;
  }
+});
+
+test('two sessions can convert simultaneously with independent access and cleanup', {skip:!testFfmpeg,timeout:45000},async()=>{
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-dual-')),file=path.join(dir,'source.mp4');let t;
+ try{
+  const result=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','12','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:15000});assert.equal(result.status,0,String(result.stderr));
+  t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+  const [one,two]=await Promise.all([t.start({},'pc'),t.start({},'phone')]);
+  assert.notEqual(one.id,two.id);assert.ok(await t.read(one.id,'pc','240/index.m3u8'));assert.ok(await t.read(two.id,'phone','360/index.m3u8'));assert.equal(await t.read(one.id,'phone','240/index.m3u8'),null);
+  const third=await t.start({},'third');assert.ok(await t.read(third.id,'third','240/index.m3u8'));assert.equal(await t.stopFor(one.id,'phone'),false);await t.stopSession('pc');assert.equal(t.status(two.id,'phone').active,true);assert.equal(await t.stopAny(),true);assert.equal(t.status(two.id,'phone'),null);
+ }finally{if(t)await t.close();await fsp.rm(dir,{recursive:true,force:true});}
+});
+
+
+
+test('MovieBox keeps short series episodes instead of discarding them as trailers',async()=>{
+ const adapter=require('./moviebox')({safeUrl:u=>new URL(u),request:async url=>{
+  if(url.includes('/home?'))return {headers:{get:()=>'{"token":"guest"}'}};
+  if(url.includes('/get-domain'))return {json:{data:'https://player.example'}};
+  if(url.includes('/subject/play'))return {json:{data:{streams:[{url:'https://cdn.example/episode.mp4',resolutions:720,duration:180}]}}};
+  throw Error('unexpected');
+ }});
+ const result=await adapter.resolve({type:'series',subjectId:'1',detailPath:'show',title:'Show'},1,2);
+ assert.equal(result.streams.length,1);assert.equal(result.streams[0].duration,180);
 });

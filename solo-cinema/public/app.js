@@ -263,7 +263,7 @@ async function findStreams(autoplay = false) {
   finally { if(sequence===resolveSequence){$('findStreams').disabled=false; $('findStreams').textContent=chosen.type==='series'?'Play selected episode':'Play again';} }
 }
 $('findStreams').onclick=()=>findStreams(true);
-$('reclaimTranscode').onclick=async()=>{if(!confirm('Stop the current conversion, even if another session is using it?'))return;try{const result=await post('/api/transcode/reclaim',{});$('playError').textContent=result.stopped?'Conversion stopped. Press Play again.':'No conversion was active.';}catch(err){$('playError').textContent=err.message;}};
+$('reclaimTranscode').onclick=async()=>{if(!confirm('Stop all conversions, including those on other devices?'))return;try{const result=await post('/api/transcode/reclaim',{});$('playError').textContent=result.stopped?'Conversion stopped. Press Play again.':'No conversion was active.';}catch(err){$('playError').textContent=err.message;}};
 
 $('video').addEventListener('ended',()=>{ if(current){const key=current.progressKey || current.url; if(key) try{save('solo-progress',load('solo-progress').filter(x=>x.url!==key));}catch{}} const ctx=current?.context; if(ctx && selected?.id===ctx.id && episodes.some(e=>e.season>ctx.season || (e.season===ctx.season && e.episode>ctx.episode))) $('nextEpisode').click(); });
 function updateNext(){
