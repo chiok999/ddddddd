@@ -21,8 +21,8 @@ const sources = require('./source-store').createSourceStore();
 const loginLimiter=require('./login-limiter').createLoginLimiter();
 let activeRangeProbes = 0;
 const catalog = new Map();
-const captions = new Map();
-const captionSources = new Map();
+const captions = require('./source-store').createSourceStore({perSession:100,maxEntries:1000});
+const captionSources = require('./source-store').createSourceStore({perSession:1000,maxEntries:4000});
 const agent = new Agent({ connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
 function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null, refreshAfterMs = null) {
@@ -166,8 +166,6 @@ const server = http.createServer(async (req, res) => {
       if (!selected || selected.sid !== sid || selected.expires < Date.now() || selected.item.source !== 'kisskh') return send(res, 404, { error:'Search result expired; search again' });
       const text=await kisskh.subtitle(selected.item,Number(data.season),Number(data.episode));
       if (!text) return send(res,200,{ url:null });
-      for (const [id, entry] of captions) if (entry.expires < Date.now()) captions.delete(id);
-      if (captions.size > 100) fail('Too many subtitles; restart the server');
       const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
       return send(res,200,{url:`/caption/${id}`});
     }
@@ -184,8 +182,6 @@ const server = http.createServer(async (req, res) => {
         if(raw.includes('-->') && !/^<(!doctype|html)/i.test(raw)) {const converted=raw.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g,'$1.$2'); text=/^WEBVTT(?:\s|$)/i.test(converted)?converted:`WEBVTT\n\n${converted}`;}
       } else text=await moviebox.subtitle(source.info);
       if (!text) return send(res,200,{url:null});
-      for (const [id, entry] of captions) if (entry.expires < Date.now()) captions.delete(id);
-      if (captions.size > 100) fail('Too many subtitles; restart the server');
       const id=crypto.randomBytes(24).toString('base64url'); captions.set(id,{sid,text,expires:Date.now()+6*3600000});
       return send(res,200,{url:`/caption/${id}`});
     }
@@ -201,10 +197,9 @@ const server = http.createServer(async (req, res) => {
       if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
       const season=Number(data.season),episode=Number(data.episode);
       const result=await resolveTitle(selected,season,episode);
-      for (const [id, entry] of captionSources) if (entry.expires<Date.now()) captionSources.delete(id);
       const streams = result.streams.map(stream => {
         let captionId=null;
-        if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
+        if(stream.captionInfo){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
         const refresh=async()=>{
           const refreshed=await resolveTitle(selected,season,episode,stream.provider);
           const matching=refreshed.streams.filter(s=>s.provider===stream.provider && s.format===stream.format && s.quality===stream.quality);

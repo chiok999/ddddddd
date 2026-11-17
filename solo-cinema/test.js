@@ -627,3 +627,16 @@ test('KissKh episode details are cached, coalesced and returned as copies',async
 test('Movy reports malformed detail metadata without leaking its contents',async()=>{
  const {createMovy}=require('./movy');const {safeUrl}=require('./network');const resolve=createMovy({safeUrl,request:async()=>({text:'<script id="__NEXT_DATA__">{bad and private}</script>'})});await assert.rejects(resolve({tmdbId:'123',type:'movie'},1,1),e=>e.message==='Movy detail data is invalid');
 });
+
+test('subtitle handle stores keep accepting entries past their limits and evict least recently used',()=>{
+ const {createSourceStore}=require('./source-store');let now=0;
+ for(const [perSession,maxEntries] of [[100,1000],[1000,4000]]){
+  const store=createSourceStore({perSession,maxEntries,now:()=>now});
+  const put=(id,sid='a',expires=100)=>store.set(id,{sid,expires});
+  put('other','b');for(let i=0;i<perSession;i++)put(`a${i}`);
+  assert.ok(store.get('a0'));put('new');assert.equal(store.get('a1'),null);assert.ok(store.get('a0'));assert.ok(store.get('other'));assert.ok(store.get('new'));
+  for(let i=0;i<maxEntries+10;i++)put(`z${i}`,`session${i}`);
+  assert.equal(store.size,maxEntries);assert.ok(store.get(`z${maxEntries+9}`));
+  now=101;assert.equal(store.get(`z${maxEntries+9}`),null);put('fresh','c',200);assert.equal(store.size,1);now=0;
+ }
+});
