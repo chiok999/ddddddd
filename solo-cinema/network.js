@@ -20,7 +20,26 @@ function safeUrl(input) {
 // "auto" (the default) keeps both families, because a dual-stack host works
 // either way and IPv6-only networks must not be broken.
 const preferIPv4 = (process.env.CINEMA_IPV4 || 'auto').toLowerCase();
-const forceIPv4 = ['1','true','yes','ipv4'].includes(preferIPv4);
+const explicit = ['1','true','yes','ipv4'].includes(preferIPv4);
+const forcedOff = ['0','false','no','ipv6','off'].includes(preferIPv4);
+// Detect the broken case ourselves instead of asking the operator to know it.
+// Node cannot report route reachability, so this is decided once at startup:
+// if the machine has no IPv6 route but DNS still hands out AAAA records, every
+// source would fail for a reason unrelated to the provider.
+const { execFileSync } = require('node:child_process');
+function ipv6RouteMissing(){
+  try{
+    if(process.platform!=='linux') return false;
+    const routes=require('node:fs').readFileSync('/proc/net/ipv6_route','utf8').trim().split('\n');
+    // A default route is all zeros; anything else means no IPv6 egress.
+    return !routes.some(line=>line.startsWith('0'.repeat(32)) && line.split(/\s+/).slice(-3,-2)[0]==='0'.repeat(32));
+  }catch{return false;}
+}
+const ipv6Unrouted = !forcedOff && ipv6RouteMissing();
+const forceIPv4 = !forcedOff && (explicit || ipv6Unrouted);
+if (ipv6Unrouted && !explicit) {
+  console.warn('[troy] No IPv6 route on this host but DNS returns IPv6 answers; preferring IPv4 automatically. Set CINEMA_IPV4=0 to override.');
+}
 function publicLookup(resolve = dns.lookup) {
   return (host, options, callback) => {
     Promise.resolve().then(() => resolve(host, { all: true, verbatim: true })).then(rows => {
@@ -51,4 +70,4 @@ async function getRemote(input, headers, signal, fetch, agent) {
     url=next;
   }
 }
-module.exports = { safeUrl, publicLookup, getRemote, forceIPv4 };
+module.exports = { safeUrl, publicLookup, getRemote, forceIPv4, ipv6Unrouted };

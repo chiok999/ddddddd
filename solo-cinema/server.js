@@ -281,4 +281,20 @@ const server = http.createServer(async (req, res) => {
 });
 server.on('close',()=>{transcoder.close();});
 for(const signal of ['SIGTERM','SIGINT'])process.once(signal,()=>{server.close();transcoder.close().finally(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();});
-server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => console.log('Troy is listening'));
+server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => {
+  // Print the two facts that decide whether playback can work at all, so a
+  // hosting panel's console log is enough to diagnose a dead deployment.
+  const net = require('./network');
+  console.log('Troy is listening');
+  console.log(`  outbound: ${net.forceIPv4 ? 'IPv4 preferred' : 'both families'}` + (net.ipv6Unrouted ? ' (no IPv6 route detected)' : ''));
+  const { bundledFfmpeg } = require('./transcode');
+  const binary = process.env.CINEMA_FFMPEG || bundledFfmpeg() || 'ffmpeg';
+  try {
+    require('node:child_process').execFileSync(binary, ['-version'], { stdio: 'ignore', timeout: 10000 });
+    console.log(`  ffmpeg:   ${binary}`);
+  } catch {
+    console.warn(`  ffmpeg:   NOT RUNNING (${binary})`);
+    console.warn('            Conversion is the only playback path, so install FFmpeg');
+    console.warn('            or set CINEMA_FFMPEG. Nothing will play until it exists.');
+  }
+});
