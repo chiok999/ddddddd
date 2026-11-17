@@ -156,6 +156,19 @@ async function playRelay(item,offset){
     if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});}
     $('placeholder').classList.add('hidden');video.classList.remove('hidden');$('playing').textContent=item.title;
     video.playbackRate=Number($('speed').value);
+    // A source can accept the connection and then send nothing, or send bytes
+    // the browser silently refuses. Without this the viewer just waits.
+    let started=false,watchdog=null;
+    const startEvents=['loadeddata','playing','timeupdate'];
+    const markStarted=()=>{started=true;clearTimeout(watchdog);for(const event of startEvents)video.removeEventListener(event,markStarted);};
+    for(const event of startEvents)video.addEventListener(event,markStarted);
+    watchdog=setTimeout(()=>{
+      for(const event of startEvents)video.removeEventListener(event,markStarted);
+      if(started||current!==item)return;
+      lastTranscodeError='The source opened but never produced playable video';
+      $('playError').textContent='This source is not responding; converting it instead…';
+      void relayFailed(item,fail);
+    },15000);
     const resume=Number.isFinite(offset)&&offset>0?offset:0;
     if(resume) video.addEventListener('loadedmetadata',()=>{try{if(resume<video.duration-1)video.currentTime=resume;}catch{}},{once:true});
     if (item.subtitleRequest) {
@@ -220,13 +233,18 @@ async function playRelay(item,offset){
 // One tiny ranged request tells us whether the relay can reach the source, and
 // why not. It reuses the session-bound handle, so no URL is exposed.
 async function relayReason(item){
+  // Bounded: the whole point of this probe is to explain a failure, so it must
+  // never become a second hang of its own.
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),4000);
   try{
-    const response=await fetch(item.proxy,{headers:{Range:'bytes=0-1'}});
+    const response=await fetch(item.proxy,{headers:{Range:'bytes=0-1'},signal:controller.signal});
     if(response.ok){response.body?.cancel?.();return null;}
     $('sourceFailures').textContent=`${item.provider||'Source'}: HTTP ${response.status}`;
     try{const body=await response.json();if(body?.error)return body.error;}catch{}
     return `the media host returned HTTP ${response.status}`;
-  }catch{return null;}
+  }catch(error){return controller.signal.aborted?'the media host did not respond in time':null;}
+  finally{clearTimeout(timer);}
 }
 // One conversion attempt per source, then move to the next source.
 async function relayFailed(item,fail){
@@ -263,7 +281,14 @@ async function playConverted(item,offset){
     $('playError').textContent='';
     current=item; pendingFailure=null; const keepUpload=!!(item.keepUpload && uploadUrl);subtitleTouched=keepUpload; if(uploadUrl && !keepUpload){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
     $('server').replaceChildren(); const variants=item.variants || [item]; variants.forEach((source,i)=>$('server').add(new Option(`${source.provider || 'Direct'} · ${source.quality ? source.quality+'p' : 'source'} · ${(source.format || 'file').toUpperCase()}`,String(i)))); $('server').disabled=variants.length<2; const serverIndex=variants.findIndex(source=>source.proxy ? source.proxy===item.proxy : source===item); $('server').value=String(Math.max(0,serverIndex));
-    $('quality').replaceChildren(new Option('240p', '240'),new Option('360p', '360')); $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});} $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
+    // Auto returns to the provider's own stream, so leaving conversion is
+    // always one click away once the server has started encoding.
+    // Auto only exists when there is a direct stream to go back to; without the
+    // relay, conversion is the only way to play and a bare Auto would be a dead
+    // option.
+    const convertedOptions=relaySupported?[new Option('Auto','auto')]:[];
+    convertedOptions.push(new Option('240p','240'),new Option('360p','360'));
+    $('quality').replaceChildren(...convertedOptions); $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});} $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
     video.onloadedmetadata=null; video.playbackRate=Number($('speed').value); pendingFailure=fail;
     if (item.subtitleRequest) {
       post(item.subtitleRequest.path,item.subtitleRequest.data).then(result=>{
@@ -286,25 +311,60 @@ async function playConverted(item,offset){
   } catch(e) { if(isActive()) { lastTranscodeError=e.message; pendingFailure=null; fail(); } }
 }
 $('quality').onchange=()=>{ const value=$('quality').value;
- if(value==='auto'){ if(hls)hls.currentLevel=-1; return; }
- const height=Number(value); if(![240,360,480,720,1080,1440,2160].includes(height))return;
- // Remember 240p/360p permanently: those are the choices that survive source
- // changes and restarts, and they are what the operator expects to stick.
- if([240,360].includes(height)){preferredHeight=height;try{localStorage.setItem('solo-quality-height',String(height));}catch{}}
- if(hls){
-  const index=activeLevels.findIndex(level=>level.height===height);
-  if(index>=0){hls.currentLevel=index;}
-  else{
-   // The stream has no such level. Cap to the nearest one at or below the
-   // request and say so, instead of leaving the selection meaningless.
-   const capped=nearestLevelIndex(height);
-   if(capped>=0)hls.currentLevel=capped;
-   const actual=activeLevels[capped]?.height;
-   $('playError').textContent=actual?`This stream has no ${height}p; using the closest available (${actual}p).`:`This stream does not report quality levels; it adapts automatically.`;
+ if(!current) return;
+ const video=$('video');
+ const resumeAt=Number.isFinite(video.currentTime)&&video.currentTime>1?video.currentTime:0;
+ const wasPaused=video.paused;
+
+ // Auto releases any pinned version. Server-encoded levels drop back to the
+ // provider's own bytes so the viewer is watching the best available copy.
+ if(value==='auto'){
+  if(hls){hls.currentLevel=-1;return;}
+  if(!relaySupported) return;
+  if(current.transcodeId){
+   const item={...current,seekAt:resumeAt,wasPaused,keepUpload:!!uploadTrack};
+   if(hls){hls.destroy();hls=null;}
+   playRelay(item,resumeAt);
+   return;
   }
-  return;}
- if(!current?.transcodeId) return;
- preferredHeight=height; try{localStorage.setItem('solo-quality-height',String(height));}catch{} if(hls){const index=activeLevels.findIndex(level=>level.height===height);if(index>=0)hls.currentLevel=index;}else if(current?.transcodeId){const video=$('video'),paused=video.paused,time=video.currentTime,item=current;video.addEventListener('loadedmetadata',()=>{if(current!==item || !Number.isFinite(time))return;try{if(Number.isFinite(video.duration) && time<=video.duration)video.currentTime=time;}catch{}},{once:true});video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();if(!paused)video.play().catch(()=>{});$('playError').textContent='Quality changed; seeking is limited to the converted portion.';} };
+  return;
+ }
+
+ const height=Number(value); if(![240,360,480,720,1080,1440,2160].includes(height))return;
+
+ // 240p and 360p are real conversions the server can produce. Picking them is
+ // how you deliberately spend the 3 GB box's CPU on a small picture; it is
+ // remembered for the next title.
+ if([240,360].includes(height)){
+  preferredHeight=height;try{localStorage.setItem('solo-quality-height',String(height));}catch{}
+  // Already converting at this height: just swap rendition.
+  if(current.transcodeId && hls){
+   const index=activeLevels.findIndex(level=>level.height===height);
+   if(index>=0){hls.currentLevel=index;return;}
+  }
+  if(current.transcodeId && !hls){
+   const item=current;
+   video.addEventListener('loadedmetadata',()=>{if(current!==item)return;try{if(resumeAt<=video.duration)video.currentTime=resumeAt;}catch{}},{once:true});
+   video.src=`/transcode/${current.transcodeId}/${height}/index.m3u8`;video.load();
+   if(!wasPaused)video.play().catch(()=>{});
+   return;
+  }
+  // Relay or a higher provider level: start a conversion at this height.
+  if(hls){hls.destroy();hls=null;}
+  const item={...current,seekAt:resumeAt,wasPaused,keepUpload:!!uploadTrack};
+  playConverted({...item,convertRetried:true},resumeAt);
+  return;
+ }
+
+ // Any other level can only come from the provider's own ladder.
+ if(!hls) return;
+ const index=activeLevels.findIndex(level=>level.height===height);
+ if(index>=0){hls.currentLevel=index;return;}
+ const capped=nearestLevelIndex(height);
+ if(capped>=0)hls.currentLevel=capped;
+ const actual=activeLevels[capped]?.height;
+ $('playError').textContent=actual?`This stream has no ${height}p; using the closest available (${actual}p).`:`This stream does not report quality levels; it adapts automatically.`;
+};
 function nativeSubtitleOptions(){
   if(hls || !current) return;
   const select=$('subtitles'), previous=select.value, tracks=$('video').textTracks;
