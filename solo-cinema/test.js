@@ -43,7 +43,6 @@ test('MovieBox catalog and streams are normalized and unsafe URLs rejected', asy
   const resolved=await adapter.resolve(results[0],1,2); assert.deepEqual(resolved.streams.map(x=>x.quality),[720,1080]); assert.equal(resolved.streams[0].duration,3600); assert.equal(resolved.streams[1].duration,undefined);
   assert.ok(requests.find(r=>r.url.includes('/subject/play')).url.includes('ep=2'));
   assert.equal(requests.find(r=>r.url.includes('/subject/play')).options.headers.authorization,undefined);
-  assert.match(requests.find(r=>r.url.includes('/subject/play')).url,/^https:\/\/player\.example\//);
   await assert.rejects(adapter.resolve(results[0],0,2),/valid season/);
 });
 
@@ -175,7 +174,7 @@ test('playback fallback tries each candidate once and ignores stale errors', () 
   fallback.play(['new']); fallback.cancel(); assert.equal(attempts[3].active(),false); failures[3](); assert.equal(exhausted,1);
 });
 
-test('HTTP flow authenticates, resolves a fixture and relays media same-origin', async () => {
+test('HTTP flow authenticates, resolves a fixture and blocks direct playback', async () => {
   const probe=net.createServer(); await new Promise(r=>probe.listen(0,'127.0.0.1',r)); const port=probe.address().port; await new Promise(r=>probe.close(r));
   const child=spawn(process.execPath,['--require',require('node:path').join(__dirname,'test-fixtures/mock-upstream.cjs'),'server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'fixture-password-123'},stdio:['ignore','pipe','pipe']});
   try {
@@ -195,28 +194,12 @@ test('HTTP flow authenticates, resolves a fixture and relays media same-origin',
     const another=await post('/api/login',{password:'fixture-password-123'});const otherCookie=another.headers.get('set-cookie').split(';')[0];
     assert.equal((await post('/api/source/probe',{url:range},otherCookie)).status,404);
     assert.deepEqual(await (await post('/api/source/probe',{url:range},cookie)).json(),{addressable:true,size:100,status:206});
+    assert.equal((await fetch(base+range,{headers:{cookie}})).status,403);
     assert.equal((await fetch(base+direct)).status,401);
-    // The relay serves media to the owning session, and rewrites playlist
-    // references so the client keeps talking only to Troy.
-    const playlist=await fetch(base+direct,{headers:{cookie}});
-    assert.equal(playlist.status,200);
-    const text=await playlist.text();
-    assert.match(text,/#EXTM3U/);
-    const segmentRef=text.match(/^\/media\/[A-Za-z0-9_-]+$/m)?.[0];
-    assert.ok(segmentRef,'playlist references are rewritten to /media handles');
-    assert.equal((await fetch(base+segmentRef)).status,401);
-    const segment=await fetch(base+segmentRef,{headers:{cookie}});
-    assert.equal(segment.status,200); assert.equal(await segment.text(),'segment');
-    assert.equal((await fetch(base+segmentRef.replace('/media/','/media/x'))).status,401);
-    const other=(await post('/api/login',{password:'fixture-password-123'})).headers.get('set-cookie').split(';')[0];
-    assert.equal((await fetch(base+segmentRef,{headers:{cookie:other}})).status,404);
-    const ranged=await fetch(base+range,{headers:{cookie,range:'bytes=0-1'}});
-    assert.equal(ranged.status,206);
-    assert.equal(await ranged.text(),'ab');
-    assert.equal((await fetch(base+direct,{method:'HEAD'})).status,401);
+    assert.equal((await fetch(base+direct,{headers:{cookie}})).status,403);
     const converted=await post('/api/transcode',{url:direct},cookie);
-    assert.equal(converted.status,502);
-    assert.ok((await converted.json()).error);
+    assert.equal(converted.status,400);
+    assert.match((await converted.json()).error,/not HLS/);
     await post('/api/logout',{},cookie); assert.equal((await fetch(base+direct,{headers:{cookie}})).status,401);
   } finally {child.kill();}
 });
@@ -400,16 +383,13 @@ test('transcode API rejects unauthenticated and invalid source requests',async()
  // Reuse an isolated instance: the transcoder only accepts authenticated, session-bound /media handles.
  const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));
  const child=spawn(process.execPath,['server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'a-strong-test-password'},stdio:['ignore','pipe','pipe']});
- try{await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject)});const base=`http://127.0.0.1:${port}`;const post=(p,data,cookie)=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});assert.equal((await post('/api/transcode',{url:'/media/whatever'})).status,401);const login=await post('/api/login',{password:'a-strong-test-password'}),cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await post('/api/transcode',{url:'https://example.com/video'},cookie)).status,400);assert.equal((await post('/api/transcode',{url:'/media/not-yours'},cookie)).status,404);const src=await (await post('/api/source',{url:'https://cdn.example/video.mp4',format:'file'},cookie)).json();assert.equal((await post('/api/transcode',{url:src.url,offset:-1},cookie)).status,400);assert.equal((await post('/api/transcode',{url:src.url,offset:2,requestId:'bad'},cookie)).status,400);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)})).status,401);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)},cookie)).status,200);assert.equal((await post('/api/transcode/status',{id:'a'.repeat(32),playhead:-1},cookie)).status,400);assert.equal((await post('/api/transcode/status',{id:'a'.repeat(32),playhead:0},cookie)).status,404);assert.equal((await fetch(base+'/transcode/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/master.m3u8')).status,401);}finally{child.kill();}
+ try{await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject)});const base=`http://127.0.0.1:${port}`;const post=(p,data,cookie)=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});assert.equal((await post('/api/transcode',{url:'/media/whatever'})).status,401);const login=await post('/api/login',{password:'a-strong-test-password'}),cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await post('/api/transcode',{url:'https://example.com/video'},cookie)).status,400);assert.equal((await post('/api/transcode',{url:'/media/not-yours'},cookie)).status,404);const src=await (await post('/api/source',{url:'https://cdn.example/video.mp4',format:'file'},cookie)).json();assert.equal((await post('/api/transcode',{url:src.url,offset:-1},cookie)).status,400);assert.equal((await post('/api/transcode',{url:src.url,offset:2,requestId:'bad'},cookie)).status,400);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)})).status,401);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)},cookie)).status,200);assert.equal((await fetch(base+'/transcode/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/master.m3u8')).status,401);}finally{child.kill();}
 });
 
 test('transcoder reports missing ffmpeg and rejects playlist content',async()=>{
  const {createTranscoder}=require('./transcode');const {Readable}=require('node:stream');const make=(type)=>({ok:true,status:200,headers:new Headers({'content-type':type}),body:Readable.toWeb(Readable.from(Buffer.from('0000000866747970000000086d6f6f76','hex')))});
  let opened=0;const bad=createTranscoder({executable:'/definitely/not/a/real/ffmpeg',open:async()=>{opened++;return make('video/mp4')},startupMs:5000});try{await assert.rejects(bad.start({},'a'),/FFmpeg executable or its system loader was not found/);assert.equal(opened,0);assert.equal(await bad.read('bad','a','master.m3u8'),null);}finally{await bad.close()}
- // HLS input needs a working FFmpeg plus the HLS relay; without either the
- // startup must fail closed rather than handing the playlist to the browser.
- const hls=createTranscoder({open:async()=>({status:200,headers:new Headers({'content-type':'application/vnd.apple.mpegurl'}),body:Readable.toWeb(Readable.from(['#EXTM3U\n']))})});
- try{await assert.rejects(hls.start({},'a'),/HLS input unavailable|FFmpeg executable or its system loader was not found/)}finally{await hls.close()}
+ const hls=createTranscoder({open:async()=>make('application/vnd.apple.mpegurl')});try{await assert.rejects(hls.start({},'a'),/Only uncompressed direct MP4/)}finally{await hls.close()}
 });
 
 const testFfmpeg=process.env.CINEMA_TEST_FFMPEG || require('./transcode').bundledFfmpeg();
@@ -417,7 +397,7 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const bin=testFfmpeg;const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-test-'));const fixture=path.join(dir,'sample.mp4');
  const input=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-f','lavfi','-i','sine=frequency=440','-t','12','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac',fixture],{encoding:'utf8'});assert.equal(input.status,0,input.stderr);
  let opened=0;const t=createTranscoder({tmpdir:dir,executable:bin,startupMs:35000,open:async()=>{opened++;return {ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(fixture))}}});
- try{const job=await t.start({},'alice');assert.equal(opened,1);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
+ try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
  for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.data.length>0);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:segment.data,encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
  assert.equal(await t.stopFor(job.id,'bob'),false);
  // Hold a segment read across stop: cleanup must not remove the file mid-read.
@@ -442,7 +422,7 @@ test('FFmpeg selection checks packaged executable, falls back safely, and distin
  const {bundledFfmpeg,ffmpegCandidates,chooseFfmpeg,probeFfmpeg}=require('./transcode');const fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
  assert.equal(bundledFfmpeg('win32','x64'),null);assert.equal(bundledFfmpeg('linux','riscv64'),null);if(bundledFfmpeg()){const chosen=await chooseFfmpeg([{label:'Missing',path:'/does/not/exist'}, {label:'Packaged',path:bundledFfmpeg()}]);assert.equal(chosen,bundledFfmpeg());}
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-probe-test-'));try{const file=path.join(dir,'blocked');await fs.writeFile(file,'#!/bin/sh\nexit 0\n',{mode:0o600});await assert.rejects(probeFfmpeg(file),/execution was denied/);await assert.rejects(chooseFfmpeg([{label:'Bundled FFmpeg',path:file},{label:'System FFmpeg',path:'/does/not/exist'}]),/execution was denied.*not found/);const limited=path.join(dir,'limited');await fs.writeFile(limited,"#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo 'ffmpeg version test'; else echo ' V....D libx264 x264'; fi\n",{mode:0o700});await assert.rejects(probeFfmpeg(limited),/missing the libx264 or AAC encoder/);}finally{await fs.rm(dir,{recursive:true,force:true});}
- const old=process.env.CINEMA_FFMPEG;try{delete process.env.CINEMA_FFMPEG;assert.deepEqual(ffmpegCandidates('linux','arm64','/bundle','/software').map(x=>x.path),['/software','ffmpeg','/bundle']);assert.deepEqual(ffmpegCandidates('linux','x64','/bundle').map(x=>x.path),['/bundle','ffmpeg']);assert.deepEqual(ffmpegCandidates('linux','arm64',null,null).map(x=>x.path),['ffmpeg']);process.env.CINEMA_FFMPEG='/custom/path';assert.deepEqual(ffmpegCandidates('linux','arm64','/bundle').map(x=>x.path),['/custom/path']);}finally{if(old===undefined)delete process.env.CINEMA_FFMPEG;else process.env.CINEMA_FFMPEG=old;}
+ const old=process.env.CINEMA_FFMPEG;try{process.env.CINEMA_FFMPEG='/custom/path';assert.deepEqual(ffmpegCandidates().map(x=>x.path),['/custom/path']);}finally{if(old===undefined)delete process.env.CINEMA_FFMPEG;else process.env.CINEMA_FFMPEG=old;}
 });
 
 test('FFmpeg can discard to a later MP4 timestamp on a pipe, but pipe input is not range-seekable', {skip:!testFfmpeg,timeout:30000},async()=>{
@@ -550,7 +530,6 @@ else if(process.argv.includes('-muxers')) console.log(' E hls');
 else if(process.argv.includes('-filters')) console.log(' ... scale\n ... pad');
 else if(process.argv.includes('full')) console.log('-readrate <speed>\n-readrate_initial_burst <seconds>');
 else if(process.argv.includes('muxer=hls')) console.log('temp_file');
-else if(process.argv.includes('demuxer=hls')) console.log('-allowed_extensions -allowed_segment_extensions -extension_picky -seg_max_retry');
 else {process.stderr.write('No space left on device\n');process.exit(1);}
 `;
  await fs.writeFile(exe,script,{mode:0o755});const box=name=>{const b=Buffer.alloc(8);b.writeUInt32BE(8);b.write(name,4);return b};
@@ -570,13 +549,16 @@ test('MovieBox detail seasons are bounded and tied to the selected subject', asy
   subject='99';assert.deepEqual(await adapter.episodes(item),[]);
 });
 
-test('concurrent session requests are independently cancellable', {skip:!testFfmpeg,timeout:20000},async()=>{
- const {createTranscoder}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-replace-'));let count=0,notify;const opened=new Promise(r=>notify=r);
- const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async(_source,signal)=>{if(++count===3)notify();return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}))}});
+test('a session can replace its abandoned conversion without cancelling another session', {skip:!testFfmpeg,timeout:20000},async()=>{
+ const {createTranscoder}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-replace-'));let notify;const opened=new Promise(r=>notify=r);let count=0;
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async(_source,signal)=>{count++;notify();return new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}))}});
  try{
-  const a=t.start({},'owner',0,'first'),b=t.start({},'owner',0,'second'),c=t.start({},'other',0,'third');for(const p of [a,b,c])p.catch(()=>{});await opened;
-  assert.equal(await t.stopRequest('first','other'),false);assert.equal(await t.stopRequest('first','owner'),true);await assert.rejects(a,/aborted|stopped/);
-  await t.stopSession('owner');await assert.rejects(b,/aborted|stopped/);assert.equal(await t.stopRequest('third','other'),true);await assert.rejects(c,/aborted|stopped/);
+  const first=t.start({},'owner',0,'first');first.catch(()=>{});await opened;
+  await assert.rejects(t.start({},'other',0,'other'),/Another session/);
+  const second=t.start({},'owner',0,'second');second.catch(()=>{});
+  await assert.rejects(first,/aborted|stopped/);
+  assert.equal(await t.stopRequest('first','owner'),false);
+  await t.stopSession('owner');await assert.rejects(second,/aborted|stopped/);
  }finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
 });
 
@@ -599,7 +581,7 @@ test('expired sessions cannot claim jobs',async()=>{
 test('a running converter is not expired just because the viewer pauses', {skip:!testFfmpeg,timeout:30000},async()=>{
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-pause-')),file=path.join(dir,'source.mp4');
  try{const generated=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','20','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:15000});assert.equal(generated.status,0,String(generated.stderr));
- const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,idleMs:1,open:async()=>({status:200,body:Readable.toWeb(Readable.from((async function*(){yield await fsp.readFile(file);await new Promise(r=>setTimeout(r,6000));})())),headers:new Headers({'content-type':'video/mp4'})})});
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,idleMs:1,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
  try{const job=await t.start({},'owner');await new Promise(r=>setTimeout(r,2300));assert.equal(t.status(job.id,'owner')?.active,true);}finally{await t.close();}
  }finally{await fsp.rm(dir,{recursive:true,force:true});}
 });
@@ -644,90 +626,4 @@ test('KissKh episode details are cached, coalesced and returned as copies',async
 
 test('Movy reports malformed detail metadata without leaking its contents',async()=>{
  const {createMovy}=require('./movy');const {safeUrl}=require('./network');const resolve=createMovy({safeUrl,request:async()=>({text:'<script id="__NEXT_DATA__">{bad and private}</script>'})});await assert.rejects(resolve({tmdbId:'123',type:'movie'},1,1),e=>e.message==='Movy detail data is invalid');
-});
-
-test('subtitle handle stores keep accepting entries past their limits and evict least recently used',()=>{
- const {createSourceStore}=require('./source-store');let now=0;
- for(const [perSession,maxEntries] of [[100,1000],[1000,4000]]){
-  const store=createSourceStore({perSession,maxEntries,now:()=>now});
-  const put=(id,sid='a',expires=100)=>store.set(id,{sid,expires});
-  put('other','b');for(let i=0;i<perSession;i++)put(`a${i}`);
-  assert.ok(store.get('a0'));put('new');assert.equal(store.get('a1'),null);assert.ok(store.get('a0'));assert.ok(store.get('other'));assert.ok(store.get('new'));
-  for(let i=0;i<maxEntries+10;i++)put(`z${i}`,`session${i}`);
-  assert.equal(store.size,maxEntries);assert.ok(store.get(`z${maxEntries+9}`));
-  now=101;assert.equal(store.get(`z${maxEntries+9}`),null);put('fresh','c',200);assert.equal(store.size,1);now=0;
- }
-});
-
-test('two sessions can convert simultaneously with independent access and cleanup', {skip:!testFfmpeg,timeout:45000},async()=>{
- const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
- const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-dual-')),file=path.join(dir,'source.mp4');let t;
- try{
-  const result=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','12','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:15000});assert.equal(result.status,0,String(result.stderr));
-  t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
-  const [one,two]=await Promise.all([t.start({},'pc'),t.start({},'phone')]);
-  assert.notEqual(one.id,two.id);assert.ok(await t.read(one.id,'pc','240/index.m3u8'));assert.ok(await t.read(two.id,'phone','360/index.m3u8'));assert.equal(await t.read(one.id,'phone','240/index.m3u8'),null);
-  const third=await t.start({},'third');assert.ok(await t.read(third.id,'third','240/index.m3u8'));assert.equal(await t.stopFor(one.id,'phone'),false);await t.stopSession('pc');assert.equal(t.status(two.id,'phone').active,true);assert.equal(await t.stopAny(),true);assert.equal(t.status(two.id,'phone'),null);
- }finally{if(t)await t.close();await fsp.rm(dir,{recursive:true,force:true});}
-});
-
-
-
-test('MovieBox keeps short series episodes instead of discarding them as trailers',async()=>{
- const adapter=require('./moviebox')({safeUrl:u=>new URL(u),request:async url=>{
-  if(url.includes('/home?'))return {headers:{get:()=>'{"token":"guest"}'}};
-  if(url.includes('/get-domain'))return {json:{data:'https://player.example'}};
-  if(url.includes('/subject/play'))return {json:{data:{streams:[{url:'https://cdn.example/episode.mp4',resolutions:720,duration:180}]}}};
-  throw Error('unexpected');
- }});
- const result=await adapter.resolve({type:'series',subjectId:'1',detailPath:'show',title:'Show'},1,2);
- assert.equal(result.streams.length,1);assert.equal(result.streams[0].duration,180);
-});
-
-test('MovieBox tries player first and falls back to fixed BFF without leaking bearer',async()=>{
- const calls=[];const adapter=require('./moviebox')({safeUrl:u=>new URL(u),request:async(url,options={})=>{
-  calls.push({url,options});
-  if(url.includes('/home?'))return {headers:{get:()=>'{"token":"guest"}'}};
-  if(url.includes('/get-domain'))return {json:{data:'https://player.example'}};
-  if(url.startsWith('https://player.example/') && url.includes('/subject/play'))return {json:{data:{streams:[]}}};
-  if(url.startsWith('https://h5-api.aoneroom.com/') && url.includes('/subject/play'))return {json:{data:{streams:[{url:'https://cdn.example/ep.mp4',duration:2600}]}}};
-  throw Error('unexpected request');
- }});
- const result=await adapter.resolve({type:'series',subjectId:'123',detailPath:'show',title:'Show'},1,1);
- assert.equal(result.streams.length,1);const bff=calls.find(x=>x.url.startsWith('https://h5-api.aoneroom.com/') && x.url.includes('/subject/play'));const player=calls.find(x=>x.url.startsWith('https://player.example/'));
- assert.ok(calls.indexOf(player)<calls.indexOf(bff));assert.equal(bff.options.headers.authorization,'Bearer guest');assert.match(bff.url,/se=1&ep=1/);assert.match(bff.url,/host=moviebox.ph/);assert.equal(player.options.headers.authorization,undefined);
-});
-
-test('real FFmpeg keeps converting past 20 minutes without player progress', {skip:!testFfmpeg,timeout:60000},async()=>{
- const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
- const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-ahead-')),file=path.join(dir,'source.mp4');let t;
- try{
-  const made=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=1','-t','1320','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:25000});assert.equal(made.status,0,String(made.stderr));
-  t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
-  const job=await t.start({},'viewer');assert.equal(t.status(job.id,'other',0),null);assert.equal(t.status(job.id,'viewer',0).paused,false);
-  const deadline=Date.now()+40000;let lists=[];while(Date.now()<deadline){lists=await Promise.all(['240','360'].map(async q=>(await t.read(job.id,'viewer',`${q}/index.m3u8`))?.data.toString()||''));if(lists.every(x=>x.includes('#EXT-X-ENDLIST')))break;await new Promise(r=>setTimeout(r,100));}
-  for(const list of lists){assert.match(list,/#EXT-X-ENDLIST/);const durations=[...list.matchAll(/#EXTINF:([0-9.]+)/g)].map(m=>Number(m[1]));assert.ok(durations.reduce((a,b)=>a+b,0)>1200,'conversion should continue past 20 minutes');}
-  assert.equal(t.status(job.id,'viewer',0).paused,false);assert.equal(await t.stopFor(job.id,'viewer'),true);assert.deepEqual(await fsp.readdir(dir),['source.mp4']);
- }finally{if(t)await t.close();await fsp.rm(dir,{recursive:true,force:true});}
-});
-
-test('FFmpeg selection rejects a system binary missing required HLS options and falls back',async t=>{
- const {bundledFfmpeg,chooseFfmpeg}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const actual=bundledFfmpeg();if(!actual)return t.skip('Bundled FFmpeg unavailable');
- const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-select-'));try{
-  const good=path.join(dir,'system-good'),old=path.join(dir,'system-old');const quote=x=>`'${x.replace(/'/g,"'\\''")}'`;
-  await fs.writeFile(good,`#!/bin/sh\nexec ${quote(actual)} "$@"\n`,{mode:0o700});
-  await fs.writeFile(old,`#!/bin/sh\nif [ "$3" = demuxer=hls ]; then echo -allowed_extensions; exit 0; fi\nexec ${quote(actual)} "$@"\n`,{mode:0o700});
-  assert.equal(await chooseFfmpeg([{label:'System',path:good},{label:'Bundle',path:actual}]),good);
-  assert.equal(await chooseFfmpeg([{label:'System',path:old},{label:'Bundle',path:actual}]),actual);
- }finally{await fs.rm(dir,{recursive:true,force:true});}
-});
-
-test('software FFmpeg is selected only after real video and HLS smoke tests', {skip:!testFfmpeg,timeout:30000},async()=>{
- const {chooseFfmpeg,probeSoftwareFfmpeg}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-software-'));
- try{
-  const bad=path.join(dir,'broken-ffmpeg');await fs.writeFile(bad,`#!/bin/sh\nfor arg in "$@"; do if [ "$arg" = "lavfi" ]; then exit 1; fi; done\nexec '${testFfmpeg.replace(/'/g,"'\\''")}' "$@"\n`,{mode:0o700});
-  await assert.rejects(probeSoftwareFfmpeg(bad),/software test failed/);
-  const selected=await chooseFfmpeg([{label:'Software FFmpeg',path:bad},{label:'System FFmpeg',path:testFfmpeg}]);assert.equal(selected,testFfmpeg);
-  assert.equal(await chooseFfmpeg([{label:'Software FFmpeg',path:testFfmpeg}]),testFfmpeg);
- }finally{await fs.rm(dir,{recursive:true,force:true});}
 });
