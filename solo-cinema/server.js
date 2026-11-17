@@ -32,6 +32,7 @@ function remember(url, sid, referer = null, format = null, origin = null, userAg
   return `/media/${id}`;
 }
 const { rewritePlaylist } = require('./playlist');
+const transcoder=require('./transcode').createTranscoder({open:async(entry,signal)=>{const headers={};if(entry.userAgent)headers['user-agent']=entry.userAgent;if(entry.referer)headers.referer=entry.referer;if(entry.origin)headers.origin=entry.origin;return (await getRemote(entry.url,headers,signal,fetch,agent)).response;}});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
 async function providerRequest(url, opts = {}) {
@@ -102,7 +103,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
     if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized });
-    if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
+    if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); await transcoder.stopSession(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
     if (url.pathname === '/api/discover' && req.method === 'GET') {
       if (!authorized) return send(res,401,{error:'Login required'});
       const sections=require('./catalog-session').bindDiscovery(await discover(),catalog,sid);
@@ -203,6 +204,22 @@ const server = http.createServer(async (req, res) => {
       const data = await body(req);
       return send(res, 200, { url: remember(data.url, sid, null, data.format === 'hls' ? 'hls' : null) });
     }
+    if (url.pathname === '/api/transcode' && req.method === 'POST') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      const data=await body(req);if(typeof data.url!=='string' || !/^\/media\/[A-Za-z0-9_-]+$/.test(data.url)) return send(res,400,{error:'Select an existing direct source'});
+      const entry=sources.get(data.url.slice(7));if(!entry || entry.sid!==sid || entry.expires<Date.now())return send(res,404,{error:'Source expired'});
+      if(entry.format==='hls')return send(res,400,{error:'Transcoding currently supports direct MP4 sources, not HLS playlists'});
+      try{return send(res,200,await transcoder.start(entry,sid));}catch(e){return send(res,e.status||502,{error:e.message});}
+    }
+    if (url.pathname === '/api/transcode/stop' && req.method === 'POST') {
+      if (!authorized) return send(res,401,{error:'Login required'});const data=await body(req);if(typeof data.id!=='string')return send(res,400,{error:'Missing job ID'});
+      return send(res,200,{stopped:await transcoder.stopFor(data.id,sid)});
+    }
+    if(url.pathname.startsWith('/transcode/') && req.method==='GET'){
+      if(!authorized)return send(res,401,{error:'Login required'});const match=/^\/transcode\/([A-Za-z0-9_-]{32})\/(master\.m3u8|(?:240|360)\/(?:index\.m3u8|index\d+\.ts))$/.exec(url.pathname);
+      if(!match)return send(res,404,{error:'Not found'});const result=await transcoder.read(match[1],sid,match[2]);if(!result)return send(res,404,{error:'Transcode unavailable'});
+      res.writeHead(200,{'Content-Type':result.type,'Cache-Control':'no-store'});return res.end(result.data);
+    }
     if (url.pathname.startsWith('/media/') && req.method === 'GET') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const entry = sources.get(url.pathname.slice(7));
@@ -235,4 +252,6 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, { error: 'Not found' });
   } catch (e) { if (!res.headersSent) send(res, 400, { error: e.message || 'Request failed' }); else res.destroy(); }
 });
+server.on('close',()=>{transcoder.close();});
+for(const signal of ['SIGTERM','SIGINT'])process.once(signal,()=>{server.close();transcoder.close().finally(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();});
 server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => console.log('Troy is listening'));
