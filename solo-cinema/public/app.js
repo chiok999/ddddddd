@@ -246,7 +246,7 @@ async function findStreams(autoplay = false) {
     if (selected!==chosen || sequence!==resolveSequence) return;
     $('providersNotice').textContent=data.providers.map(p=>`${p.provider}: ${p.count ? p.count+' stream(s)' : (p.error || 'no streams')}`).join(' · ');
     const items=data.streams.map(stream=>({title:`${data.title}${chosen.type === 'series' ? ` S${season} E${episode}` : ''}`,proxy:stream.url,format:stream.format,subtitleRequest:chosen.source==='kisskh'?{path:'/api/kiss-subtitle',data:{id:chosen.id,season,episode}}:stream.captionId?{path:stream.provider.startsWith('movy:')?'/api/movy-subtitle':stream.provider==='7movies'?'/api/vidlink-subtitle':'/api/moviebox-subtitle',data:{id:stream.captionId}}:null,progressKey:`${chosen.source}:${chosen.title}:${chosen.year}:${chosen.type}:${season}:${episode}`,provider:stream.provider,quality:stream.quality,context:chosen.type==='series'?{id:chosen.id,season,episode}:null}));
-    items.sort((a,b)=>scoreProvider(b.provider)-scoreProvider(a.provider) || (a.quality || Infinity)-(b.quality || Infinity)); items.forEach(item=>{item.variants=items;});
+    items.sort((a,b)=>scoreProvider(b.provider)-scoreProvider(a.provider) || (a.format==='file'?0:1)-(b.format==='file'?0:1) || (a.quality || Infinity)-(b.quality || Infinity)); items.forEach(item=>{item.variants=items;});
     for(let i=0;i<items.length;i++){
       const item=items[i], btn=document.createElement('button'); btn.textContent=`${item.provider} · ${item.quality ? item.quality+'p' : 'Auto'} · ${item.format.toUpperCase()}`;
       btn.onclick=()=>fallback.play([item,...items.filter((_,n)=>n!==i)]);
