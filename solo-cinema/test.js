@@ -42,8 +42,8 @@ test('MovieBox catalog and streams are normalized and unsafe URLs rejected', asy
   const adapter=create({request,safeUrl}); const results=await adapter.search('A Show'); assert.equal(results.length,1); assert.equal(results[0].type,'series');
   const resolved=await adapter.resolve(results[0],1,2); assert.deepEqual(resolved.streams.map(x=>x.quality),[720,1080]); assert.equal(resolved.streams[0].duration,3600); assert.equal(resolved.streams[1].duration,undefined);
   assert.ok(requests.find(r=>r.url.includes('/subject/play')).url.includes('ep=2'));
-  assert.equal(requests.find(r=>r.url.includes('/subject/play')).options.headers.authorization,'Bearer guest');
-  assert.match(requests.find(r=>r.url.includes('/subject/play')).url,/^https:\/\/h5-api\.aoneroom\.com\//);
+  assert.equal(requests.find(r=>r.url.includes('/subject/play')).options.headers.authorization,undefined);
+  assert.match(requests.find(r=>r.url.includes('/subject/play')).url,/^https:\/\/player\.example\//);
   await assert.rejects(adapter.resolve(results[0],0,2),/valid season/);
 });
 
@@ -665,18 +665,18 @@ test('MovieBox keeps short series episodes instead of discarding them as trailer
  assert.equal(result.streams.length,1);assert.equal(result.streams[0].duration,180);
 });
 
-test('MovieBox tries fixed BFF playback and keeps bearer off player-domain fallback',async()=>{
+test('MovieBox tries player first and falls back to fixed BFF without leaking bearer',async()=>{
  const calls=[];const adapter=require('./moviebox')({safeUrl:u=>new URL(u),request:async(url,options={})=>{
   calls.push({url,options});
   if(url.includes('/home?'))return {headers:{get:()=>'{"token":"guest"}'}};
   if(url.includes('/get-domain'))return {json:{data:'https://player.example'}};
-  if(url.startsWith('https://h5-api.aoneroom.com/') && url.includes('/subject/play'))return {json:{data:{streams:[]}}};
-  if(url.startsWith('https://player.example/') && url.includes('/subject/play'))return {json:{data:{streams:[{url:'https://cdn.example/ep.mp4',duration:2600}]}}};
+  if(url.startsWith('https://player.example/') && url.includes('/subject/play'))return {json:{data:{streams:[]}}};
+  if(url.startsWith('https://h5-api.aoneroom.com/') && url.includes('/subject/play'))return {json:{data:{streams:[{url:'https://cdn.example/ep.mp4',duration:2600}]}}};
   throw Error('unexpected request');
  }});
  const result=await adapter.resolve({type:'series',subjectId:'123',detailPath:'show',title:'Show'},1,1);
  assert.equal(result.streams.length,1);const bff=calls.find(x=>x.url.startsWith('https://h5-api.aoneroom.com/') && x.url.includes('/subject/play'));const player=calls.find(x=>x.url.startsWith('https://player.example/'));
- assert.equal(bff.options.headers.authorization,'Bearer guest');assert.match(bff.url,/se=1&ep=1/);assert.match(bff.url,/host=moviebox.ph/);assert.equal(player.options.headers.authorization,undefined);
+ assert.ok(calls.indexOf(player)<calls.indexOf(bff));assert.equal(bff.options.headers.authorization,'Bearer guest');assert.match(bff.url,/se=1&ep=1/);assert.match(bff.url,/host=moviebox.ph/);assert.equal(player.options.headers.authorization,undefined);
 });
 
 test('real FFmpeg keeps converting past 20 minutes without player progress', {skip:!testFfmpeg,timeout:60000},async()=>{

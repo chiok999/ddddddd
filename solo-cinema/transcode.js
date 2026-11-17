@@ -183,7 +183,7 @@ function createTranscoder({open, openHlsResource, safeUrl=require('./network').s
       const timer=setTimeout(()=>job.controller.abort(),30000);let response;
       try{response=await open(source,job.controller.signal);}finally{clearTimeout(timer);}
       if(job.stopped){await response.body?.cancel();throw Error('Transcode stopped');}
-      if(response.status!==200 || !response.body){await response.body?.cancel().catch(()=>{});throw Error(response.status===426?'Source returned 426 before conversion (upstream requested a protocol upgrade)':`Source returned ${response.status}`);}
+      if(response.status!==200 || !response.body){await response.body?.cancel().catch(()=>{});throw Error(`Source returned ${response.status}`);}
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';
       if(encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Source returned compressed content; uncompressed video or HLS is required');}
       if(/text\/html|application\/(?:json|problem\+json)/i.test(type)){await response.body.cancel().catch(()=>{});throw Error('Source returned HTML or JSON instead of video or HLS');}
