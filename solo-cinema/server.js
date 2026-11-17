@@ -96,7 +96,7 @@ const server = http.createServer(async (req, res) => {
       const b = crypto.createHash('sha256').update(password).digest();
       if (!crypto.timingSafeEqual(a, b)) { loginFailures.push(Date.now()); return send(res, 401, { error: 'Incorrect password' }); }
       loginFailures = [];
-      if (sid) sessions.delete(sid);
+      if (sid) { sessions.delete(sid); await transcoder.stopSession(sid); }
       const token = crypto.randomBytes(32).toString('base64url'); sessions.set(token, Date.now() + 24 * 3600000);
       res.setHeader('Set-Cookie', `cinema=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : ''}`);
       return send(res, 200, { ok: true });
@@ -143,6 +143,9 @@ const server = http.createServer(async (req, res) => {
       if (selected.item.source === 'kisskh') {
         const list = await kisskh.details(selected.item.kissId);
         return send(res, 200, { episodes:list.map(e => ({ season:1, episode:e.number, title:`Episode ${e.number}` })), source:'KissKh' });
+      }
+      if(selected.item.source==='moviebox'){
+        try{const list=await moviebox.episodes(selected.item);if(list.length)return send(res,200,{episodes:list,source:'MovieBox'});}catch{/* fall back to independent episode metadata */}
       }
       return send(res, 200, { episodes: await episodes(await enrichItem(selected)), source:'Cinemeta / TVMaze' });
     }

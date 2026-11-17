@@ -13,7 +13,13 @@ let transcodeJob=null, transcodeSequence=0, transcodeQueue=Promise.resolve(), la
 function enqueueTranscode(fn){const task=transcodeQueue.then(fn,fn);transcodeQueue=task.catch(()=>{});return task;}
 async function conversionFailed(item,fail){
   const sequence=transcodeSequence;let message='Converted playback failed.';try{const result=await post('/api/transcode/status',{id:item.transcodeId});if(result.error)message=result.error;}catch{}
-  if(current!==item || route!=='watch' || sequence!==transcodeSequence)return;lastTranscodeError=message;fail();
+  if(current!==item || route!=='watch' || sequence!==transcodeSequence)return;
+  lastTranscodeError=message;
+  if(!item.playbackRetried){
+    const position=(item.seekBase || 0)+($('video').currentTime || 0);
+    $('playError').textContent='Playback interrupted; retrying this source…';
+    void playItem({...item,format:'file',seekAt:position,playbackRetried:true,keepUpload:!!uploadTrack,wasPaused:$('video').paused},fail,true,item.isActive);
+  } else fail();
 }
 function stopTranscode(){++transcodeSequence;const pending=pendingRequestId;pendingRequestId=null;if(pending)post('/api/transcode/cancel',{requestId:pending}).catch(()=>{});const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
 
@@ -92,7 +98,7 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     });
     if(!result || !isActive())return;
     transcodeJob=result.id;
-    item={...item,format:'hls',transcodeId:result.id,noResume:true,seekBase:offset,totalDuration:Number.isFinite(result.duration) && result.duration>0 ? result.duration : (Number.isFinite(item.totalDuration)?item.totalDuration:null)};
+    item={...item,isActive,format:'hls',transcodeId:result.id,noResume:true,seekBase:offset,totalDuration:Number.isFinite(result.duration) && result.duration>0 ? result.duration : (Number.isFinite(item.totalDuration)?item.totalDuration:null)};
     const outputUrl=result.url;
     $('playError').textContent=item.totalDuration?'Seeking to an unconverted point restarts conversion and may take time.':'Duration unavailable: seeking is limited to the converted portion.';
     current=item; pendingFailure=null; const keepUpload=!!(item.keepUpload && uploadUrl);subtitleTouched=keepUpload; if(uploadUrl && !keepUpload){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
@@ -181,13 +187,16 @@ $('video').ontimeupdate=()=>{ if(!current || current.noResume || Date.now()-last
 $('video').onerror=()=>{ if(current && pendingFailure && $('video').currentSrc) { const fail=pendingFailure, item=current; pendingFailure=null; void conversionFailed(item,fail); } };
 api('/api/session').then(x=>loggedIn(x.authenticated)).catch(()=>loggedIn(false));
 
+function catalogMatches(a,b){return a.kind==='catalog' && a.title===b.title && a.type===b.type && (a.year||'')===(b.year||'') && (a.source||'')===(b.source||'');}
+function updateCatalogSave(){const saved=selected && load('solo-watchlist').some(x=>catalogMatches(x,selected));$('saveTitle').textContent=saved?'Remove from watchlist':'Add to watchlist';$('saveTitle').setAttribute('aria-pressed',String(!!saved));}
+$('saveTitle').onclick=()=>{if(!selected)return;const list=load('solo-watchlist'),index=list.findIndex(x=>catalogMatches(x,selected));if(index>=0)list.splice(index,1);else list.unshift({kind:'catalog',title:selected.title,type:selected.type,year:selected.year || '',source:selected.source || ''});save('solo-watchlist',list);updateCatalogSave();render();};
 async function selectTitle(item) {
-  selected=item; episodes=[]; $('season').value='1'; $('episode').value='1'; updateNext(); $('selectedTitle').textContent=item.title; $('overview').textContent=item.overview;
+  selected=item; updateCatalogSave(); episodes=[]; $('season').value='1'; $('episode').value='1'; updateNext(); $('selectedTitle').textContent=item.title; $('overview').textContent=item.overview;
   $('episodeFields').classList.toggle('hidden', item.type!=='series'); $('episodeCatalog').classList.add('hidden'); $('selection').classList.remove('hidden'); $('streams').replaceChildren(); $('providersNotice').textContent=''; $('findStreams').textContent=item.type==='series'?'Play selected episode':'Play again';
   if(item.type==='series') {
     $('season').value='1'; $('episode').value='1';
-    $('episodeNotice').textContent='Loading episode list…'; $('episodeCatalog').classList.remove('hidden'); $('episodeSelect').replaceChildren();
-    try { const data=await post('/api/episodes',{id:item.id}); if(selected!==item) return; episodes=data.episodes.slice().sort((a,b)=>a.season-b.season || a.episode-b.episode); for(const e of episodes){ const option=new Option(`S${e.season} E${e.episode} · ${e.title}`, `${e.season}:${e.episode}`); $('episodeSelect').add(option); } $('episodeNotice').textContent=data.episodes.length ? `Episode data from ${data.source}; you can also enter numbers below.` : 'No episode list available; enter numbers below.'; if(data.episodes.some(e=>e.season===1 && e.episode===1)) $('episodeSelect').value='1:1'; updateNext(); } catch { if(selected===item) $('episodeNotice').textContent='Episode list unavailable; enter numbers below.'; }
+    $('episodeNotice').textContent='Loading episode list…'; $('episodeCatalog').classList.remove('hidden'); $('episodeSelect').replaceChildren(new Option('Loading…','')); $('episodeSelect').disabled=true;
+    try { const data=await post('/api/episodes',{id:item.id}); if(selected!==item) return; $('episodeSelect').replaceChildren(); episodes=data.episodes.slice().sort((a,b)=>a.season-b.season || a.episode-b.episode); for(const e of episodes){ const option=new Option(`S${e.season} E${e.episode} · ${e.title}`, `${e.season}:${e.episode}`); $('episodeSelect').add(option); } $('episodeSelect').disabled=!episodes.length; if(!episodes.length) $('episodeSelect').add(new Option('No episode list available','')); $('episodeNotice').textContent=data.episodes.length ? `Episode data from ${data.source}; availability may vary. You can also enter numbers below.` : 'No episode list available; enter numbers below.'; if(data.episodes.some(e=>e.season===1 && e.episode===1)) $('episodeSelect').value='1:1'; updateNext(); } catch { if(selected===item){$('episodeSelect').replaceChildren(new Option('Episode list unavailable','')); $('episodeSelect').disabled=true; $('episodeNotice').textContent='Episode list unavailable; enter numbers below.';} }
   }
 }
 async function searchTitles(query, saved = null) {

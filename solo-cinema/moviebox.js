@@ -43,6 +43,19 @@ module.exports = function createMoviebox({ request, safeUrl }) {
       return { subjectId, detailPath, title, type: st === 2 ? 'series' : 'movie', year: String(s?.releaseDate || '').slice(0,4), overview: String(s?.description || '').slice(0,1000), imdbId: /^tt\d{1,12}$/.test(String(s?.imdbId || '')) ? String(s.imdbId) : null, tmdbId: /^\d{1,12}$/.test(String(s?.tmdbId || '')) ? String(s.tmdbId) : null };
     }).filter(Boolean);
   }
+  async function episodes(item) {
+    if(item?.type!=='series' || typeof item.detailPath!=='string' || !item.detailPath || item.detailPath.length>512)return [];
+    const response=await request(`${base}/detail?${new URLSearchParams({detailPath:item.detailPath})}`,{headers,timeoutMs:7000});
+    const data=response.json?.data, subject=data?.subject;
+    if(String(subject?.subjectId || '')!==String(item.subjectId || '') || Number(subject?.subjectType)!==2)return [];
+    const seasons=Array.isArray(data?.resource?.seasons)?data.resource.seasons:[];const result=[],seen=new Set();
+    for(const row of seasons.slice(0,100)){
+      const season=Number(row?.se),max=Number(row?.maxEp);
+      if(!Number.isInteger(season)||season<1||season>999||!Number.isInteger(max)||max<1||max>9999||seen.has(season))continue;
+      seen.add(season);for(let episode=1;episode<=max && result.length<5000;episode++)result.push({season,episode,title:`Episode ${episode}`});
+    }
+    return result;
+  }
   async function resolve(item, season, episode) {
     if (!item || !['series','movie'].includes(item.type)) throw Error('Invalid catalog item');
     if (item.type === 'series' && (!Number.isInteger(season) || season < 1 || season > 999 || !Number.isInteger(episode) || episode < 1 || episode > 9999)) throw Error('Choose a valid season and episode');
@@ -110,5 +123,5 @@ module.exports = function createMoviebox({ request, safeUrl }) {
     }
     return null;
   }
-  return { search, resolve, subtitle, home };
+  return { search, resolve, subtitle, home, episodes };
 };
