@@ -57,12 +57,18 @@ function bundledFfmpeg(platform=process.platform,arch=process.arch,report=proces
   const name=`@seydx/node-av-ffmpeg-light-linux-${arch}${libc==='musl'?'-musl':''}`;
   try{const executable=path.join(path.dirname(require.resolve(`${name}/package.json`)),'ffmpeg');return fs.existsSync(executable)?executable:null;}catch{return null;}
 }
-function ffmpegCandidates(platform=process.platform,arch=process.arch,bundled=bundledFfmpeg()){
+// Software-only ARM64 build from npm; no Rockchip runtime initialization.
+function softwareFfmpeg(platform=process.platform,arch=process.arch){
+  if(platform!=='linux' || arch!=='arm64')return null;
+  try{const executable=path.join(path.dirname(require.resolve('@content-forge/ffmpeg-linux-arm64/package.json')),'ffmpeg');return fs.existsSync(executable)?executable:null;}catch{return null;}
+}
+const ffmpegOptions=new Map();
+function ffmpegCandidates(platform=process.platform,arch=process.arch,bundled=bundledFfmpeg(),software=softwareFfmpeg()){
   if(process.env.CINEMA_FFMPEG)return [{label:'Configured FFmpeg',path:process.env.CINEMA_FFMPEG}];
   const system={label:'System FFmpeg',path:'ffmpeg'},packaged=bundled?{label:'Bundled FFmpeg',path:bundled}:null;
   // The ARM64 bundle links Rockchip MPP, whose initializers can write to
   // system logs even for software-only jobs on non-Rockchip machines.
-  if(platform==='linux' && arch==='arm64')return [system,...(packaged?[packaged]:[])];
+  if(platform==='linux' && arch==='arm64')return [...(software?[{label:'Software FFmpeg',path:software}]:[]),system,...(packaged?[packaged]:[])];
   return [...(packaged?[packaged]:[]),system];
 }
 function executableError(error){
@@ -92,14 +98,54 @@ async function probeFfmpeg(executable){
   const hls=await probeCommand(executable,['-hide_banner','-h','muxer=hls']);
   if(!/\btemp_file\b/.test(hls))throw Error('FFmpeg HLS muxer lacks temp_file support');
   const demuxer=await probeCommand(executable,['-hide_banner','-h','demuxer=hls']);
-  for(const option of ['allowed_extensions','allowed_segment_extensions','extension_picky','seg_max_retry'])if(!new RegExp(`\\b${option}\\b`).test(demuxer))throw Error(`FFmpeg HLS demuxer lacks ${option} support`);
+  for(const option of ['allowed_extensions','seg_max_retry'])if(!demuxer.includes(`-${option}`))throw Error(`FFmpeg HLS demuxer lacks ${option} support`);
+  // FFmpeg builds differ: Jellyfin adds these optional segment extension checks.
+  // All HLS references still pass through the private validating relay.
+  ffmpegOptions.set(executable,{allowedSegmentExtensions:demuxer.includes('-allowed_segment_extensions'),extensionPicky:demuxer.includes('-extension_picky')});
 }
 
-async function chooseFfmpeg(candidates){const failures=[];for(const candidate of candidates){try{await probeFfmpeg(candidate.path);return candidate.path;}catch(err){failures.push(`${candidate.label}: ${err.message}`);}}throw Error(failures.join('; '));}
+// Verify the optional software build actually decodes on this host; capability
+// listings alone cannot detect incompatible CPU/kernel/static builds.
+function binaryRun(executable,args,input){return new Promise((resolve,reject)=>{
+  const child=spawn(executable,args,{stdio:['pipe','pipe','pipe'],shell:false});let data=[],size=0,finished=false;
+  const timer=setTimeout(()=>{child.kill('SIGKILL');done(Error('FFmpeg software test timed out'));},10000);
+  function done(error,result){if(finished)return;finished=true;clearTimeout(timer);error?reject(error):resolve(result);}
+  child.stdout.on('data',chunk=>{size+=chunk.length;if(size>2*1024*1024){child.kill('SIGKILL');done(Error('FFmpeg software test output exceeded limit'));}else data.push(chunk);});
+  child.stderr.resume();child.stdin.on('error',()=>{});child.on('error',err=>done(Error(executableError(err))));
+  child.on('close',(code,signal)=>{if(code!==0)return done(Error(`FFmpeg software test failed (${signal || code})`));done(null,Buffer.concat(data));});
+  child.stdin.end(input);
+});}
+async function probeSoftwareFfmpeg(executable){
+  const encoded=await binaryRun(executable,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=64x64:rate=1','-frames:v','1','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-f','mpegts','pipe:1']);
+  if(!encoded.length)throw Error('FFmpeg software test produced no video');
+  const decoded=await binaryRun(executable,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-frames:v','1','-pix_fmt','rgb24','-f','rawvideo','pipe:1'],encoded);
+  if(decoded.length!==64*64*3)throw Error('FFmpeg software test could not decode video');
+  const http=require('node:http');const server=http.createServer((req,res)=>{
+    if(req.url==='/index.m3u8'){res.writeHead(200,{'content-type':'application/vnd.apple.mpegurl'});res.end('#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nsegment.ts\n#EXT-X-ENDLIST\n');}
+    else if(req.url==='/segment.ts'){res.writeHead(200,{'content-type':'video/mp2t'});res.end(encoded);}else res.writeHead(404).end();
+  });
+  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
+  try{
+    const features=ffmpegOptions.get(executable)||{};
+    const picture=await binaryRun(executable,['-hide_banner','-loglevel','error','-protocol_whitelist','http,tcp,crypto','-format_whitelist','hls,mpegts,mov,aac,mp3','-allowed_extensions','ALL',...(features.allowedSegmentExtensions?['-allowed_segment_extensions','ALL']:[]),...(features.extensionPicky?['-extension_picky','0']:[]),'-seg_max_retry','3','-f','hls','-i',`http://127.0.0.1:${server.address().port}/index.m3u8`,'-frames:v','1','-pix_fmt','rgb24','-f','rawvideo','pipe:1']);
+    if(picture.length!==64*64*3)throw Error('FFmpeg software HLS test could not decode video');
+  }finally{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));}
+}
+async function chooseFfmpeg(candidates){const failures=[];for(const candidate of candidates){try{await probeFfmpeg(candidate.path);if(candidate.label==='Software FFmpeg')await probeSoftwareFfmpeg(candidate.path);return candidate.path;}catch(err){failures.push(`${candidate.label}: ${err.message}`);}}throw Error(failures.join('; '));}
 
 function createTranscoder({open, openHlsResource, safeUrl=require('./network').safeUrl, executable, tmpdir=os.tmpdir(), startupMs=45000, authorize=()=>true}={}){
   const jobs=new Map(),failures=new Map();let admission=Promise.resolve(),binaryPromise=null;
-  function getBinary(){if(!binaryPromise)binaryPromise=chooseFfmpeg(executable?[{label:'FFmpeg',path:executable}]:ffmpegCandidates()).catch(err=>{binaryPromise=null;throw err;});return binaryPromise;}
+  function getBinary(){
+    if(!binaryPromise){
+      const candidates=executable?[{label:'FFmpeg',path:executable}]:ffmpegCandidates();
+      binaryPromise=chooseFfmpeg(candidates).then(binary=>{
+        if(!executable)console.log(`Troy FFmpeg: ${candidates.find(candidate=>candidate.path===binary)?.label || 'selected'}`);
+        if(!executable && !process.env.CINEMA_FFMPEG && process.platform==='linux' && process.arch==='arm64' && binary===bundledFfmpeg())console.warn('Troy: software-only FFmpeg unavailable or incompatible; using Rockchip-enabled fallback.');
+        return binary;
+      }).catch(err=>{binaryPromise=null;throw err;});
+    }
+    return binaryPromise;
+  }
   // Reap abandoned private directories after a crash, without touching a live Troy process.
   async function reap(){
     for(const name of await fsp.readdir(tmpdir).catch(()=>[])){
@@ -150,7 +196,8 @@ function createTranscoder({open, openHlsResource, safeUrl=require('./network').s
       if(isHls){if(!openHlsResource){await body.cancel().catch(()=>{});throw Error('HLS input unavailable');}job.relay=await createHlsInput({source,first:response,fetchResource:openHlsResource,openRoot:open,signal:job.controller.signal,safeUrl});if(job.stopped)throw Error('Transcode stopped');}
       const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,'-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames','expr:gte(t,n_forced*4)','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
       const pacing=seekOffset>0?['-ss',String(seekOffset)]:[];
-      const input=isHls?['-protocol_whitelist','http,tcp,crypto','-format_whitelist','hls,mpegts,mov,aac,mp3','-allowed_extensions','ALL','-allowed_segment_extensions','ALL','-extension_picky','0','-seg_max_retry','3','-f','hls','-i',job.relay.url]:['-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0'];
+      const features=ffmpegOptions.get(binary) || {};
+      const input=isHls?['-protocol_whitelist','http,tcp,crypto','-format_whitelist','hls,mpegts,mov,aac,mp3','-allowed_extensions','ALL',...(features.allowedSegmentExtensions?['-allowed_segment_extensions','ALL']:[]),...(features.extensionPicky?['-extension_picky','0']:[]),'-seg_max_retry','3','-f','hls','-i',job.relay.url]:['-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0'];
       const args=['-hide_banner','-loglevel','error','-nostdin',...pacing,...input,...output(426,240,'250k','48k','240'),...output(640,360,'600k','64k','360')];
       job.proc=spawn(binary,args,{stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
@@ -179,4 +226,4 @@ function createTranscoder({open, openHlsResource, safeUrl=require('./network').s
   function status(id,sid){const job=jobs.get(id);if(job && job.sid===sid && !job.stopped){job.lastAccess=Date.now();return {active:true,error:null,paused:false};}const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
   return {start,read,stopFor,stopRequest,stopSession,stopAny,status,close:()=>stopAny()};
 }
-module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg};
+module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,softwareFfmpeg,ffmpegCandidates,probeFfmpeg,probeSoftwareFfmpeg,chooseFfmpeg};

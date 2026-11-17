@@ -23,6 +23,7 @@
     "jsdom": "^26.1.0"
   },
   "optionalDependencies": {
+    "@content-forge/ffmpeg-linux-arm64": "6.1.1",
     "@seydx/node-av-ffmpeg-light-linux-arm64": "7.1.0",
     "@seydx/node-av-ffmpeg-light-linux-arm64-musl": "7.1.0",
     "@seydx/node-av-ffmpeg-light-linux-x64": "7.1.0",
