@@ -4,8 +4,9 @@ let hls = null, current = null, lastSave = 0, selected = null, externalTrack = n
 const load = key => { try { return JSON.parse(localStorage.getItem(key)) || []; } catch { return []; } };
 const save = (key, value) => localStorage.setItem(key, JSON.stringify(value));
 async function api(url, options = {}) {
-  const response = await fetch(url, options); const result = await response.json();
-  if (!response.ok) throw new Error(result.error || 'Request failed'); return result;
+  const response = await fetch(url, options); let result;
+  try{result=await response.json();}catch{throw new Error(`Request failed (HTTP ${response.status || 'unknown'})`);}
+  if (!response.ok) throw new Error(result.error || `Request failed (HTTP ${response.status || 'unknown'})`); return result;
 }
 const post = (url, data) => api(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(data) });
 let route='home', resolveSequence=0, watchReturn='search', discoveryEpoch=0;
@@ -77,9 +78,14 @@ function render() {
 function formItem() { return { title:$('title').value.trim(), url:$('url').value.trim(), format:$('format').value }; }
 $('save').onclick=()=>{ if (!$('sourceForm').reportValidity()) return; const item=formItem(), list=load('solo-watchlist'); if (!list.some(x=>x.kind!=='catalog' && x.url===item.url)) list.unshift(item); save('solo-watchlist', list); render(); };
 $('sourceForm').onsubmit=e=>{ e.preventDefault(); stopTranscode(); ++resolveSequence; selected=null; directControls(true);  updateNext(); showRoute('watch'); $('selection').classList.add('hidden'); fallback.play([formItem()]); };
+// Session-only observations: a 'playing' event means playback started, not
+// that a provider is permanently healthy. New providers retain a neutral prior.
+const providerStats=new Map();
+function scoreProvider(name){const stat=providerStats.get(name);return stat?(stat.ok+1)/(stat.ok+stat.fail+2):0.5;}
+function recordProvider(name,success){if(!name)return;const stat=providerStats.get(name)||{ok:0,fail:0};if(stat.ok+stat.fail>=20){stat.ok=Math.floor(stat.ok/2);stat.fail=Math.floor(stat.fail/2);}stat[success?'ok':'fail']++;providerStats.set(name,stat);}
 const fallback = createFallback((item, index, total, fail, isActive) => {
   $('playError').textContent=index ? `Trying another source (${index+1}/${total})…` : '';
-  playItem(item, fail, index>0, isActive);
+  playItem(item, ()=>{if(isActive()){recordProvider(item.provider,false);fail();}}, index>0, isActive);
 }, () => { pendingFailure=null; stopTranscode(); if(hls){hls.destroy();hls=null;} const video=$('video');video.pause();video.removeAttribute('src');video.load(); $('playError').textContent='Unable to transcode any available source. '+lastTranscodeError; });
 async function playItem(item, fail, isFallback = false, isActive = () => true) {
   stopTranscode(); const sequence=transcodeSequence; const oldVideo=$('video'); if(hls){hls.destroy();hls=null;} oldVideo.pause();oldVideo.removeAttribute('src');oldVideo.load();
@@ -102,7 +108,7 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     });
     if(!result || !isActive())return;
     transcodeJob=result.id;
-    item={...item,isActive,format:'hls',transcodeId:result.id,noResume:true,seekBase:offset,totalDuration:Number.isFinite(result.duration) && result.duration>0 ? result.duration : (Number.isFinite(item.totalDuration)?item.totalDuration:null)};
+    item={...item,isActive,reliabilityRecorded:false,format:'hls',transcodeId:result.id,noResume:true,seekBase:offset,totalDuration:Number.isFinite(result.duration) && result.duration>0 ? result.duration : (Number.isFinite(item.totalDuration)?item.totalDuration:null)};
     const outputUrl=result.url;
     $('playError').textContent=item.totalDuration?'Seeking to an unconverted point restarts conversion and may take time.':'Duration unavailable: seeking is limited to the converted portion.';
     current=item; pendingFailure=null; const keepUpload=!!(item.keepUpload && uploadUrl);subtitleTouched=keepUpload; if(uploadUrl && !keepUpload){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
@@ -190,6 +196,7 @@ $('subtitleFile').onchange=async()=>{
     $('subtitles').querySelector('option[value="upload"]')?.remove(); $('subtitles').add(new Option('Uploaded subtitles','upload')); $('subtitles').value='upload'; $('subtitles').dispatchEvent(new Event('change')); const track=uploadTrack; track.addEventListener('load',()=>{if(uploadTrack===track && $('subtitles').value==='upload') {shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}}); $('playError').textContent='';
   } catch { if(current===item) $('playError').textContent='Could not read that subtitle file.'; }
 };
+$('video').addEventListener('playing',()=>{if(current && !current.reliabilityRecorded){current.reliabilityRecorded=true;recordProvider(current.provider,true);}});
 $('video').ontimeupdate=()=>{ if(!current || Date.now()-lastSave<5000) return; const key=current.progressKey || current.url;if(!key)return;lastSave=Date.now(); const progress=load('solo-progress').filter(x=>x.url!==key); progress.unshift({url:key,time:(current.seekBase||0)+($('video').currentTime||0)}); save('solo-progress', progress.slice(0,100)); };
 $('video').onerror=()=>{ if(current && pendingFailure && $('video').currentSrc) { const fail=pendingFailure, item=current; pendingFailure=null; void conversionFailed(item,fail); } };
 api('/api/session').then(x=>loggedIn(x.authenticated)).catch(()=>loggedIn(false));
@@ -244,7 +251,7 @@ async function findStreams(autoplay = false) {
     const unsupported=data.streams.filter(s=>s.format==='hls');
     $('providersNotice').textContent=[...data.providers.map(p=>`${p.provider}: ${p.count ? p.count+' stream(s)' : (p.error || 'no streams')}`),...(unsupported.length?[`${unsupported.length} HLS source(s) cannot be converted`]:[])].join(' · ');
     const items=data.streams.filter(s=>s.format!=='hls').map(stream=>({title:`${data.title}${chosen.type === 'series' ? ` S${season} E${episode}` : ''}`,proxy:stream.url,format:stream.format,subtitleRequest:chosen.source==='kisskh'?{path:'/api/kiss-subtitle',data:{id:chosen.id,season,episode}}:stream.captionId?{path:stream.provider.startsWith('movy:')?'/api/movy-subtitle':stream.provider==='7movies'?'/api/vidlink-subtitle':'/api/moviebox-subtitle',data:{id:stream.captionId}}:null,progressKey:`${chosen.source}:${chosen.title}:${chosen.year}:${chosen.type}:${season}:${episode}`,provider:stream.provider,quality:stream.quality,context:chosen.type==='series'?{id:chosen.id,season,episode}:null}));
-    items.sort((a,b)=>(a.quality || Infinity)-(b.quality || Infinity)); items.forEach(item=>{item.variants=items;});
+    items.sort((a,b)=>scoreProvider(b.provider)-scoreProvider(a.provider) || (a.quality || Infinity)-(b.quality || Infinity)); items.forEach(item=>{item.variants=items;});
     for(let i=0;i<items.length;i++){
       const item=items[i], btn=document.createElement('button'); btn.textContent=`${item.provider} · ${item.quality ? item.quality+'p' : 'Auto'} · ${item.format.toUpperCase()}`;
       btn.onclick=()=>fallback.play([item,...items.filter((_,n)=>n!==i)]);

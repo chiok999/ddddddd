@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { Agent, fetch } = require('undici');
 const { safeUrl, publicLookup, getRemote } = require('./network');
 const { describe } = require('./diagnostics');
+const {scope:providerScope}=require('./provider-timeout');
 
 // Botkeep writes variables to .env rather than exporting them. Node loads the
 // file from the process working directory without overriding real environment
@@ -16,19 +17,17 @@ catch (err) { if (err.code !== 'ENOENT') { console.error('Unable to load .env fi
 const password = process.env.CINEMA_PASSWORD || '';
 if (password.length < 12) { console.error('Set CINEMA_PASSWORD to at least 12 characters.'); process.exit(1); }
 const sessions = new Map();
-const sources = new Map();
-let loginFailures = [];
+const sources = require('./source-store').createSourceStore();
+const loginLimiter=require('./login-limiter').createLoginLimiter();
 let activeRangeProbes = 0;
 const catalog = new Map();
 const captions = new Map();
 const captionSources = new Map();
 const agent = new Agent({ connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
-function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null) {
-  if (sources.size > 10000) for (const [id, entry] of sources) { if (entry.expires < Date.now()) sources.delete(id); }
-  if (sources.size > 12000) fail('Too many media links; restart the server');
+function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null, refreshAfterMs = null) {
   const id = crypto.randomBytes(24).toString('base64url');
-  sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, refresh, expires: Date.now() + 6 * 3600000 });
+  sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, refresh, refreshAt:Number.isFinite(refreshAfterMs) && refreshAfterMs>0 ? Date.now()+refreshAfterMs : null, expires: Date.now() + 6 * 3600000 });
   return `/media/${id}`;
 }
 // Informational only: never prevent playback based on storage detection.
@@ -41,7 +40,8 @@ const transcoder=require('./transcode').createTranscoder({open:openSource,tmpdir
 async function providerRequest(url, opts = {}) {
   safeUrl(url);
   const { timeoutMs = 15000, ...fetchOpts } = opts;
-  const response = await fetch(url, { ...fetchOpts, dispatcher: agent, redirect: 'manual', signal: AbortSignal.timeout(Math.max(1, Math.min(15000, timeoutMs))) });
+  const signals=[AbortSignal.timeout(Math.max(1, Math.min(15000, timeoutMs))),providerScope.getStore(),fetchOpts.signal].filter(Boolean);
+  const response = await fetch(url, { ...fetchOpts, dispatcher: agent, redirect: 'manual', signal: AbortSignal.any(signals) });
   if (!response.ok) { await response.body?.cancel(); throw Object.assign(new Error(`Provider HTTP ${response.status}`), { status: response.status }); }
   const reader = response.body.getReader(); const chunks = []; let total = 0;
   while (true) {
@@ -67,12 +67,12 @@ async function enrichItem(entry) {
   if (!entry.enriched) { entry.enriched = await enrich(entry.item).catch(() => entry.item); }
   return entry.enriched;
 }
-async function resolveTitle(selected, season, episode) {
+async function resolveTitle(selected, season, episode, onlyProvider=null) {
   if (selected.item.source === 'kisskh') {
     try { const r=await kisskh.resolve(selected.item,season,episode);return {streams:r.streams.map(s=>({...s,provider:'kisskh',referer:r.referer,origin:r.origin})),providers:[{provider:'kisskh',count:r.streams.length,error:null}]}; }
     catch(err){return {streams:[],providers:[{provider:'kisskh',count:0,error:String(err?.message || 'Unavailable').slice(0,160)}]};}
   }
-  return resolveProviders({moviebox,providers,movy,vidlink,item:await enrichItem(selected),season,episode});
+  return resolveProviders({moviebox,providers,movy,vidlink,item:await enrichItem(selected),season,episode,onlyProvider});
 }
 async function body(req, max = 16384) {
   const chunks = []; let size = 0;
@@ -100,13 +100,13 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'POST' && !sameOrigin(req)) return send(res, 403, { error: 'Origin rejected' });
     if (url.pathname === '/api/login' && req.method === 'POST') {
-      loginFailures = loginFailures.filter(t => t > Date.now() - 60000);
-      if (loginFailures.length >= 8) return send(res, 429, { error: 'Too many attempts; wait a minute' });
+      const peer=req.socket.remoteAddress || 'unknown';
+      if (loginLimiter.blocked(peer)) return send(res, 429, { error: 'Too many attempts; wait a minute' });
       const submitted = (await body(req)).password;
       const a = crypto.createHash('sha256').update(typeof submitted === 'string' ? submitted : '').digest();
       const b = crypto.createHash('sha256').update(password).digest();
-      if (!crypto.timingSafeEqual(a, b)) { loginFailures.push(Date.now()); return send(res, 401, { error: 'Incorrect password' }); }
-      loginFailures = [];
+      if (!crypto.timingSafeEqual(a, b)) { loginLimiter.failure(peer); return send(res, 401, { error: 'Incorrect password' }); }
+      loginLimiter.success(peer);
       if (sid) { sessions.delete(sid); await transcoder.stopSession(sid); }
       const token = crypto.randomBytes(32).toString('base64url'); sessions.set(token, Date.now() + 24 * 3600000);
       res.setHeader('Set-Cookie', `cinema=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : ''}`);
@@ -206,11 +206,11 @@ const server = http.createServer(async (req, res) => {
         let captionId=null;
         if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
         const refresh=async()=>{
-          const refreshed=await resolveTitle(selected,season,episode);
+          const refreshed=await resolveTitle(selected,season,episode,stream.provider);
           const matching=refreshed.streams.filter(s=>s.provider===stream.provider && s.format===stream.format && s.quality===stream.quality);
           return matching.length===1?matching[0]:null;
         };
-        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 && stream.duration<=86400 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent, refresh) };
+        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 && stream.duration<=86400 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent, refresh, stream.refreshAfterMs) };
       });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }

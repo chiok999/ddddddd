@@ -21,8 +21,9 @@ module.exports = function createVidlink({request,safeUrl}) {
     const captions=Array.isArray(data.captions)?data.captions:Array.isArray(response.json?.captions)?response.json.captions:[];
     const sub=captions.find(c=>/^(?:en|eng|english)(?:$|[-_\s])/i.test(String(c?.language||c?.label||c?.name||''))); let captionInfo=null;
     if(sub) try { captionInfo={url:safeUrl(sub.url).href}; } catch {}
+    const ttl=Number(data.TTL);const refreshAfterMs=Number.isFinite(ttl) && ttl>0 && ttl<=604800?Math.min(2700000,Math.floor(ttl*750)):null;
     const streams=[], seen=new Set();
-    function add(raw,format,quality,headers){try{const url=safeUrl(raw).href;if(seen.has(url))return;seen.add(url); streams.push({url,format,quality,...remoteHeaders(headers)});}catch{}}
+    function add(raw,format,quality,headers){try{const url=safeUrl(raw).href;if(seen.has(url))return;seen.add(url); streams.push({url,format,quality,refreshAfterMs,...remoteHeaders(headers)});}catch{}}
     if(data.qualities && typeof data.qualities==='object') for(const [key,row] of Object.entries(data.qualities).slice(0,30)){
       if(!row || typeof row.url!=='string')continue;const q=/(\d{3,4})/.exec(key);const format=/hls|m3u8/i.test(String(row.type||''))||/\.m3u8(?:$|\?)/i.test(row.url)?'hls':'file';
       add(row.url,format,q?Number(q[1]):/4k/i.test(key)?2160:0,{...data.headers,...row.headers});

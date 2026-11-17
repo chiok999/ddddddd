@@ -21,13 +21,16 @@ function publicLookup(resolve = dns.lookup) {
 }
 async function getRemote(input, headers, signal, fetch, agent) {
   let url = safeUrl(input);
+  let forwarded=new Headers(headers);
   for (let n = 0; n <= 5; n++) {
-    const response = await fetch(url, { dispatcher: agent, headers, redirect: 'manual', signal });
+    const response = await fetch(url, { dispatcher: agent, headers:forwarded, redirect: 'manual', signal });
     if (![301,302,303,307,308].includes(response.status)) return { response, url };
     const location = response.headers.get('location');
     await response.body?.cancel();
     if (!location || n === 5) throw Error('Invalid redirect');
-    url = safeUrl(new URL(location, url));
+    const next=safeUrl(new URL(location, url));
+    if(next.origin!==url.origin){for(const name of ['authorization','proxy-authorization','cookie','cookie2'])forwarded.delete(name);}
+    url=next;
   }
 }
 module.exports = { safeUrl, publicLookup, getRemote };
