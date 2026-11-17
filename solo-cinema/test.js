@@ -42,7 +42,8 @@ test('MovieBox catalog and streams are normalized and unsafe URLs rejected', asy
   const adapter=create({request,safeUrl}); const results=await adapter.search('A Show'); assert.equal(results.length,1); assert.equal(results[0].type,'series');
   const resolved=await adapter.resolve(results[0],1,2); assert.deepEqual(resolved.streams.map(x=>x.quality),[720,1080]); assert.equal(resolved.streams[0].duration,3600); assert.equal(resolved.streams[1].duration,undefined);
   assert.ok(requests.find(r=>r.url.includes('/subject/play')).url.includes('ep=2'));
-  assert.equal(requests.find(r=>r.url.includes('/subject/play')).options.headers.authorization,undefined);
+  assert.equal(requests.find(r=>r.url.includes('/subject/play')).options.headers.authorization,'Bearer guest');
+  assert.match(requests.find(r=>r.url.includes('/subject/play')).url,/^https:\/\/h5-api\.aoneroom\.com\//);
   await assert.rejects(adapter.resolve(results[0],0,2),/valid season/);
 });
 
@@ -383,7 +384,7 @@ test('transcode API rejects unauthenticated and invalid source requests',async()
  // Reuse an isolated instance: the transcoder only accepts authenticated, session-bound /media handles.
  const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));
  const child=spawn(process.execPath,['server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'a-strong-test-password'},stdio:['ignore','pipe','pipe']});
- try{await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject)});const base=`http://127.0.0.1:${port}`;const post=(p,data,cookie)=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});assert.equal((await post('/api/transcode',{url:'/media/whatever'})).status,401);const login=await post('/api/login',{password:'a-strong-test-password'}),cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await post('/api/transcode',{url:'https://example.com/video'},cookie)).status,400);assert.equal((await post('/api/transcode',{url:'/media/not-yours'},cookie)).status,404);const src=await (await post('/api/source',{url:'https://cdn.example/video.mp4',format:'file'},cookie)).json();assert.equal((await post('/api/transcode',{url:src.url,offset:-1},cookie)).status,400);assert.equal((await post('/api/transcode',{url:src.url,offset:2,requestId:'bad'},cookie)).status,400);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)})).status,401);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)},cookie)).status,200);assert.equal((await fetch(base+'/transcode/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/master.m3u8')).status,401);}finally{child.kill();}
+ try{await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject)});const base=`http://127.0.0.1:${port}`;const post=(p,data,cookie)=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});assert.equal((await post('/api/transcode',{url:'/media/whatever'})).status,401);const login=await post('/api/login',{password:'a-strong-test-password'}),cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await post('/api/transcode',{url:'https://example.com/video'},cookie)).status,400);assert.equal((await post('/api/transcode',{url:'/media/not-yours'},cookie)).status,404);const src=await (await post('/api/source',{url:'https://cdn.example/video.mp4',format:'file'},cookie)).json();assert.equal((await post('/api/transcode',{url:src.url,offset:-1},cookie)).status,400);assert.equal((await post('/api/transcode',{url:src.url,offset:2,requestId:'bad'},cookie)).status,400);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)})).status,401);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)},cookie)).status,200);assert.equal((await post('/api/transcode/status',{id:'a'.repeat(32),playhead:-1},cookie)).status,400);assert.equal((await post('/api/transcode/status',{id:'a'.repeat(32),playhead:0},cookie)).status,404);assert.equal((await fetch(base+'/transcode/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/master.m3u8')).status,401);}finally{child.kill();}
 });
 
 test('transcoder reports missing ffmpeg and rejects playlist content',async()=>{
@@ -661,4 +662,42 @@ test('MovieBox keeps short series episodes instead of discarding them as trailer
  }});
  const result=await adapter.resolve({type:'series',subjectId:'1',detailPath:'show',title:'Show'},1,2);
  assert.equal(result.streams.length,1);assert.equal(result.streams[0].duration,180);
+});
+
+test('MovieBox tries fixed BFF playback and keeps bearer off player-domain fallback',async()=>{
+ const calls=[];const adapter=require('./moviebox')({safeUrl:u=>new URL(u),request:async(url,options={})=>{
+  calls.push({url,options});
+  if(url.includes('/home?'))return {headers:{get:()=>'{"token":"guest"}'}};
+  if(url.includes('/get-domain'))return {json:{data:'https://player.example'}};
+  if(url.startsWith('https://h5-api.aoneroom.com/') && url.includes('/subject/play'))return {json:{data:{streams:[]}}};
+  if(url.startsWith('https://player.example/') && url.includes('/subject/play'))return {json:{data:{streams:[{url:'https://cdn.example/ep.mp4',duration:2600}]}}};
+  throw Error('unexpected request');
+ }});
+ const result=await adapter.resolve({type:'series',subjectId:'123',detailPath:'show',title:'Show'},1,1);
+ assert.equal(result.streams.length,1);const bff=calls.find(x=>x.url.startsWith('https://h5-api.aoneroom.com/') && x.url.includes('/subject/play'));const player=calls.find(x=>x.url.startsWith('https://player.example/'));
+ assert.equal(bff.options.headers.authorization,'Bearer guest');assert.match(bff.url,/se=1&ep=1/);assert.match(bff.url,/host=moviebox.ph/);assert.equal(player.options.headers.authorization,undefined);
+});
+
+test('look-ahead uses finalized durations, hysteresis, and stale-report recovery',()=>{
+ const {playlistDuration,leadAction}=require('./lead-control');
+ assert.equal(playlistDuration('#EXTM3U\n#EXTINF:4.0,\na.ts\n#EXTINF:3.5,\nb.ts\n'),7.5);assert.equal(playlistDuration('#EXTM3U\n#EXTINF:bad,\na.ts\n'),null);
+ const state={paused:false,buffered:1200,playhead:0,lastReport:10,now:20};assert.equal(leadAction(state),'pause');
+ assert.equal(leadAction({...state,paused:true,playhead:30}),null);assert.equal(leadAction({...state,paused:true,playhead:60}),'resume');
+ assert.equal(leadAction({...state,paused:true,now:60011}),'resume');assert.equal(leadAction({...state,paused:false,lastReport:null}),null);
+});
+
+test('real FFmpeg pauses ahead, resumes as playhead advances, and stops cleanly while paused', {skip:!testFfmpeg || !['linux','darwin'].includes(process.platform),timeout:60000},async()=>{
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-lead-')),file=path.join(dir,'source.mp4');let t;
+ try{
+  const made=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=5','-t','180','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:20000});assert.equal(made.status,0,String(made.stderr));
+  t=createTranscoder({tmpdir:dir,executable:testFfmpeg,aheadSeconds:8,leadTickMs:100,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+  const job=await t.start({},'viewer');assert.equal(t.status(job.id,'other',0),null);t.status(job.id,'viewer',0);
+  const wait=async fn=>{const until=Date.now()+12000;while(Date.now()<until){if(fn())return;await new Promise(r=>setTimeout(r,50));}throw Error('look-ahead did not change state');};
+  await wait(()=>t.status(job.id,'viewer')?.paused===true);
+  const before=(await t.read(job.id,'viewer','240/index.m3u8')).data.toString();await new Promise(r=>setTimeout(r,500));const after=(await t.read(job.id,'viewer','240/index.m3u8')).data.toString();assert.equal(after,before);
+  t.status(job.id,'viewer',1000);await wait(()=>t.status(job.id,'viewer')?.paused===false);
+  t.status(job.id,'viewer',0);await wait(()=>t.status(job.id,'viewer')?.paused===true);
+  assert.equal(await t.stopFor(job.id,'viewer'),true);assert.deepEqual(await fsp.readdir(dir),['source.mp4']);
+ }finally{if(t)await t.close();await fsp.rm(dir,{recursive:true,force:true});}
 });
