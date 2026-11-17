@@ -112,6 +112,9 @@ test('media redirects reject private targets before another network request', as
   const { getRemote }=require('./network'); let calls=0;
   const fetch=async()=>{calls++; return {status:302,headers:{get:()=> 'https://127.0.0.1/private'},body:{cancel:async()=>{}}};};
   await assert.rejects(getRemote('https://cdn.example/master',{},undefined,fetch,{}),/public HTTPS/); assert.equal(calls,1);
+  // A non-standard port is refused even for a public name: provider media is
+  // always on 443, and allowing arbitrary ports widens the surface.
+  await assert.rejects(getRemote('https://cdn.example:8443/master',{},undefined,fetch,{}),/public HTTPS/);
 });
 
 test('KissKh token sandbox has no Node globals and interrupts infinite code', async () => {
