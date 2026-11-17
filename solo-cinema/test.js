@@ -394,7 +394,7 @@ test('transcode API rejects unauthenticated and invalid source requests',async()
  // Reuse an isolated instance: the transcoder only accepts authenticated, session-bound /media handles.
  const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));
  const child=spawn(process.execPath,['server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'a-strong-test-password'},stdio:['ignore','pipe','pipe']});
- try{await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject)});const base=`http://127.0.0.1:${port}`;const post=(p,data,cookie)=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});assert.equal((await post('/api/transcode',{url:'/media/whatever'})).status,401);const login=await post('/api/login',{password:'a-strong-test-password'}),cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await post('/api/transcode',{url:'https://example.com/video'},cookie)).status,400);assert.equal((await post('/api/transcode',{url:'/media/not-yours'},cookie)).status,404);assert.equal((await fetch(base+'/transcode/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/master.m3u8')).status,401);}finally{child.kill();}
+ try{await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject)});const base=`http://127.0.0.1:${port}`;const post=(p,data,cookie)=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});assert.equal((await post('/api/transcode',{url:'/media/whatever'})).status,401);const login=await post('/api/login',{password:'a-strong-test-password'}),cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await post('/api/transcode',{url:'https://example.com/video'},cookie)).status,400);assert.equal((await post('/api/transcode',{url:'/media/not-yours'},cookie)).status,404);const src=await (await post('/api/source',{url:'https://cdn.example/video.mp4',format:'file'},cookie)).json();assert.equal((await post('/api/transcode',{url:src.url,offset:-1},cookie)).status,400);assert.equal((await post('/api/transcode',{url:src.url,offset:2,requestId:'bad'},cookie)).status,400);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)})).status,401);assert.equal((await post('/api/transcode/cancel',{requestId:'f'.repeat(32)},cookie)).status,200);assert.equal((await fetch(base+'/transcode/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/master.m3u8')).status,401);}finally{child.kill();}
 });
 
 test('transcoder reports missing ffmpeg and rejects playlist content',async()=>{
@@ -488,4 +488,34 @@ test('production transcoder retains earlier segments throughout an EVENT and fin
    for(const part of [first,last]){const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:part.data,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));}
   }
  }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true});}
+});
+
+test('production transcoder starts a new conversion at an unconverted MP4 timestamp', {skip:!testFfmpeg,timeout:40000},async()=>{
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-offset-')),file=path.join(dir,'source.mp4');
+ const input=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','color=red:s=160x90:r=10:d=10','-f','lavfi','-i','color=blue:s=160x90:r=10:d=10','-f','lavfi','-i','sine=frequency=440:duration=20','-filter_complex','[0:v][1:v]concat=n=2:v=1:a=0[v]','-map','[v]','-map','2:a','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-c:a','aac','-movflags','+faststart',file],{encoding:'utf8',timeout:15000});assert.equal(input.status,0,input.stderr);
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,startupMs:10000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(file))})});
+ try{
+  await assert.rejects(t.start({},'alice',-1),/Invalid seek/);
+  const job=await t.start({},'alice',12);assert.equal(job.offset,12);assert.ok(Math.abs(job.duration-20)<0.1,job.duration);
+  for(const quality of ['240','360']){const list=await t.read(job.id,'alice',`${quality}/index.m3u8`);const first=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${quality}/${first}`);
+   const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-frames:v','1','-vf','scale=2:2','-f','rawvideo','-pix_fmt','rgb24','pipe:1'],{input:segment.data,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));assert.ok(decode.stdout[2]>200 && decode.stdout[0]<30,`first frame should be blue, got ${[...decode.stdout.subarray(0,3)]}`);
+   const audio=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:a:0','-f','null','-'],{input:segment.data,timeout:10000});assert.equal(audio.status,0,String(audio.stderr));}
+  await t.stopFor(job.id,'alice');await assert.rejects(t.start({},'alice',21),/Cannot seek beyond/);
+ }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true});}
+});
+
+test('in-flight conversion cancellation is bound to request and session', {skip:!testFfmpeg,timeout:20000},async()=>{
+ const {createTranscoder}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-cancel-'));let opened;const ready=new Promise(resolve=>opened=resolve);
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async(_source,signal)=>{opened();return new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}))}});
+ try{const start=t.start({},'owner',25,'req1');const result=start.catch(e=>e);await ready;assert.equal(await t.stopRequest('req1','other'),false);assert.equal(await t.stopRequest('req2','owner'),false);assert.equal(await t.stopRequest('req1','owner'),true);assert.match((await result).message,/aborted|stopped/);assert.deepEqual(await fs.readdir(dir),[]);}finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
+});
+
+test('MP4 duration parser handles mvhd versions and rejects unknown or malformed lengths',()=>{
+ const {movieDuration}=require('./transcode');
+ const box=(type,payload)=>{const out=Buffer.alloc(payload.length+8);out.writeUInt32BE(out.length,0);out.write(type,4);payload.copy(out,8);return out;};
+ const v0=Buffer.alloc(20);v0.writeUInt32BE(1000,12);v0.writeUInt32BE(90500,16);const moov0=box('moov',box('mvhd',v0));assert.equal(movieDuration(moov0,0,moov0.length,8),90.5);
+ const v1=Buffer.alloc(32);v1[0]=1;v1.writeUInt32BE(1000,20);v1.writeBigUInt64BE(120000n,24);const moov1=box('moov',box('mvhd',v1));assert.equal(movieDuration(moov1,0,moov1.length,8),120);
+ v1.writeBigUInt64BE(0xffffffffffffffffn,24);const unknown=box('moov',box('mvhd',v1));assert.equal(movieDuration(unknown,0,unknown.length,8),null);
+ const broken=Buffer.from(moov0);broken.writeUInt32BE(0xfffffff0,8);assert.equal(movieDuration(broken,0,broken.length,8),null);
 });

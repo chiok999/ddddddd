@@ -228,7 +228,13 @@ const server = http.createServer(async (req, res) => {
       const data=await body(req);if(typeof data.url!=='string' || !/^\/media\/[A-Za-z0-9_-]+$/.test(data.url)) return send(res,400,{error:'Select an existing direct source'});
       const entry=sources.get(data.url.slice(7));if(!entry || entry.sid!==sid || entry.expires<Date.now())return send(res,404,{error:'Source expired'});
       if(entry.format==='hls')return send(res,400,{error:'Transcoding currently supports direct MP4 sources, not HLS playlists'});
-      try{return send(res,200,await transcoder.start(entry,sid));}catch(e){return send(res,e.status||502,{error:e.message});}
+      if(data.requestId!==undefined && (typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId)))return send(res,400,{error:'Invalid request ID'});
+      try{return send(res,200,await transcoder.start(entry,sid,data.offset===undefined?0:data.offset,data.requestId || null));}catch(e){return send(res,e.status||502,{error:e.message});}
+    }
+    if (url.pathname === '/api/transcode/cancel' && req.method === 'POST') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      const data=await body(req);if(typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId))return send(res,400,{error:'Invalid request ID'});
+      return send(res,200,{stopped:await transcoder.stopRequest(data.requestId,sid)});
     }
     if (url.pathname === '/api/transcode/status' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
