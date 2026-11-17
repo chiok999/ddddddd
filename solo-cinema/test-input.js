@@ -123,6 +123,43 @@ test('a series host that answers 426 to HTTP/1.1 plays once HTTP/2 is offered', 
   assert.equal(seen.length,1);
   // A refusal that names something other than h2 is not retried.
   assert.equal(h2Requested({headers:{get:()=> 'websocket'}}),false);
-  assert.equal(h2Requested({headers:{get:()=> null}}),true);
+  // An absent Upgrade header is ambiguous: only a GET opts into retrying it.
+  assert.equal(h2Requested({headers:{get:()=> null}}),false);
+  assert.equal(h2Requested({headers:{get:()=> null}},{allowMissing:true}),true);
+  assert.equal(h2Requested({headers:{get:()=> 'h2'}}),true);
+ }finally{await h1.close();await h2.close();server.closeAllConnections?.();await new Promise(r=>server.close(r));fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a host that wants HTTP/2 and a player client is satisfied by escalation', async t => {
+ // Measured behaviour: some edges refuse HTTP/1.1, then refuse plain HTTP/2,
+ // and accept only HTTP/2 with a player-like User-Agent. A single retry is not
+ // enough; the client has to escalate both properties together.
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),http2=require('node:http2');
+ const {spawnSync}=require('node:child_process');const {Agent,fetch}=require('undici');
+ const {getRemote}=require('./network');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'troy-escalate-'));
+ const key=path.join(dir,'key.pem'),cert=path.join(dir,'cert.pem');
+ const gen=spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',key,'-out',cert,'-days','1','-subj','/CN=fixture.test'],{stdio:'ignore'});
+ if(gen.error||gen.status!==0){fs.rmSync(dir,{recursive:true,force:true});return t.skip('openssl unavailable');}
+ const server=http2.createSecureServer({key:fs.readFileSync(key),cert:fs.readFileSync(cert),allowHTTP1:true});
+ const seen=[];
+ server.on('request',(req,res)=>{
+  const ua=req.headers['user-agent']||'';
+  seen.push(`h${req.httpVersionMajor}${/Chrome/.test(ua)?'+ua':''}`);
+  const refuse=()=>{ if(req.httpVersionMajor===1) res.writeHead(426,{upgrade:'h2'}); else res.writeHead(426); res.end(); };
+  if(req.httpVersionMajor===1) return refuse();
+  if(!/Chrome/.test(ua)) return refuse();
+  res.writeHead(200,{'content-type':'video/mp4'});res.end('ok');
+ });
+ server.listen(0,'127.0.0.1');await once(server,'listening');
+ const lookup=(name,options,cb)=>options.all?cb(null,[{address:'127.0.0.1',family:4}]):cb(null,'127.0.0.1',4);
+ const connect={lookup,rejectUnauthorized:false};
+ const h1=new Agent({connect}),h2=new Agent({connect,allowH2:true});
+ const fixtureFetch=(url,options)=>{const u=new URL(url);u.port=String(server.address().port);return fetch(u,options);};
+ try{
+  const {response}=await getRemote('https://fixture.test/film.mp4',{},AbortSignal.timeout(15000),fixtureFetch,h1,h2);
+  assert.equal(response.status,200,'escalation reaches a host that refuses both simpler forms');
+  assert.equal(await response.text(),'ok');
+  assert.deepEqual(seen,['h1','h2','h2+ua'],'HTTP/1.1, then plain HTTP/2, then HTTP/2 as a player');
  }finally{await h1.close();await h2.close();server.closeAllConnections?.();await new Promise(r=>server.close(r));fs.rmSync(dir,{recursive:true,force:true});}
 });

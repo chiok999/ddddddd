@@ -61,25 +61,52 @@ function publicLookup(resolve = dns.lookup) {
 // endpoints and refuse it for others, which is why one title plays and another
 // returns 426 from the same server. HTTP/2 is negotiated by TLS ALPN, so the
 // fix is to offer it rather than to change any header.
-function h2Requested(response){
+// A named Upgrade must ask for h2. An absent header is ambiguous, so the
+// caller decides: for a GET it is worth one retry, for anything that changes
+// state it is not.
+function h2Requested(response,{allowMissing=false}={}){
   const upgrade=response.headers.get('upgrade');
-  // An absent Upgrade header is treated as a request to negotiate h2: a
-  // misconfigured edge often omits it, and a needless retry costs one request.
-  return !upgrade || /(?:^|[,\s])h2(?:$|[,\s])/i.test(upgrade);
+  if(!upgrade) return allowMissing;
+  return /(?:^|[,\s])h2(?:$|[,\s])/i.test(upgrade);
 }
+// The client a browser presents when it plays a video. Only used to retry a
+// source that refused an honest request, never to disguise the first attempt.
+const PLAYER_USER_AGENT = process.env.CINEMA_PLAYER_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 async function getRemote(input, headers, signal, fetch, agent, h2Agent = null) {
   let url = safeUrl(input);
   let forwarded=new Headers(headers);
+  const finish = response => ({ response, url });
   for (let n = 0; n <= 5; n++) {
     let response = await fetch(url, { dispatcher: agent, headers:forwarded, redirect: 'manual', signal });
     // Retry once over HTTP/2 before following anything. Only GET-like reads are
     // ever reached here, and the body has not been consumed yet.
-    if (response.status === 426 && h2Agent && h2Requested(response)) {
+    // Escalate a 426 rather than giving up. Some edges want HTTP/2, some want a
+    // player-like client, and some want both at once -- measured, not guessed:
+    // see troy-426.js. Each step is a GET-like replay of the same URL, so it is
+    // safe to repeat, and each step is bounded.
+    if (response.status === 426 && h2Agent && h2Requested(response,{allowMissing:true})) {
       await response.body?.cancel().catch(()=>{});
-      try { response = await fetch(url, { dispatcher: h2Agent, headers:forwarded, redirect: 'manual', signal }); }
-      catch (error) { if (signal?.aborted) throw error; }
+      const retry = async (dispatcher, requestHeaders) => {
+        try { return await fetch(url, { dispatcher, headers:requestHeaders, redirect: 'manual', signal }); }
+        catch (error) { if (signal?.aborted) throw error; return null; }
+      };
+      // Step 1: the same request over HTTP/2.
+      let next = await retry(h2Agent, forwarded);
+      if (next && next.status !== 426) return finish(next);
+      if (next) { await next.body?.cancel().catch(()=>{}); }
+      // Step 2: HTTP/2 with a player-like client. A host can refuse HTTP/1.1 and
+      // plain HTTP/2 while accepting the pair, so both are escalated together.
+      const playerHeaders = new Headers(forwarded);
+      if (!playerHeaders.has('user-agent')) playerHeaders.set('user-agent', PLAYER_USER_AGENT);
+      if (!playerHeaders.has('accept')) playerHeaders.set('accept', '*/*');
+      const escalated = await retry(h2Agent, playerHeaders);
+      if (escalated) {
+        if (escalated.status !== 426) return finish(escalated);
+        await escalated.body?.cancel().catch(()=>{});
+      }
+      // Everything refused. Keep the original 426 rather than a bare failure.
     }
-    if (![301,302,303,307,308].includes(response.status)) return { response, url };
+    if (![301,302,303,307,308].includes(response.status)) return finish(response);
     const location = response.headers.get('location');
     await response.body?.cancel();
     if (!location || n === 5) throw Error('Invalid redirect');
