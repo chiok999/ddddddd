@@ -461,11 +461,9 @@ test('relay playback starts the provider stream immediately without converting',
   player.emit('manifest',{levels:[{height:360},{height:720},{height:1080}]});
   // 240p and 360p stay selectable even though this stream has no such level,
   // and the provider's real levels are added alongside them.
-  assert.deepEqual([...d.getElementById('quality').options].map(o=>o.value),['auto','240','360','720','1080']);
-  d.getElementById('quality').value='720';d.getElementById('quality').dispatchEvent(new w.Event('change'));
-  assert.equal(player.currentLevel,1);
-  assert.ok([...d.getElementById('quality').options].map(o=>o.value).includes('auto'),'Auto returns to the provider stream');
-  assert.equal(transcodes.length,0,'switching provider levels never starts a conversion');
+  assert.deepEqual([...d.getElementById('quality').options].map(o=>o.value),['240','360'],'exactly the two qualities this server produces');
+  assert.equal(player.currentLevel,-1,'the provider stream is left to adapt until the viewer chooses');
+  assert.equal(transcodes.length,0,'browsing qualities never starts a conversion by itself');
   // 240p is a real conversion the server can produce, so choosing it on a
   // relayed stream starts one instead of pretending to cap a provider level.
   d.getElementById('quality').value='240';d.getElementById('quality').dispatchEvent(new w.Event('change'));
@@ -557,7 +555,7 @@ test('quality selector always offers 240p and 360p and never claims conversion',
   assert.equal(d.getElementById('quality').value,'240','the saved preference is preselected');
   player.emit('manifest',{levels:[{height:1080}]});
   const after=[...d.getElementById('quality').options].map(o=>o.value);
-  assert.ok(after.includes('240')&&after.includes('360')&&after.includes('1080'));
-  assert.equal(player.currentLevel,-1,'nothing at or below 240, so Auto is used rather than an unrelated level');
+  assert.deepEqual(after,['240','360'],'provider levels never leak into the menu');
+  assert.equal(player.currentLevel,-1,'the relayed stream adapts until the viewer converts');
  }finally{w.close()}
 });
