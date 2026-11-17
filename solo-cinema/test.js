@@ -38,7 +38,7 @@ test('MovieBox catalog and streams are normalized and unsafe URLs rejected', asy
     throw Error('unexpected request');
   };
   const adapter=create({request,safeUrl}); const results=await adapter.search('A Show'); assert.equal(results.length,1); assert.equal(results[0].type,'series');
-  const resolved=await adapter.resolve(results[0],1,2); assert.deepEqual(resolved.streams.map(x=>x.quality),[720,1080]);
+  const resolved=await adapter.resolve(results[0],1,2); assert.deepEqual(resolved.streams.map(x=>x.quality),[720,1080]); assert.equal(resolved.streams[0].duration,3600); assert.equal(resolved.streams[1].duration,undefined);
   assert.ok(requests.find(r=>r.url.includes('/subject/play')).url.includes('ep=2'));
   assert.equal(requests.find(r=>r.url.includes('/subject/play')).options.headers.authorization,undefined);
   await assert.rejects(adapter.resolve(results[0],0,2),/valid season/);
@@ -199,6 +199,13 @@ test('HTTP flow authenticates, resolves a fixture and blocks direct playback', a
     const resolved=await (await post('/api/resolve',{id:found.results[0].id,season:1,episode:1},cookie)).json();
     assert.equal(resolved.streams.length,1); assert.equal(resolved.streams[0].provider,'moviebox');
     const direct=resolved.streams[0].url;
+    assert.equal((await post('/api/source/probe',{url:direct},cookie)).status,400);
+    const range=(await (await post('/api/source',{url:'https://cdn.example/range.mp4',format:'file'},cookie)).json()).url;
+    assert.equal((await post('/api/source/probe',{url:range})).status,401);
+    const another=await post('/api/login',{password:'fixture-password-123'});const otherCookie=another.headers.get('set-cookie').split(';')[0];
+    assert.equal((await post('/api/source/probe',{url:range},otherCookie)).status,404);
+    assert.deepEqual(await (await post('/api/source/probe',{url:range},cookie)).json(),{addressable:true,size:100,status:206});
+    assert.equal((await fetch(base+range,{headers:{cookie}})).status,403);
     assert.equal((await fetch(base+direct)).status,401);
     assert.equal((await fetch(base+direct,{headers:{cookie}})).status,403);
     const converted=await post('/api/transcode',{url:direct},cookie);
@@ -428,5 +435,27 @@ test('FFmpeg can discard to a later MP4 timestamp on a pipe, but pipe input is n
  try{
   const make=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','color=red:s=160x90:r=10:d=10','-f','lavfi','-i','color=blue:s=160x90:r=10:d=10','-filter_complex','[0:v][1:v]concat=n=2:v=1:a=0','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart','-y',file],{encoding:'utf8',timeout:15000});assert.equal(make.status,0,make.stderr);
   const input=await fs.readFile(file);const seek=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0','-ss','12','-t','1','-vf','scale=2:2','-f','rawvideo','-pix_fmt','rgb24','pipe:1'],{input,maxBuffer:1024*1024,timeout:15000});assert.equal(seek.status,0,String(seek.stderr));assert.ok(seek.stdout.length>=3);assert.ok(seek.stdout[2]>200 && seek.stdout[0]<30,'frame at 12s should be blue');
+ }finally{await fs.rm(dir,{recursive:true,force:true})}
+});
+
+
+test('range probe validates start and midpoint, cancels ignored bodies, rejects malformed and inconsistent responses',async()=>{
+ const {probeRange}=require('./source-probe');let calls=[],cancelled=0;
+ const fake=(status,headers)=>({status,headers:new Headers(headers),body:{cancel:async()=>{cancelled++}}});
+ const ok=await probeRange(async(_entry,_signal,start,end)=>{calls.push([start,end]);return fake(206,{'content-range':`bytes ${start}-${end}/100`,'content-length':'2',etag:'"one"'})},{});
+ assert.deepEqual(ok,{addressable:true,size:100,status:206});assert.deepEqual(calls,[[0,1],[50,51]]);assert.equal(cancelled,2);
+ const ignored=await probeRange(async()=>fake(200,{'content-length':'100'}),{});assert.equal(ignored.addressable,false);assert.equal(cancelled,3);
+ let n=0;const changed=await probeRange(async(_e,_s,start,end)=>fake(206,{'content-range':`bytes ${start}-${end}/${++n===1?100:101}`}),{});assert.equal(changed.addressable,false);assert.equal(cancelled,5);
+ const compressed=await probeRange(async()=>fake(206,{'content-range':'bytes 0-1/100','content-encoding':'gzip'}),{});assert.equal(compressed.addressable,false);
+ const bad=await probeRange(async()=>fake(206,{'content-range':'bytes 0-2/100'}),{});assert.equal(bad.addressable,false);
+});
+
+
+test('local seekable MP4 input-side seek produces the later scene', {skip:!testFfmpeg,timeout:30000},async()=>{
+ const {spawnSync}=require('node:child_process'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-local-seek-')),file=path.join(dir,'source.mp4');
+ try{
+  const make=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','color=red:s=160x90:r=10:d=10','-f','lavfi','-i','color=blue:s=160x90:r=10:d=10','-filter_complex','[0:v][1:v]concat=n=2:v=1:a=0','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart','-y',file],{encoding:'utf8',timeout:15000});assert.equal(make.status,0,make.stderr);
+  const seek=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-ss','12','-i',file,'-t','1','-vf','scale=2:2','-f','rawvideo','-pix_fmt','rgb24','pipe:1'],{maxBuffer:1024*1024,timeout:15000});assert.equal(seek.status,0,String(seek.stderr));assert.ok(seek.stdout.length>=3);assert.ok(seek.stdout[2]>200 && seek.stdout[0]<30,'frame at 12s should be blue');
  }finally{await fs.rm(dir,{recursive:true,force:true})}
 });

@@ -4,7 +4,7 @@ const Module=require('node:module');
 const load=Module._load;
 Module._load=function(name,parent,isMain){
   if(name!=='undici') return load.apply(this,arguments);
-  return {Agent:class Agent {},fetch:async input=>{
+  return {Agent:class Agent {},fetch:async (input,options={})=>{
     const url=String(input);
     const json=(data,extra={})=>new Response(JSON.stringify(data),{status:200,headers:{'content-type':'application/json',...extra}});
     if(url.includes('aoneroom.com/wefeed-h5api-bff/home?')) return json({}, {'x-user':JSON.stringify({token:'fixture'})});
@@ -14,6 +14,7 @@ Module._load=function(name,parent,isMain){
     if(url.includes('kisskh.is/api/DramaList/Search')) return json([]);
     if(url.includes('v3-cinemeta.strem.io')) return json({metas:[]});
     if(url==='https://cdn.example/master.m3u8') return new Response('#EXTM3U\n#EXTINF:5,\nsegment.ts\n#EXT-X-ENDLIST\n',{headers:{'content-type':'application/vnd.apple.mpegurl'}});
+    if(url==='https://cdn.example/range.mp4'){const match=/^bytes=(\d+)-(\d+)$/.exec(options.headers?.range || '');if(!match)return new Response('unexpected range',{status:400});return new Response('ab',{status:206,headers:{'content-range':`bytes ${match[1]}-${match[2]}/100`,'content-length':'2','content-type':'video/mp4'}});}
     if(url==='https://cdn.example/segment.ts') return new Response(Buffer.from('segment'),{headers:{'content-type':'video/mp2t'}});
     if(url==='https://cdn.example/redirect.m3u8') return new Response('',{status:302,headers:{location:'https://127.0.0.1/private'}});
     throw Error('Unexpected fixture request: '+url);
