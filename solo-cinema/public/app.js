@@ -9,6 +9,28 @@ async function api(url, options = {}) {
 }
 const post = (url, data) => api(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(data) });
 let route='home', resolveSequence=0, watchReturn='search', discoveryEpoch=0;
+let dataSaver = (()=>{try{const v=localStorage.getItem('solo-data-saver'); return v===null ? !!navigator.connection?.saveData : v==='true';}catch{return !!navigator.connection?.saveData;}})();
+let preferredHeight = (()=>{try{return Number(localStorage.getItem('solo-quality-height')) || 0;}catch{return 0;}})();
+let activeLevels=[];
+function posterUrl(input){
+  try {const u=new URL(input); if(u.protocol!=='https:' || u.username || u.password || u.port || !['images.metahub.space','live.metahub.space','pbcdn.aoneroom.com','pbcdnw.aoneroom.com'].includes(u.hostname)) return null;
+    const p=new URL('https://wsrv.nl/'); p.searchParams.set('url',u.href); p.searchParams.set('w',dataSaver?'140':'240'); p.searchParams.set('q',dataSaver?'45':'60'); p.searchParams.set('output','webp'); return p.href;
+  }catch{return null;}
+}
+function updatePoster(img){const url=posterUrl(img.dataset.poster);if(url && img.getAttribute('src')!==url) img.src=url;}
+function addPoster(art,url){if(!posterUrl(url)) return;const img=document.createElement('img'); img.dataset.poster=url;img.loading='lazy';img.decoding='async';img.width=125;img.height=187;img.alt='';img.referrerPolicy='no-referrer';img.onerror=()=>img.remove();art.append(img);}
+function refreshCards(){
+ document.querySelectorAll('#catalogRows .catalog-section').forEach(row=>{let shown=0, hidden=0;const expanded=row.dataset.expanded==='true';
+  row.querySelectorAll('.catalog-card').forEach(card=>{const eligible=!card.classList.contains('hidden');const limited=eligible && dataSaver && !expanded && shown>=6;card.classList.toggle('saver-hidden',limited);if(eligible&&!limited){shown++;card.querySelectorAll('img[data-poster]').forEach(updatePoster);}else if(limited)hidden++;});
+  const more=row.querySelector('.more-cards');if(more){more.hidden=!hidden;more.textContent=`More (${hidden})`;}
+ });
+ document.querySelectorAll('#results img[data-poster]').forEach(updatePoster);
+}
+function capAdaptive(){if(!hls || !activeLevels.length)return;let cap=-1;if(dataSaver){cap=activeLevels.findIndex(l=>!l.height || l.height>360);cap=cap<0?activeLevels.length-1:Math.max(0,cap-1);}hls.autoLevelCapping=cap;}
+function updateSaver(){ $('dataSaver').textContent=`Data saver: ${dataSaver?'on':'off'}`; $('dataSaver').setAttribute('aria-pressed',String(dataSaver));capAdaptive();refreshCards(); }
+updateSaver();
+$('dataSaver').onclick=()=>{dataSaver=!dataSaver;try{localStorage.setItem('solo-data-saver',String(dataSaver));}catch{} updateSaver();};
+
 function directControls(show){for(const id of ['directTransport','directPlayerbar','directHint']) $(id).classList.toggle('hidden',!show);}
 function showRoute(name, updateHash=true) {
   if(!['home','movies','shows','anime','search','watch','list'].includes(name)) name='home';
@@ -21,13 +43,14 @@ function showRoute(name, updateHash=true) {
     el.querySelectorAll('.catalog-card').forEach(card=>{card.classList.toggle('hidden',filtered && (name==='anime' ? card.dataset.anime!=='true' : card.dataset.type!==(name==='movies'?'movie':'series')));});
     el.classList.toggle('hidden',filtered && !el.querySelector('.catalog-card:not(.hidden)') && (el.querySelector('.catalog-card') || !(el.dataset.groups||'').split(',').includes(name)));
   });
+  refreshCards();
   if(previous==='watch' && view!=='watch') {++resolveSequence; fallback.cancel(); directControls(true); $('findStreams').disabled=false; $('video').pause();}
   if(updateHash && location.hash!=='#'+name) location.hash=name;
   if(typeof window.scrollTo==='function') window.scrollTo(0,0);
 }
 window.addEventListener('hashchange',()=>showRoute(location.hash.slice(1),false));
 $('backToSearch').onclick=()=>showRoute(watchReturn);
-function loggedIn(on) { $('login').classList.toggle('hidden', on); $('app').classList.toggle('hidden', !on); $('logout').classList.toggle('hidden', !on); $('mainNav').classList.toggle('hidden', !on); if (on) { render(); showRoute(location.hash.slice(1)||'home',false); loadDiscovery(); } }
+function loggedIn(on) { $('login').classList.toggle('hidden', on); $('app').classList.toggle('hidden', !on); $('logout').classList.toggle('hidden', !on); $('dataSaver').classList.toggle('hidden', !on); $('mainNav').classList.toggle('hidden', !on); if (on) { render(); showRoute(location.hash.slice(1)||'home',false); loadDiscovery(); } }
 $('loginForm').onsubmit = async e => { e.preventDefault(); $('loginError').textContent = ''; try { await post('/api/login', {password:$('password').value}); $('password').value=''; loggedIn(true); } catch (err) { $('loginError').textContent=err.message; } };
 $('logout').onclick = async () => { try { await post('/api/logout', {}); } catch(err) { $('playError').textContent='Sign out failed: '+err.message; return; } ++searchSequence; ++resolveSequence; ++discoveryEpoch; discoveryLoaded=false; selected=null; episodes=[]; fallback.cancel(); directControls(true); current=null; pendingFailure=null; if(uploadUrl){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('server').replaceChildren(new Option('No sources yet','')); $('server').disabled=true; $('back10').disabled=true; $('forward10').disabled=true; updateNext(); if (hls) hls.destroy(); $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('playing').textContent='Nothing playing yet'; $('selection').classList.add('hidden'); $('results').replaceChildren(); $('streams').replaceChildren(); $('playError').textContent=''; loggedIn(false); };
 function render() {
@@ -60,15 +83,15 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     }
     // hls.js can detect a playlist whose URL itself is opaque.
     if (item.format === 'hls' && Hls.isSupported()) {
-      hls=new Hls({maxBufferLength:45,maxMaxBufferLength:60,backBufferLength:30}); const player=hls; player.loadSource(url); player.attachMedia(video);
-      player.on(Hls.Events.MANIFEST_PARSED, (_event, data)=>{ if(current!==item || hls!==player) return; const levels=data.levels.map((level,i)=>({level,i})).sort((a,b)=>(a.level.height || 0)-(b.level.height || 0) || (a.level.bitrate || 0)-(b.level.bitrate || 0)); $('quality').replaceChildren(); levels.forEach(({level,i})=>$('quality').add(new Option(`${level.height ? level.height+'p' : 'Quality'}${level.bitrate ? ' · '+Math.round(level.bitrate/1000)+' kbps':''}`, String(i)))); $('quality').add(new Option('Auto (adaptive)', '-1')); if(levels.length){ player.currentLevel=levels[0].i; $('quality').value=String(levels[0].i); } if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); });
+      activeLevels=[]; hls=new Hls({startLevel:0,maxBufferLength:45,maxMaxBufferLength:60,backBufferLength:30}); const player=hls; player.loadSource(url); player.attachMedia(video);
+      player.on(Hls.Events.MANIFEST_PARSED, (_event, data)=>{ if(current!==item || hls!==player) return; activeLevels=data.levels || []; const levels=activeLevels.map((level,i)=>({level,i})).sort((a,b)=>(a.level.height || 0)-(b.level.height || 0) || (a.level.bitrate || 0)-(b.level.bitrate || 0)); $('quality').replaceChildren(new Option('Auto (adaptive)', '-1')); levels.forEach(({level,i})=>$('quality').add(new Option(`${level.height ? level.height+'p' : 'Quality'}${level.bitrate ? ' · '+Math.round(level.bitrate/1000)+' kbps · ~'+Math.round(level.bitrate*3600/8/1000000)+' MB/hr':''}`, String(i)))); capAdaptive(); const match=preferredHeight && levels.find(x=>x.level.height===preferredHeight); player.currentLevel=match?match.i:-1; $('quality').value=match?String(match.i):'-1'; if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); });
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('subtitles').value; $('subtitles').replaceChildren(new Option('Off', '-1')); (data.subtitleTracks || []).forEach((track,i)=>$('subtitles').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if(externalTrack) $('subtitles').add(new Option('English (provider)','external')); if(uploadTrack) $('subtitles').add(new Option('Uploaded subtitles','upload')); if([...$('subtitles').options].some(o=>o.value===previous)) $('subtitles').value=previous; });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('audio').value; $('audio').replaceChildren(new Option('Default', '-1')); (data.audioTracks || []).forEach((track,i)=>$('audio').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if([...$('audio').options].some(o=>o.value===previous)) $('audio').value=previous; });
       hls.on(Hls.Events.ERROR, (_event,data)=>{ if(data.fatal && current===item && pendingFailure===fail) { pendingFailure=null; fail(); } });
     } else { video.src=url; if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); }
   } catch(e) { if(isActive()) { pendingFailure=null; fail(); } }
 }
-$('quality').onchange=()=>{ const value=$('quality').value; if(hls && /^-?\d+$/.test(value)) { hls.currentLevel=Number(value); return; } if(value.startsWith('file:') && current?.variants){ const chosen=current.variants[Number(value.slice(5))]; if(chosen && chosen.proxy!==current.proxy){ const video=$('video'); const next={...chosen,resumeAt:video.currentTime,wasPaused:video.paused}; fallback.play([next,...current.variants.filter(x=>x!==chosen)]); } } };
+$('quality').onchange=()=>{ const value=$('quality').value; if(hls && /^-?\d+$/.test(value)) { hls.currentLevel=Number(value); preferredHeight=Number(value)<0?0:Number(activeLevels[Number(value)]?.height)||0; try{localStorage.setItem('solo-quality-height',String(preferredHeight));}catch{} return; } if(value.startsWith('file:') && current?.variants){ const chosen=current.variants[Number(value.slice(5))]; if(chosen && chosen.proxy!==current.proxy){ const video=$('video'); const next={...chosen,resumeAt:video.currentTime,wasPaused:video.paused}; fallback.play([next,...current.variants.filter(x=>x!==chosen)]); } } };
 $('subtitles').onchange=()=>{ subtitleTouched=true; const value=$('subtitles').value; if(uploadTrack) uploadTrack.track.mode=value==='upload'?'showing':'disabled'; if(externalTrack) externalTrack.track.mode=value==='external'?'showing':'disabled'; if(hls) hls.subtitleTrack=(value==='external'||value==='upload')?-1:Number(value); };
 $('audio').onchange=()=>{ if(hls) hls.audioTrack=Number($('audio').value); };
 $('speed').onchange=()=>{ $('video').playbackRate=Number($('speed').value); };
@@ -112,11 +135,12 @@ async function searchTitles(query, saved = null) {
     const normalized=s=>String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim(); const q=normalized(query); const rank=x=>{const n=normalized(x.title);return n===q?0:n.startsWith(q)?1:n.includes(q)?2:3;};
     for(const item of data.results.slice().sort((a,b)=>rank(a)-rank(b))) {
       const btn=document.createElement('button'); btn.className='result';
-      const art=document.createElement('div'); art.className='result-art'; const placeholder=document.createElement('span'); placeholder.className='art-fallback'; placeholder.textContent=item.title; art.append(placeholder); if(item.poster){try{const u=new URL(item.poster); if(u.protocol==='https:' && ['images.metahub.space','live.metahub.space'].includes(u.hostname)){const img=document.createElement('img');img.src=u.href;img.alt='';img.loading='lazy';img.referrerPolicy='no-referrer';img.onerror=()=>img.remove();art.append(img);}}catch{}}
+      const art=document.createElement('div'); art.className='result-art'; const placeholder=document.createElement('span'); placeholder.className='art-fallback'; placeholder.textContent=item.title; art.append(placeholder); if(item.poster) addPoster(art,item.poster);
       const title=document.createElement('strong'); title.textContent=item.title;
       const meta=document.createElement('small'); meta.textContent=`${item.type === 'series' ? 'Series' : 'Movie'} · ${item.year || 'Year unknown'} · ${item.source || 'MovieBox'}`;
       btn.append(art,title,meta); btn.onclick=()=>openTitle(item); $('results').append(btn);
     }
+    refreshCards();
     if(saved) {
       const candidates=data.results.filter(item=>item.title===saved.title && item.type===saved.type && (!saved.year || item.year===saved.year));
       const item=(saved.source && candidates.find(x=>x.source===saved.source)) || (candidates.length===1 ? candidates[0] : null);
@@ -174,7 +198,7 @@ $('nextEpisode').onclick=async()=>{
 function titleCard(item, animeSection=false){
   const card=document.createElement('button'); card.type='button'; card.className='catalog-card'; card.dataset.type=item.type; card.dataset.anime=String(animeSection || !!item.anime);
   const art=document.createElement('div'); art.className='catalog-art';
-  if(item.poster){ const img=document.createElement('img'); img.loading='lazy'; img.decoding='async'; img.alt=''; img.referrerPolicy='no-referrer'; img.src=item.poster; img.onerror=()=>img.remove(); art.append(img); }
+  if(item.poster) addPoster(art,item.poster);
   const fallback=document.createElement('span'); fallback.className='art-fallback'; fallback.textContent=item.title; art.append(fallback);
   const name=document.createElement('strong'); name.textContent=item.title;
   const meta=document.createElement('small'); meta.textContent=`${item.year || 'Year unknown'} · ${item.type==='series'?'Series':'Movie'}`;
@@ -191,7 +215,7 @@ async function loadDiscovery(){
       const heading=document.createElement('div'); heading.className='row-head'; const title=document.createElement('h2'); title.textContent=label; const note=document.createElement('span'); note.textContent=section.source || 'Catalog'; heading.append(title,note); row.append(heading);
       const rail=document.createElement('div'); rail.className='catalog-rail'; rail.setAttribute('role','group'); rail.setAttribute('aria-label',label); rail.tabIndex=0;
       for(const item of section.items) rail.append(titleCard(item,section.id==='anime')); if(!section.items.length){ const empty=document.createElement('p'); empty.className='catalog-status'; empty.textContent=section.error || 'No titles available right now.'; rail.append(empty); }
-      row.append(rail); root.append(row);
+      row.append(rail); const more=document.createElement('button');more.type='button';more.className='more-cards secondary';more.hidden=true;more.onclick=()=>{row.dataset.expanded='true';refreshCards();};row.append(more);root.append(row);
     }
     showRoute(route,false); discoveryLoaded=data.sections.every(section=>!section.error);
     if(!discoveryLoaded){ const retry=document.createElement('button'); retry.className='secondary'; retry.textContent='Retry unavailable catalogs'; retry.onclick=loadDiscovery; root.append(retry); }
