@@ -130,10 +130,27 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
       if(job.stopped)throw Error('Transcode stopped');
       const binary=await getBinary();if(job.stopped)throw Error('Transcode stopped');
       job.dir=await fsp.mkdtemp(path.join(tmpdir,`troy-transcode-${process.pid}-`));if(job.stopped)throw Error('Transcode stopped');for(const d of ['240','360']){await fsp.mkdir(path.join(job.dir,d));if(job.stopped)throw Error('Transcode stopped');}
-      const timer=setTimeout(()=>job.controller.abort(),30000);let response;
-      try{response=await open(source,job.controller.signal);}finally{clearTimeout(timer);}
+      // A CDN edge can refuse the first connection of a burst with 426 and
+      // accept the next one -- the same thing a browser retry does silently.
+      // Only retried at offset 0: beyond it, a short replay would leave a hole
+      // in the file and FFmpeg would transcode damaged output.
+      let response=null, attempt=0;
+      for(;attempt<3;attempt++){
+        const timer=setTimeout(()=>job.controller.abort(),30000);
+        try{response=await open(source,job.controller.signal);}finally{clearTimeout(timer);}
+        if(job.stopped){await response.body?.cancel();throw Error('Transcode stopped');}
+        if(response.status!==426 || seekOffset>0 || attempt===2) break;
+        await response.body?.cancel().catch(()=>{});
+        await new Promise(resolve=>setTimeout(resolve,250*(attempt+1)));
+      }
       if(job.stopped){await response.body?.cancel();throw Error('Transcode stopped');}
-      if(response.status!==200 || !response.body){await response.body?.cancel().catch(()=>{});throw Error(`Source returned ${response.status}`);}
+      if(response.status!==200 || !response.body){
+        await response.body?.cancel().catch(()=>{});
+        const detail=response.status===426
+          ? 'Source returned 426 (the host refused this connection; this is a network path problem, not a bad file)'
+          : `Source returned ${response.status}`;
+        throw Error(detail);
+      }
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';
       if(/mpegurl|text\/html/i.test(type) || encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Only uncompressed direct MP4 sources can be transcoded');}
       const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,'-c:v','libx264','-preset','veryfast','-threads','1','-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames','expr:gte(t,n_forced*4)','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
