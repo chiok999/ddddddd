@@ -175,7 +175,7 @@ test('playback fallback tries each candidate once and ignores stale errors', () 
   fallback.play(['new']); fallback.cancel(); assert.equal(attempts[3].active(),false); failures[3](); assert.equal(exhausted,1);
 });
 
-test('HTTP flow authenticates, resolves a fixture and blocks direct playback', async () => {
+test('HTTP flow authenticates, resolves a fixture and relays media same-origin', async () => {
   const probe=net.createServer(); await new Promise(r=>probe.listen(0,'127.0.0.1',r)); const port=probe.address().port; await new Promise(r=>probe.close(r));
   const child=spawn(process.execPath,['--require',require('node:path').join(__dirname,'test-fixtures/mock-upstream.cjs'),'server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'fixture-password-123'},stdio:['ignore','pipe','pipe']});
   try {
@@ -195,9 +195,25 @@ test('HTTP flow authenticates, resolves a fixture and blocks direct playback', a
     const another=await post('/api/login',{password:'fixture-password-123'});const otherCookie=another.headers.get('set-cookie').split(';')[0];
     assert.equal((await post('/api/source/probe',{url:range},otherCookie)).status,404);
     assert.deepEqual(await (await post('/api/source/probe',{url:range},cookie)).json(),{addressable:true,size:100,status:206});
-    assert.equal((await fetch(base+range,{headers:{cookie}})).status,403);
     assert.equal((await fetch(base+direct)).status,401);
-    assert.equal((await fetch(base+direct,{headers:{cookie}})).status,403);
+    // The relay serves media to the owning session, and rewrites playlist
+    // references so the client keeps talking only to Troy.
+    const playlist=await fetch(base+direct,{headers:{cookie}});
+    assert.equal(playlist.status,200);
+    const text=await playlist.text();
+    assert.match(text,/#EXTM3U/);
+    const segmentRef=text.match(/^\/media\/[A-Za-z0-9_-]+$/m)?.[0];
+    assert.ok(segmentRef,'playlist references are rewritten to /media handles');
+    assert.equal((await fetch(base+segmentRef)).status,401);
+    const segment=await fetch(base+segmentRef,{headers:{cookie}});
+    assert.equal(segment.status,200); assert.equal(await segment.text(),'segment');
+    assert.equal((await fetch(base+segmentRef.replace('/media/','/media/x'))).status,401);
+    const other=(await post('/api/login',{password:'fixture-password-123'})).headers.get('set-cookie').split(';')[0];
+    assert.equal((await fetch(base+segmentRef,{headers:{cookie:other}})).status,404);
+    const ranged=await fetch(base+range,{headers:{cookie,range:'bytes=0-1'}});
+    assert.equal(ranged.status,206);
+    assert.equal(await ranged.text(),'ab');
+    assert.equal((await fetch(base+direct,{method:'HEAD'})).status,401);
     const converted=await post('/api/transcode',{url:direct},cookie);
     assert.equal(converted.status,502);
     assert.ok((await converted.json()).error);
@@ -390,7 +406,10 @@ test('transcode API rejects unauthenticated and invalid source requests',async()
 test('transcoder reports missing ffmpeg and rejects playlist content',async()=>{
  const {createTranscoder}=require('./transcode');const {Readable}=require('node:stream');const make=(type)=>({ok:true,status:200,headers:new Headers({'content-type':type}),body:Readable.toWeb(Readable.from(Buffer.from('0000000866747970000000086d6f6f76','hex')))});
  let opened=0;const bad=createTranscoder({executable:'/definitely/not/a/real/ffmpeg',open:async()=>{opened++;return make('video/mp4')},startupMs:5000});try{await assert.rejects(bad.start({},'a'),/FFmpeg executable or its system loader was not found/);assert.equal(opened,0);assert.equal(await bad.read('bad','a','master.m3u8'),null);}finally{await bad.close()}
- const hls=createTranscoder({open:async()=>({status:200,headers:new Headers({'content-type':'application/vnd.apple.mpegurl'}),body:Readable.toWeb(Readable.from(['#EXTM3U\n']))})});try{await assert.rejects(hls.start({},'a'),/HLS input unavailable/)}finally{await hls.close()}
+ // HLS input needs a working FFmpeg plus the HLS relay; without either the
+ // startup must fail closed rather than handing the playlist to the browser.
+ const hls=createTranscoder({open:async()=>({status:200,headers:new Headers({'content-type':'application/vnd.apple.mpegurl'}),body:Readable.toWeb(Readable.from(['#EXTM3U\n']))})});
+ try{await assert.rejects(hls.start({},'a'),/HLS input unavailable|FFmpeg executable or its system loader was not found/)}finally{await hls.close()}
 });
 
 const testFfmpeg=process.env.CINEMA_TEST_FFMPEG || require('./transcode').bundledFfmpeg();

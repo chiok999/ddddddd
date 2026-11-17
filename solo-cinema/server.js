@@ -42,6 +42,17 @@ const openHlsResource=async(source,signal,range)=>{
   return (await getRemote(source.url,headers,signal,fetch,agent,h2Agent)).response;
 };
 const transcoder=require('./transcode').createTranscoder({open:openSource,openHlsResource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
+// Same-origin relay for direct playback. Provider CDNs often reject requests
+// that do not come from a browser, and a browser cannot add Referer headers to
+// cross-origin media while satisfying CORS. Set CINEMA_RELAY=0 to keep the old
+// conversion-only behaviour.
+const relayEnabled=process.env.CINEMA_RELAY!=='0';
+const mediaProxy=require('./media-proxy').createMediaProxy({
+  safeUrl,
+  openMedia:(entry,headers,signal,head)=>getRemote(entry.url,headers,signal,fetch,agent,h2Agent,{method:head?'HEAD':'GET'}),
+  createHandle:(entry,sid)=>remember(entry.url,sid,entry.referer,entry.format,entry.origin,entry.userAgent),
+  perSession:Number(process.env.CINEMA_RELAY_STREAMS)||6,
+});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
 async function providerRequest(url, opts = {}) {
@@ -123,7 +134,7 @@ const server = http.createServer(async (req, res) => {
       res.setHeader('Set-Cookie', `cinema=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : ''}`);
       return send(res, 200, { ok: true });
     }
-    if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized });
+    if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized, relay: relayEnabled });
     if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); await transcoder.stopSession(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
     if (url.pathname === '/api/discover' && req.method === 'GET') {
       if (!authorized) return send(res,401,{error:'Login required'});
@@ -278,7 +289,15 @@ const server = http.createServer(async (req, res) => {
       if(!match)return send(res,404,{error:'Not found'});const result=await transcoder.read(match[1],sid,match[2]);if(!result)return send(res,404,{error:'Transcode unavailable'});
       res.writeHead(200,{'Content-Type':result.type,'Cache-Control':match[2].endsWith('.ts')?'private, max-age=3600, immutable':'no-store'});return res.end(result.data);
     }
-    if (url.pathname.startsWith('/media/') && req.method === 'GET') return send(res, authorized ? 403 : 401, {error:authorized ? 'Direct playback is disabled; conversion is required' : 'Login required'});
+    if (url.pathname.startsWith('/media/') && ['GET','HEAD'].includes(req.method)) {
+      if (!authorized) return send(res, 401, { error: 'Login required' });
+      const entry=sources.get(url.pathname.slice(7));
+      if (!entry || entry.sid!==sid || entry.expires<Date.now()) return send(res, 404, { error:'Source expired; find the stream again' });
+      if (!relayEnabled) return send(res, 403, { error: 'Direct playback is disabled; conversion is required' });
+      const result=await mediaProxy.relay(req,res,entry,sid);
+      if (!res.headersSent) return send(res, result.status, { error: result.error });
+      return;
+    }
     if (req.method === 'GET' && staticFiles[url.pathname]) {
       const [file, mime] = staticFiles[url.pathname]; res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-store' }); return fs.createReadStream(path.join(__dirname, file)).pipe(res);
     }
