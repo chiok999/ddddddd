@@ -679,27 +679,16 @@ test('MovieBox tries fixed BFF playback and keeps bearer off player-domain fallb
  assert.equal(bff.options.headers.authorization,'Bearer guest');assert.match(bff.url,/se=1&ep=1/);assert.match(bff.url,/host=moviebox.ph/);assert.equal(player.options.headers.authorization,undefined);
 });
 
-test('look-ahead uses finalized durations, hysteresis, and stale-report recovery',()=>{
- const {playlistDuration,leadAction}=require('./lead-control');
- assert.equal(playlistDuration('#EXTM3U\n#EXTINF:4.0,\na.ts\n#EXTINF:3.5,\nb.ts\n'),7.5);assert.equal(playlistDuration('#EXTM3U\n#EXTINF:bad,\na.ts\n'),null);
- const state={paused:false,buffered:1200,playhead:0,lastReport:10,now:20};assert.equal(leadAction(state),'pause');
- assert.equal(leadAction({...state,paused:true,playhead:30}),null);assert.equal(leadAction({...state,paused:true,playhead:60}),'resume');
- assert.equal(leadAction({...state,paused:true,now:60011}),'resume');assert.equal(leadAction({...state,paused:false,lastReport:null}),null);
-});
-
-test('real FFmpeg pauses ahead, resumes as playhead advances, and stops cleanly while paused', {skip:!testFfmpeg || !['linux','darwin'].includes(process.platform),timeout:60000},async()=>{
+test('real FFmpeg keeps converting past 20 minutes without player progress', {skip:!testFfmpeg,timeout:60000},async()=>{
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
- const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-lead-')),file=path.join(dir,'source.mp4');let t;
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-ahead-')),file=path.join(dir,'source.mp4');let t;
  try{
-  const made=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=5','-t','180','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:20000});assert.equal(made.status,0,String(made.stderr));
-  t=createTranscoder({tmpdir:dir,executable:testFfmpeg,aheadSeconds:8,leadTickMs:100,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
-  const job=await t.start({},'viewer');assert.equal(t.status(job.id,'other',0),null);t.status(job.id,'viewer',0);
-  const wait=async fn=>{const until=Date.now()+12000;while(Date.now()<until){if(fn())return;await new Promise(r=>setTimeout(r,50));}throw Error('look-ahead did not change state');};
-  await wait(()=>t.status(job.id,'viewer')?.paused===true);
-  const before=(await t.read(job.id,'viewer','240/index.m3u8')).data.toString();await new Promise(r=>setTimeout(r,500));const after=(await t.read(job.id,'viewer','240/index.m3u8')).data.toString();assert.equal(after,before);
-  t.status(job.id,'viewer',1000);await wait(()=>t.status(job.id,'viewer')?.paused===false);
-  t.status(job.id,'viewer',0);await wait(()=>t.status(job.id,'viewer')?.paused===true);
-  assert.equal(await t.stopFor(job.id,'viewer'),true);assert.deepEqual(await fsp.readdir(dir),['source.mp4']);
+  const made=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=1','-t','1320','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:25000});assert.equal(made.status,0,String(made.stderr));
+  t=createTranscoder({tmpdir:dir,executable:testFfmpeg,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+  const job=await t.start({},'viewer');assert.equal(t.status(job.id,'other',0),null);assert.equal(t.status(job.id,'viewer',0).paused,false);
+  const deadline=Date.now()+40000;let lists=[];while(Date.now()<deadline){lists=await Promise.all(['240','360'].map(async q=>(await t.read(job.id,'viewer',`${q}/index.m3u8`))?.data.toString()||''));if(lists.every(x=>x.includes('#EXT-X-ENDLIST')))break;await new Promise(r=>setTimeout(r,100));}
+  for(const list of lists){assert.match(list,/#EXT-X-ENDLIST/);const durations=[...list.matchAll(/#EXTINF:([0-9.]+)/g)].map(m=>Number(m[1]));assert.ok(durations.reduce((a,b)=>a+b,0)>1200,'conversion should continue past 20 minutes');}
+  assert.equal(t.status(job.id,'viewer',0).paused,false);assert.equal(await t.stopFor(job.id,'viewer'),true);assert.deepEqual(await fsp.readdir(dir),['source.mp4']);
  }finally{if(t)await t.close();await fsp.rm(dir,{recursive:true,force:true});}
 });
 

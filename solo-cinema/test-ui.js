@@ -378,14 +378,6 @@ test('non-JSON API errors show status instead of a parser error',async()=>{
  try{for(const f of ['fallback.js','app.js'])w.eval(fs.readFileSync(path.join(__dirname,'public',f),'utf8'));await tick();d.getElementById('query').value='Film';d.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();assert.match(d.getElementById('searchError').textContent,/HTTP 502/);}finally{w.close()}
 });
 
-test('player reports output-relative playhead for conversion look-ahead',async()=>{
- const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window,d=w.document;w.scrollTo=()=>{};w.Hls=class{static isSupported(){return false}};
- w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.HTMLMediaElement.prototype.play=()=>Promise.resolve();
- const timers=[];w.setInterval=(fn,ms)=>{timers.push({fn,ms});return timers.length};let report;
- w.fetch=async(url,opts={})=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true};if(url==='/api/source')return {url:'/media/a'};if(url==='/api/transcode')return {id:'job1',url:'/transcode/job1/master.m3u8',duration:300};if(url==='/api/transcode/status'){report=JSON.parse(opts.body);return {active:true}}return {sections:[]}}});
- try{for(const f of ['fallback.js','app.js','player-ui.js'])w.eval(fs.readFileSync(path.join(__dirname,'public',f),'utf8'));await tick();d.getElementById('title').value='Film';d.getElementById('url').value='https://example.com/a.mp4';d.getElementById('format').value='file';d.getElementById('sourceForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();d.getElementById('video').currentTime=17;const timer=timers.find(t=>t.ms===5000);assert.ok(timer);timer.fn();await tick();assert.deepEqual(report,{id:'job1',playhead:17});}finally{w.close()}
-});
-
 test('featured carousel uses live catalog titles and real watchlist and playback actions',async()=>{
  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window,d=w.document;w.scrollTo=()=>{};w.Hls=class{static isSupported(){return false}};w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.HTMLMediaElement.prototype.play=()=>Promise.resolve();let resolved;
  const items=[{id:'one',title:'Real Film',type:'movie',year:'2024',source:'moviebox',overview:'A real catalog description',poster:'https://pbcdn.aoneroom.com/poster.jpg'},{id:'two',title:'Real Series',type:'series',year:'2022',source:'moviebox'}];

@@ -10,7 +10,6 @@ const {spawn,execFile}=require('node:child_process');
 const {Transform,Readable}=require('node:stream');
 const {createHlsInput}=require('./hls-input');
 const {resumableInput}=require('./resumable-input');
-const {playlistDuration,leadAction}=require('./lead-control');
 
 // Extract only the bounded mvhd declared movie duration; fragmented/unknown
 // durations are not guessed. The gate has already buffered the complete moov.
@@ -98,7 +97,7 @@ async function probeFfmpeg(executable){
 
 async function chooseFfmpeg(candidates){const failures=[];for(const candidate of candidates){try{await probeFfmpeg(candidate.path);return candidate.path;}catch(err){failures.push(`${candidate.label}: ${err.message}`);}}throw Error(failures.join('; '));}
 
-function createTranscoder({open, openHlsResource, safeUrl=require('./network').safeUrl, executable, tmpdir=os.tmpdir(), startupMs=45000, aheadSeconds=1200, leadTickMs=2000, authorize=()=>true}={}){
+function createTranscoder({open, openHlsResource, safeUrl=require('./network').safeUrl, executable, tmpdir=os.tmpdir(), startupMs=45000, authorize=()=>true}={}){
   const jobs=new Map(),failures=new Map();let admission=Promise.resolve(),binaryPromise=null;
   function getBinary(){if(!binaryPromise)binaryPromise=chooseFfmpeg(executable?[{label:'FFmpeg',path:executable}]:ffmpegCandidates()).catch(err=>{binaryPromise=null;throw err;});return binaryPromise;}
   // Reap abandoned private directories after a crash, without touching a live Troy process.
@@ -127,7 +126,7 @@ function createTranscoder({open, openHlsResource, safeUrl=require('./network').s
     const claim=admission.then(async()=>{
       if(requestSignal?.aborted)throw Error('Transcode request disconnected');
       if(!authorize(sid))throw Object.assign(Error('Session expired'),{status:401});
-      const next={sid,requestId,id:crypto.randomBytes(24).toString('base64url'),controller:new AbortController(),lastAccess:Date.now(),stopped:false,error:null,proc:null,dir:null,ready:false,readers:0,drainWaiters:[],paused:false,playhead:null,lastReport:null,leadBusy:false};jobs.set(next.id,next);return next;
+      const next={sid,requestId,id:crypto.randomBytes(24).toString('base64url'),controller:new AbortController(),lastAccess:Date.now(),stopped:false,error:null,proc:null,dir:null,ready:false,readers:0,drainWaiters:[]};jobs.set(next.id,next);return next;
     });
     admission=claim.then(()=>{},()=>{});const job=await claim;
     const onDisconnect=()=>{void stop(job);};requestSignal?.addEventListener('abort',onDisconnect,{once:true});if(requestSignal?.aborted)onDisconnect();
@@ -157,18 +156,9 @@ function createTranscoder({open, openHlsResource, safeUrl=require('./network').s
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
       job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=job.relay?.error || ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
       if(!isHls){job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);}else job.proc.stdin.end();
-      job.monitor=setInterval(()=>{
-        if(job.stopped)return;
-        if(!authorize(job.sid)){job.error='Session expired';void stop(job);return;}
-        if(!job.ready || job.leadBusy || !['linux','darwin'].includes(process.platform) || job.proc?.exitCode!==null || job.proc?.signalCode!==null)return;
-        job.leadBusy=true;
-        void Promise.all(['240','360'].map(d=>fsp.readFile(path.join(job.dir,d,'index.m3u8'),'utf8'))).then(lists=>{
-          if(job.stopped || job.proc?.exitCode!==null || job.proc?.signalCode!==null)return;
-          const durations=lists.map(playlistDuration);const buffered=durations.every(Number.isFinite)?Math.min(...durations):null;
-          const action=leadAction({paused:job.paused,buffered,playhead:job.playhead,lastReport:job.lastReport,now:Date.now(),ahead:aheadSeconds,hysteresis:Math.min(60,aheadSeconds/2)});
-          if(action && job.proc.kill(action==='pause'?'SIGSTOP':'SIGCONT'))job.paused=action==='pause';
-        }).catch(()=>{if(!job.stopped && job.paused && job.proc?.exitCode===null && job.proc?.signalCode===null && job.proc.kill('SIGCONT'))job.paused=false;}).finally(()=>{job.leadBusy=false;});
-      },leadTickMs);job.monitor.unref();
+      // Encoding is deliberately independent of the viewer's playhead. Keep
+      // only session authorization monitoring, not a conversion lead limit.
+      job.monitor=setInterval(()=>{if(!job.stopped && !authorize(job.sid)){job.error='Session expired';void stop(job);}},2000);job.monitor.unref();
       const deadline=Date.now()+(seekOffset ? Math.max(startupMs,180000+Math.ceil(seekOffset*1000)) : startupMs);
       while(Date.now()<deadline && !job.stopped){if(job.error)throw Error(job.error);const ready=await Promise.all(['240','360'].map(d=>fsp.stat(path.join(job.dir,d,'index.m3u8')).then(s=>s.size>0,()=>false)));if(ready.every(Boolean)){job.ready=true;job.lastAccess=Date.now();return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate?.duration || job.relay?.duration || null,offset:seekOffset};}await interval(250);}
       throw Error(job.error || 'Transcode did not start in time');
@@ -186,7 +176,7 @@ function createTranscoder({open, openHlsResource, safeUrl=require('./network').s
   async function stopRequest(requestId,sid){const job=[...jobs.values()].find(job=>job.sid===sid && job.requestId===requestId);if(!job)return false;await stop(job);return true;}
   async function stopAny(){const action=admission.then(async()=>{const current=[...jobs.values()];await Promise.all(current.map(stop));return current.length>0;});admission=action.then(()=>{},()=>{});return action;}
   async function stopSession(sid){await Promise.all([...jobs.values()].filter(job=>job.sid===sid).map(stop));for(const [id,failure] of failures)if(failure.sid===sid)failures.delete(id);}
-  function status(id,sid,playhead){const job=jobs.get(id);if(job && job.sid===sid && !job.stopped){job.lastAccess=Date.now();if(typeof playhead==='number' && Number.isFinite(playhead) && playhead>=0){job.playhead=playhead;job.lastReport=Date.now();}return {active:true,error:null,paused:job.paused};}const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
+  function status(id,sid){const job=jobs.get(id);if(job && job.sid===sid && !job.stopped){job.lastAccess=Date.now();return {active:true,error:null,paused:false};}const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
   return {start,read,stopFor,stopRequest,stopSession,stopAny,status,close:()=>stopAny()};
 }
 module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg};

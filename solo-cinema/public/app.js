@@ -23,8 +23,6 @@ async function conversionFailed(item,fail){
     void playItem({...item,format:'file',seekAt:position,playbackRetried:true,keepUpload:!!uploadTrack,wasPaused:$('video').paused},fail,true,item.isActive);
   } else fail();
 }
-// Report the output-relative playhead so the encoder can maintain a runway.
-setInterval(()=>{const time=$('video').currentTime;if(route==='watch' && current?.transcodeId && Number.isFinite(time) && time>=0)post('/api/transcode/status',{id:current.transcodeId,playhead:time}).catch(()=>{});},5000);
 function stopTranscode(){++transcodeSequence;const pending=pendingRequestId;pendingRequestId=null;if(pending)post('/api/transcode/cancel',{requestId:pending}).catch(()=>{});const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
 
 let dataSaver = (()=>{try{const v=localStorage.getItem('solo-data-saver'); return v===null ? !!navigator.connection?.saveData : v==='true';}catch{return !!navigator.connection?.saveData;}})();
