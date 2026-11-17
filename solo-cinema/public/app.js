@@ -11,7 +11,7 @@ async function api(url, options = {}) {
 const post = (url, data) => api(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(data) });
 let route='home', resolveSequence=0, watchReturn='search', discoveryEpoch=0;
 let catalogSections=[], searchResults=[], searchFilter='all', exploreType='all', exploreSection='all', exploreYear='all', searchTimer;
-let transcodeJob=null, transcodeSequence=0, transcodeQueue=Promise.resolve(), lastTranscodeError='', pendingRequestId=null;
+let transcodeJob=null, transcodeSequence=0, transcodeQueue=Promise.resolve(), lastTranscodeError='', pendingRequestId=null, attemptErrors=[];
 function enqueueTranscode(fn){const task=transcodeQueue.then(fn,fn);transcodeQueue=task.catch(()=>{});return task;}
 async function conversionFailed(item,fail){
   const sequence=transcodeSequence;let message='Converted playback failed.';try{const result=await post('/api/transcode/status',{id:item.transcodeId});if(result.error)message=result.error;}catch{}
@@ -86,9 +86,10 @@ const providerStats=new Map();
 function scoreProvider(name){const stat=providerStats.get(name);return stat?(stat.ok+1)/(stat.ok+stat.fail+2):0.5;}
 function recordProvider(name,success){if(!name)return;const stat=providerStats.get(name)||{ok:0,fail:0};if(stat.ok+stat.fail>=20){stat.ok=Math.floor(stat.ok/2);stat.fail=Math.floor(stat.fail/2);}stat[success?'ok':'fail']++;providerStats.set(name,stat);}
 const fallback = createFallback((item, index, total, fail, isActive) => {
+  if(index===0){attemptErrors=[];$('sourceFailures').textContent='';}
   $('playError').textContent=index ? `Trying another source (${index+1}/${total})…` : '';
-  playItem(item, ()=>{if(isActive()){recordProvider(item.provider,false);fail();}}, index>0, isActive);
-}, () => { pendingFailure=null; stopTranscode(); if(hls){hls.destroy();hls=null;} const video=$('video');video.pause();video.removeAttribute('src');video.load(); $('playError').textContent='Unable to transcode any available source. '+lastTranscodeError; });
+  playItem(item, ()=>{if(isActive()){recordProvider(item.provider,false);const reason=String(lastTranscodeError || 'Playback failed').replace(/https?:\/\/\S+/g,'[source]').slice(0,150);attemptErrors.push(`${item.provider || 'Direct'}: ${reason}`);fail();}}, index>0, isActive);
+}, () => { pendingFailure=null; stopTranscode(); if(hls){hls.destroy();hls=null;} const video=$('video');video.pause();video.removeAttribute('src');video.load(); $('playing').textContent=selected?.title || 'Playback unavailable';$('placeholder').classList.remove('hidden');$('placeholder').querySelector('p').textContent='Playback unavailable';$('playError').textContent='Unable to transcode any available source. '+lastTranscodeError; $('sourceFailures').textContent=attemptErrors.join(' · '); });
 async function playItem(item, fail, isFallback = false, isActive = () => true) {
   $('screen').classList.add('player-expanded');stopTranscode(); const sequence=transcodeSequence; const oldVideo=$('video'); if(hls){hls.destroy();hls=null;} oldVideo.pause();oldVideo.removeAttribute('src');oldVideo.load();
   directControls(true);
@@ -240,7 +241,7 @@ function openTitle(item,resume=null){ stopTranscode(); if(route!=='watch') watch
 $('episodeSelect').onchange=()=>{ const [s,e]=$('episodeSelect').value.split(':').map(Number); if(s && e){ $('season').value=s; $('episode').value=e; } };
 async function findStreams(autoplay = false) {
   stopTranscode();
-  if(!selected) return;  const sequence=++resolveSequence; const chosen=selected; $('playError').textContent=''; $('streams').replaceChildren(); $('findStreams').disabled=true; $('findStreams').textContent='Preparing your video…';
+  if(!selected) return;  const sequence=++resolveSequence; const chosen=selected; $('playError').textContent=''; $('sourceFailures').textContent=''; $('streams').replaceChildren(); $('findStreams').disabled=true; $('findStreams').textContent='Preparing your video…';
   const season=Number($('season').value), episode=Number($('episode').value);
   try {
     const data=await post('/api/resolve',{id:chosen.id, season, episode});

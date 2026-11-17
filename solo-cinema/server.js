@@ -24,6 +24,8 @@ const catalog = new Map();
 const captions = require('./source-store').createSourceStore({perSession:100,maxEntries:1000});
 const captionSources = require('./source-store').createSourceStore({perSession:1000,maxEntries:4000});
 const agent = new Agent({ connect: { lookup: publicLookup() } });
+// Used only after a source explicitly advertises an HTTP/2 upgrade.
+const h2Agent = new Agent({ allowH2:true, connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
 function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null, refreshAfterMs = null) {
   const id = crypto.randomBytes(24).toString('base64url');
@@ -33,11 +35,11 @@ function remember(url, sid, referer = null, format = null, origin = null, userAg
 // Informational only: never prevent playback based on storage detection.
 const transcodeTmp=process.env.CINEMA_TMPDIR || require('node:os').tmpdir();
 if(process.platform==='linux') fs.statfs(transcodeTmp,(err,stat)=>{if(!err && Number(stat.type)===0x01021994)console.warn('Troy temporary output is on tmpfs and may consume RAM.');});
-const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent)).response});
+const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent,h2Agent)).response});
 const openHlsResource=async(source,signal,range)=>{
   const headers={'accept-encoding':'identity'};if(range)headers.range=range;
   if(source.userAgent)headers['user-agent']=source.userAgent;if(source.referer)headers.referer=source.referer;if(source.origin)headers.origin=source.origin;
-  return (await getRemote(source.url,headers,signal,fetch,agent)).response;
+  return (await getRemote(source.url,headers,signal,fetch,agent,h2Agent)).response;
 };
 const transcoder=require('./transcode').createTranscoder({open:openSource,openHlsResource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
@@ -234,7 +236,7 @@ const server = http.createServer(async (req, res) => {
           if(source.userAgent)headers['user-agent']=source.userAgent;
           if(source.referer)headers.referer=source.referer;
           if(source.origin)headers.origin=source.origin;
-          return (await getRemote(source.url,headers,signal,fetch,agent)).response;
+          return (await getRemote(source.url,headers,signal,fetch,agent,h2Agent)).response;
         },entry);
         return send(res,200,result);
       } catch {return send(res,502,{error:'Range probe failed'});} finally {activeRangeProbes--;}
