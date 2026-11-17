@@ -26,6 +26,10 @@ module.exports = function createMoviebox({ request, safeUrl }) {
       throw e;
     }
   }
+  async function home() {
+    const response=await request(`${base}/home?host=moviebox.ph`,{headers,timeoutMs:7000});
+    return require('./moviebox-home').normalizeHome(response.json);
+  }
   async function search(query) {
     if (typeof query !== 'string' || !query.trim() || query.length > 150) throw Error('Enter a title up to 150 characters');
     const result = await bff('/subject/search', { keyword: query.trim(), page: 1, perPage: 20 });
@@ -106,5 +110,5 @@ module.exports = function createMoviebox({ request, safeUrl }) {
     }
     return null;
   }
-  return { search, resolve, subtitle };
+  return { search, resolve, subtitle, home };
 };

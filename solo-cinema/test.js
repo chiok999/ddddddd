@@ -373,3 +373,21 @@ test('discovery produces per-session title IDs without changing the shared metad
  const first=bindDiscovery(sections,catalog,'alice',1000),second=bindDiscovery(sections,catalog,'bob',1000);
  assert.notEqual(first[0].items[0].id,second[0].items[0].id);assert.equal(catalog.get(first[0].items[0].id).sid,'alice');assert.equal(catalog.get(second[0].items[0].id).sid,'bob');assert.equal(catalog.get(first[0].items[0].id).item.imdbId,'tt123');assert.equal(catalog.get(first[0].items[0].id).item.tmdbId,'321');assert.equal(item.id,undefined);assert.equal(catalog.get(first[0].items[0].id).expires,1000+24*3600000);
 });
+
+test('MovieBox home uses provider category names and valid playable subjects, not fixed titles',()=>{
+ const {normalizeHome}=require('./moviebox-home');const rows=normalizeHome({data:{operatingList:[{title:'Fresh from MovieBox',type:'SUBJECTS_MOVIE',subjects:[{subjectId:'100',subjectType:1,title:'Movie',detailPath:'movie-100',releaseDate:'2026-01-02',cover:{url:'https://pbcdn.aoneroom.com/image/a.jpg'}},{subjectId:'200',subjectType:2,title:'Show',detailPath:'show-200',cover:{url:'https://evil.example/a.jpg'}},{subjectId:'300',subjectType:1,title:'Hidden',detailPath:'bad',isPornographic:true},{subjectId:'bad',subjectType:1,title:'No path'}]},{title:'Anime now',subjects:[{subjectId:'500',subjectType:2,title:'Animated show',genre:'Anime,Action',detailPath:'anime-500'}]}]}});
+ assert.equal(rows.length,2);assert.equal(rows[0].title,'Fresh from MovieBox');assert.deepEqual(rows[0].groups,['movies','shows']);assert.equal(rows[0].items.length,2);assert.equal(rows[0].items[0].source,'moviebox');assert.equal(rows[0].items[0].poster,'https://pbcdn.aoneroom.com/image/a.jpg');assert.equal(rows[0].items[1].poster,null);assert.ok(rows[1].groups.includes('anime'));
+ assert.deepEqual(normalizeHome({data:{operatingList:[{title:'A different category',subjects:[{subjectId:'55',subjectType:1,title:'New title',detailPath:'new'}]}]}}).map(r=>r.title),['A different category']);assert.throws(()=>normalizeHome({data:{}}),/Invalid/);
+});
+
+test('discovery prefers MovieBox live sections, fills missing anime from Cinemeta, and falls back on failure',async()=>{
+ const create=require('./discover');let homeCalls=0,requests=[];
+ const row={id:'moviebox-0',title:'Live category',source:'MovieBox',groups:['movies','shows'],items:[{source:'moviebox',title:'A',type:'movie'}],error:null};
+ const request=async url=>{requests.push(url);return {json:{metas:[{id:'tt100',name:'Anime title',releaseInfo:'2026'}]}}};
+ const d=create({request,moviebox:{home:async()=>{homeCalls++;return [row]}}});const data=await d();assert.equal(data[0].title,'Live category');assert.equal(data[1].id,'anime');assert.equal(data[1].items[0].title,'Anime title');assert.equal(requests.length,1);await d();assert.equal(homeCalls,1);
+ const fallback=create({request,moviebox:{home:async()=>{throw Error('offline')}}});const fallbackRows=await fallback();assert.equal(fallbackRows.length,7);assert.ok(fallbackRows.every(r=>r.source==='Cinemeta'));
+});
+
+test('session-bound MovieBox cards retain the subject needed by the real resolver',()=>{
+ const {bindDiscovery}=require('./catalog-session');const catalog=new Map();const source={title:'MovieBox row',items:[{source:'moviebox',subjectId:'123',detailPath:'actual-123',type:'movie',title:'Title'}]};const rows=bindDiscovery([source],catalog,'session',1);const card=rows[0].items[0];assert.equal(card.source,'moviebox');assert.equal(card.subjectId,undefined);const entry=catalog.get(card.id);assert.equal(entry.item.subjectId,'123');assert.equal(entry.item.detailPath,'actual-123');assert.equal(entry.item.source,'moviebox');
+});

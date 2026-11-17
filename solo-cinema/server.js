@@ -49,9 +49,9 @@ async function providerRequest(url, opts = {}) {
   let json = null; try { json = JSON.parse(text); } catch { /* token response may have no JSON */ }
   return { headers:response.headers, json, text };
 }
-const discover = require('./discover')({request:providerRequest});
 const catalogSearch = require('./catalog-search')({request:providerRequest});
 const moviebox = require('./moviebox')({ request:providerRequest, safeUrl });
+const discover = require('./discover')({request:providerRequest,moviebox});
 const kisskh = require('./kisskh')({ request:providerRequest, safeUrl });
 const { createProviders, resolveProviders } = require('./providers');
 const providers = createProviders({ request:providerRequest, safeUrl });

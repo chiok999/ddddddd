@@ -7,8 +7,9 @@ function bindDiscovery(sections,catalog,sid,now=Date.now()) {
   if(catalog.size+total>3000) throw Error('Too many catalog entries; restart the server');
   return sections.map(section=>({...section,items:section.items.map(item=>{
     const id=crypto.randomBytes(20).toString('base64url');
-    catalog.set(id,{item:{...item,source:'cinemeta'},sid,expires:now+24*3600000});
-    return {id,title:item.title,type:item.type,year:item.year,overview:item.overview,poster:item.poster,source:'cinemeta'};
+    const source=item.source==='moviebox'?'moviebox':'cinemeta';
+    catalog.set(id,{item:{...item,source},sid,expires:now+24*3600000});
+    return {id,title:item.title,type:item.type,year:item.year,overview:item.overview,poster:item.poster,source,anime:!!item.anime};
   })}));
 }
 module.exports={bindDiscovery};
