@@ -80,7 +80,7 @@ const staticFiles = {
 };
 const server = http.createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src 'none'; frame-ancestors 'none'");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https://wsrv.nl; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src 'none'; frame-ancestors 'none'");
   const url = new URL(req.url, 'http://local');
   const sid = /(?:^|;\s*)cinema=([\w-]+)/.exec(req.headers.cookie || '')?.[1];
   const session = sessions.get(sid);
