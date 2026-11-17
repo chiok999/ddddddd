@@ -17,7 +17,7 @@ function resumableInput(first,open,signal,{retries=3,backoffMs=250}={}){
       try{
         for await(const chunk of Readable.fromWeb(response.body)){
           if(signal.aborted)throw Error('Transcode stopped');
-          offset+=chunk.length;
+          offset+=chunk.length;if(chunk.length)attempts=0;
           if(length!==null && offset>length)throw Error('Source exceeded declared length');
           yield chunk;
         }
@@ -25,7 +25,7 @@ function resumableInput(first,open,signal,{retries=3,backoffMs=250}={}){
       }catch{/* retry only when the response can be safely resumed */}
       if(signal.aborted)throw Error('Transcode stopped');
       if(!validator || length===null || encoding!=='identity' || offset>=length)throw Error('Source stream failed; safe resume is unavailable');
-      let accepted=false;
+      let accepted=false,validatorChanged=false;
       while(attempts<retries && !accepted){
         attempts++;
         await delay(backoffMs*2**(attempts-1),undefined,{signal});
@@ -36,11 +36,12 @@ function resumableInput(first,open,signal,{retries=3,backoffMs=250}={}){
           const partLength=next.headers.get('content-length');
           const end=range && Number(range[2]);
           accepted=next.status===206 && !!next.body && !!range && Number(range[1])===offset && end===length-1 && Number(range[3])===length && (!partLength || Number(partLength)===length-offset) && (next.headers.get('content-encoding')||'identity').toLowerCase()==='identity' && next.headers.get(validator.name)===validator.value;
+          if(next.status===206 && next.headers.get(validator.name)!==validator.value)validatorChanged=true;
           if(!accepted)await next.body?.cancel().catch(()=>{});
           else response=next;
         }catch{await next?.body?.cancel().catch(()=>{});}
       }
-      if(!accepted)throw Error('Source stream failed; validated range retry exhausted');
+      if(!accepted)throw Error(validatorChanged?'Source changed; a fresh conversion is required':'Source stream failed; validated range retry exhausted');
     }
   }
   return Readable.from(stream());

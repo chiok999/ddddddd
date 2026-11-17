@@ -419,8 +419,9 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  try{const inflight=t.read(job.id,'alice','240/index0.ts');await reading;let finished=false;const stopping=t.stopFor(job.id,'alice').then(value=>{finished=true;return value;});await new Promise(r=>setTimeout(r,50));assert.equal(finished,false);release();assert.ok((await inflight).data.length);assert.equal(await stopping,true);}finally{release();fsp.readFile=originalRead;}
  assert.equal(await t.read(job.id,'alice','master.m3u8'),null);assert.deepEqual((await fsp.readdir(dir)).sort(),['sample.mp4']);
  const silent=path.join(dir,'silent.mp4');const noAudio=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-t','10','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart',silent],{encoding:'utf8'});assert.equal(noAudio.status,0,noAudio.stderr);
- const limited=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
- try{const small=await limited.start({},'alice');await new Promise(r=>setTimeout(r,2500));assert.match(limited.status(small.id,'alice').error,/storage limit/);}finally{await limited.close();}
+ const statfs=fsp.statfs;let calls=0;fsp.statfs=async()=>{calls++;throw Error('statfs unavailable')};
+ const uncapped=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,minFreeBytes:Number.MAX_SAFE_INTEGER,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
+ try{const small=await uncapped.start({},'alice');await new Promise(r=>setTimeout(r,2500));assert.equal(uncapped.status(small.id,'alice').active,true);assert.equal(calls,0);}finally{fsp.statfs=statfs;await uncapped.close();}
 
  }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true})}
 });
@@ -584,8 +585,16 @@ test('disconnected startup is cancelled and authenticated manual reclaim can sto
  }finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
 });
 
-test('storage reserve is checked before conversion and expired sessions cannot claim jobs',async()=>{
+test('expired sessions cannot claim jobs',async()=>{
  const {createTranscoder}=require('./transcode');let opened=0;
- const t=createTranscoder({minFreeBytes:Number.MAX_SAFE_INTEGER,authorize:sid=>sid==='live',open:async()=>{opened++;throw Error('should not open')}});
- try{await assert.rejects(t.start({},'expired'),e=>e.status===401);await assert.rejects(t.start({},'live'),/Not enough free temporary storage/);assert.equal(opened,0);}finally{await t.close();}
+ const t=createTranscoder({authorize:sid=>sid==='live',open:async()=>{opened++;throw Error('should not open')}});
+ try{await assert.rejects(t.start({},'expired'),e=>e.status===401);assert.equal(opened,0);}finally{await t.close();}
+});
+
+test('a running converter is not expired just because the viewer pauses', {skip:!testFfmpeg,timeout:30000},async()=>{
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-pause-')),file=path.join(dir,'source.mp4');
+ try{const generated=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','20','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:15000});assert.equal(generated.status,0,String(generated.stderr));
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,idleMs:1,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+ try{const job=await t.start({},'owner');await new Promise(r=>setTimeout(r,2300));assert.equal(t.status(job.id,'owner')?.active,true);}finally{await t.close();}
+ }finally{await fsp.rm(dir,{recursive:true,force:true});}
 });

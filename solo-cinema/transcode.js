@@ -1,5 +1,5 @@
 'use strict';
-// One bounded FFmpeg job. Input is already fetched through Troy's pinned proxy;
+// One session-bound FFmpeg job. Input is already fetched through Troy's pinned proxy;
 // FFmpeg receives bytes on stdin and cannot open network or file input protocols.
 const fs=require('node:fs');
 const fsp=fs.promises;
@@ -89,8 +89,9 @@ async function probeFfmpeg(executable){
 
 async function chooseFfmpeg(candidates){const failures=[];for(const candidate of candidates){try{await probeFfmpeg(candidate.path);return candidate.path;}catch(err){failures.push(`${candidate.label}: ${err.message}`);}}throw Error(failures.join('; '));}
 
-function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=90000, startupMs=45000, maxBytes=1024*1024*1024, minFreeBytes=500*1024*1024, authorize=()=>true}={}){
-  let active=null;const failures=new Map();let admission=Promise.resolve();
+function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, startupMs=45000, authorize=()=>true}={}){
+  let active=null;const failures=new Map();let admission=Promise.resolve(),binaryPromise=null;
+  function getBinary(){if(!binaryPromise)binaryPromise=chooseFfmpeg(executable?[{label:'FFmpeg',path:executable}]:ffmpegCandidates()).catch(err=>{binaryPromise=null;throw err;});return binaryPromise;}
   // Reap abandoned private directories after a crash, without touching a live Troy process.
   async function reap(){
     for(const name of await fsp.readdir(tmpdir).catch(()=>[])){
@@ -111,11 +112,6 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=90000, s
     })();return job.stopPromise;
   }
 
-  async function checkStorage(job){
-    const stat=await fsp.statfs(tmpdir);
-    if(Number(stat.bavail)*Number(stat.bsize)<minFreeBytes)throw Error('Not enough free temporary storage for conversion');
-    if(job?.dir){let bytes=0;for(const quality of ['240','360']){const dir=path.join(job.dir,quality);for(const name of await fsp.readdir(dir)){const st=await fsp.stat(path.join(dir,name)).catch(e=>e.code==='ENOENT'?null:Promise.reject(e));if(st?.isFile())bytes+=st.size;}}if(bytes>maxBytes)throw Error('Conversion exceeded its temporary storage limit');}
-  }
   async function start(source,sid,seekOffset=0,requestId=null,requestSignal=null){
     if(typeof seekOffset!=='number' || !Number.isFinite(seekOffset) || seekOffset<0 || seekOffset>86400)throw Object.assign(Error('Invalid seek position'),{status:400});
     // Serialize admission so a reload or retry can replace its own abandoned job
@@ -131,9 +127,8 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=90000, s
     admission=claim.then(()=>{},()=>{});const job=await claim;
     const onDisconnect=()=>{void stop(job);};requestSignal?.addEventListener('abort',onDisconnect,{once:true});if(requestSignal?.aborted)onDisconnect();
     try{
-      try{await checkStorage();}catch(e){throw Error(e.message==='Not enough free temporary storage for conversion'?e.message:'Cannot check temporary storage');}
       if(job.stopped)throw Error('Transcode stopped');
-      const binary=await chooseFfmpeg(executable?[{label:'FFmpeg',path:executable}]:ffmpegCandidates());if(job.stopped)throw Error('Transcode stopped');
+      const binary=await getBinary();if(job.stopped)throw Error('Transcode stopped');
       job.dir=await fsp.mkdtemp(path.join(tmpdir,`troy-transcode-${process.pid}-`));if(job.stopped)throw Error('Transcode stopped');for(const d of ['240','360']){await fsp.mkdir(path.join(job.dir,d));if(job.stopped)throw Error('Transcode stopped');}
       const timer=setTimeout(()=>job.controller.abort(),30000);let response;
       try{response=await open(source,job.controller.signal);}finally{clearTimeout(timer);}
@@ -141,15 +136,15 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=90000, s
       if(response.status!==200 || !response.body){await response.body?.cancel().catch(()=>{});throw Error(`Source returned ${response.status}`);}
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';
       if(/mpegurl|text\/html/i.test(type) || encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Only uncompressed direct MP4 sources can be transcoded');}
-      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`,'-c:v','libx264','-preset','veryfast','-threads','2','-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',bitrate,'-bufsize',bitrate,'-force_key_frames','expr:gte(t,n_forced*4)','-sc_threshold','0','-c:a','aac','-b:a',audio,'-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
+      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,'-c:v','libx264','-preset','veryfast','-threads','1','-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames','expr:gte(t,n_forced*4)','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
       const pacing=seekOffset>0?['-readrate','3','-readrate_initial_burst',String(Math.ceil(seekOffset+12)),'-ss',String(seekOffset)]:['-readrate','3'];
       const args=['-hide_banner','-loglevel','error','-nostdin','-filter_threads','1',...pacing,'-threads','2','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...output(426,240,'250k','48k','240'),...output(640,360,'600k','64k','360')];
       job.proc=spawn(binary,args,{stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
-      job.proc.once('error',err=>{job.error=executableError(err);void stop(job);});
+      job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
       job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
       job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);
-      job.monitor=setInterval(()=>{if(job.stopped)return;if(job.ready && Date.now()-job.lastAccess>idleMs){job.error='Conversion expired after inactivity';void stop(job);return;}if(job.checkingStorage)return;job.checkingStorage=true;checkStorage(job).catch(err=>{if(!job.stopped){job.error=err.message;void stop(job);}}).finally(()=>{job.checkingStorage=false;});},2000);job.monitor.unref();
-      const deadline=Date.now()+(seekOffset ? Math.max(startupMs,180000) : startupMs);
+      job.monitor=setInterval(()=>{if(!job.stopped && job.ready && job.proc?.exitCode!==null && Date.now()-job.lastAccess>idleMs){job.error='Conversion expired after inactivity';void stop(job);}},2000);job.monitor.unref();
+      const deadline=Date.now()+(seekOffset ? Math.max(startupMs,180000+Math.ceil(seekOffset*1000)) : startupMs);
       while(Date.now()<deadline && !job.stopped){if(job.error)throw Error(job.error);const ready=await Promise.all(['240','360'].map(d=>fsp.stat(path.join(job.dir,d,'index.m3u8')).then(s=>s.size>0,()=>false)));if(ready.every(Boolean)){job.ready=true;job.lastAccess=Date.now();return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate.duration || null,offset:seekOffset};}await interval(250);}
       throw Error(job.error || 'Transcode did not start in time');
     }catch(err){await stop(job);if(job.dir)await fsp.rm(job.dir,{recursive:true,force:true}).catch(()=>{});if(err.code==='ENOSPC'||err.code==='EDQUOT')throw Error('Temporary filesystem is full or its quota has been exceeded');throw err;}finally{requestSignal?.removeEventListener('abort',onDisconnect);}
@@ -166,7 +161,7 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=90000, s
   async function stopRequest(requestId,sid){if(!active || active.sid!==sid || active.requestId!==requestId)return false;await stop(active);return true;}
   async function stopAny(){const action=admission.then(async()=>{if(!active)return false;await stop(active);return true;});admission=action.then(()=>{},()=>{});return action;}
   async function stopSession(sid){if(active?.sid===sid)await stop(active);for(const [id,failure] of failures)if(failure.sid===sid)failures.delete(id);}
-  function status(id,sid){if(active && active.id===id && active.sid===sid && !active.stopped)return {active:true,error:null};const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
+  function status(id,sid){if(active && active.id===id && active.sid===sid && !active.stopped){active.lastAccess=Date.now();return {active:true,error:null};}const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
   return {start,read,stopFor,stopRequest,stopSession,stopAny,status,close:()=>stop(active)};
 }
 module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg};
