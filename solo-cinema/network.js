@@ -19,17 +19,22 @@ function publicLookup(resolve = dns.lookup) {
     }).catch(callback);
   };
 }
+// Only retry idempotent GETs. A broken origin may omit Upgrade on a 426;
+// HTTP/2 is negotiated by TLS ALPN and is never forced with an Upgrade header.
+// Both agents are supplied by the caller and use the same pinned DNS lookup.
+async function getWithH2Fallback(url,options,fetch,agent,h2Agent){
+  const first=await fetch(url,{...options,dispatcher:agent});
+  const upgrade=first.headers.get('upgrade');
+  if((options.method || 'GET').toUpperCase()!=='GET' || !h2Agent || first.status!==426 || (upgrade && !/(?:^|[,\s])h2(?:$|[,\s])/i.test(upgrade)))return first;
+  await first.body?.cancel().catch(()=>{});
+  try{return await fetch(url,{...options,dispatcher:h2Agent});}
+  catch(error){if(options.signal?.aborted)throw error;return first;}
+}
 async function getRemote(input, headers, signal, fetch, agent, h2Agent = null) {
   let url = safeUrl(input);
   let forwarded=new Headers(headers);
   for (let n = 0; n <= 5; n++) {
-    let response = await fetch(url, { dispatcher: agent, headers:forwarded, redirect: 'manual', signal });
-    // Retry only when the origin explicitly requests HTTP/2. Both dispatchers
-    // use the same validated DNS lookup; redirects remain individually checked.
-    if (h2Agent && response.status===426 && /(?:^|[,\s])h2(?:$|[,\s])/i.test(response.headers.get('upgrade') || '')) {
-      await response.body?.cancel();
-      response = await fetch(url, { dispatcher:h2Agent, headers:forwarded, redirect:'manual', signal });
-    }
+    const response = await getWithH2Fallback(url,{headers:forwarded,redirect:'manual',signal},fetch,agent,h2Agent);
     if (![301,302,303,307,308].includes(response.status)) return { response, url };
     const location = response.headers.get('location');
     await response.body?.cancel();
@@ -39,4 +44,4 @@ async function getRemote(input, headers, signal, fetch, agent, h2Agent = null) {
     url=next;
   }
 }
-module.exports = { safeUrl, publicLookup, getRemote };
+module.exports = { safeUrl, publicLookup, getRemote, getWithH2Fallback };

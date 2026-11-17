@@ -83,19 +83,40 @@ test('provider TTL refresh runs before open without bypassing range validator ch
  await assert.rejects(collect(resumableInput(original,()=>Promise.resolve(response),controller.signal,{retries:1,backoffMs:1})),/Source changed/);
 });
 
-test('HTTP 426 explicitly advertising h2 retries through the HTTP/2 dispatcher', async t=>{
+for(const explicit of [true,false])test(`HTTP 426 ${explicit?'with h2 upgrade':'without an upgrade header'} retries through the HTTP/2 dispatcher`, async t=>{
  const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process'),http2=require('node:http2');const {Agent,fetch}=require('undici');const {getRemote}=require('./network');
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'troy-h2-')),key=path.join(dir,'key.pem'),cert=path.join(dir,'cert.pem');
  const generated=spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',key,'-out',cert,'-days','1','-subj','/CN=fixture.test'],{stdio:'ignore'});if(generated.error||generated.status!==0){fs.rmSync(dir,{recursive:true,force:true});return t.skip('openssl unavailable');}
  const server=http2.createSecureServer({key:fs.readFileSync(key),cert:fs.readFileSync(cert),allowHTTP1:true});let seen=[];
- server.on('request',(req,res)=>{seen.push(req.httpVersionMajor);if(req.httpVersionMajor===1){res.writeHead(426,{upgrade:'h2'});res.end();}else{res.writeHead(200,{'content-type':'video/mp4'});res.end('fixture bytes');}});server.listen(0,'127.0.0.1');await once(server,'listening');
+ server.on('request',(req,res)=>{seen.push(req.httpVersionMajor);if(req.httpVersionMajor===1){res.writeHead(426,explicit?{upgrade:'h2'}:{});res.end();}else{res.writeHead(200,{'content-type':'video/mp4'});res.end('fixture bytes');}});server.listen(0,'127.0.0.1');await once(server,'listening');
  const lookup=(name,options,cb)=>options.all?cb(null,[{address:'127.0.0.1',family:4}]):cb(null,'127.0.0.1',4),connect={lookup,rejectUnauthorized:false};const h1=new Agent({connect}),h2=new Agent({connect,allowH2:true});
  const fixtureFetch=(url,options)=>{const rewritten=new URL(url);rewritten.port=String(server.address().port);return fetch(rewritten,options)};
  try{const {response}=await getRemote('https://fixture.test/video',{},AbortSignal.timeout(10000),fixtureFetch,h1,h2);assert.equal(response.status,200);assert.equal(await response.text(),'fixture bytes');assert.deepEqual(seen,[1,2]);}
  finally{await h1.close();await h2.close();server.closeAllConnections?.();await new Promise(r=>server.close(r));fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('HTTP 426 without an explicit h2 upgrade does not retry or weaken URL validation',async()=>{
- const {getRemote}=require('./network');let count=0;const response=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('no',{status:426})},{},{h2:true});assert.equal(response.response.status,426);assert.equal(count,1);
+test('HTTP 426 retries only where safe and preserves URL validation',async()=>{
+ const {getRemote,getWithH2Fallback}=require('./network');let count=0;const response=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('no',{status:426})},{},{h2:true});assert.equal(response.response.status,426);assert.equal(count,2);
+ count=0;await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{count++;return new Response('no',{status:426,headers:{upgrade:'websocket'}})},{},{h2:true});assert.equal(count,1);
+ count=0;await getWithH2Fallback('https://example.com',{method:'POST'},async()=>{count++;return new Response('no',{status:426})},{},{});assert.equal(count,1);
+ let attempt=0;const result=await getRemote('https://example.com/video',{},new AbortController().signal,async()=>{if(++attempt===1)return new Response('no',{status:426});throw Error('connection failure');},{},{h2:true});assert.equal(result.response.status,426);assert.equal(attempt,2);
+ const controller=new AbortController();await assert.rejects(()=>getWithH2Fallback('https://example.com', {signal:controller.signal},async()=>{if(!controller.signal.aborted){controller.abort();return new Response('no',{status:426})}throw Error('aborted');},{},{}),/aborted/);
  await assert.rejects(()=>getRemote('https://127.0.0.1/video',{},new AbortController().signal,()=>{}, {},{}),/Only public HTTPS/);
+});
+
+test('real FFmpeg plays movie and series-style HLS fixtures after 426 without Upgrade', {timeout:60000},async t=>{
+ const fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),http2=require('node:http2'),{spawnSync}=require('node:child_process');const {Agent,fetch}=require('undici');const {getRemote,safeUrl}=require('./network');const {createTranscoder,bundledFfmpeg}=require('./transcode');const bin=process.env.CINEMA_TEST_FFMPEG||bundledFfmpeg();if(!bin)return t.skip('FFmpeg unavailable');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-426-playback-')),key=path.join(dir,'key.pem'),cert=path.join(dir,'cert.pem');let server,transcoder,h1,h2;
+ try{
+  const certResult=spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',key,'-out',cert,'-days','1','-subj','/CN=fixture.test'],{stdio:'ignore'});if(certResult.error||certResult.status!==0)return t.skip('openssl unavailable');
+  const common=['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','8','-c:v','libx264','-threads','1','-pix_fmt','yuv420p'];
+  for(const args of [[...common,'-movflags','+faststart',path.join(dir,'movie.mp4')],[...common,'-g','20','-f','hls','-hls_time','2','-hls_list_size','0',path.join(dir,'episode.m3u8')]]){const result=spawnSync(bin,args,{timeout:20000});assert.equal(result.status,0,String(result.stderr));}
+  const versions=[];server=http2.createSecureServer({key:fs.readFileSync(key),cert:fs.readFileSync(cert),allowHTTP1:true});server.on('request',async(req,res)=>{versions.push(req.httpVersionMajor);if(req.httpVersionMajor===1){res.writeHead(426);return res.end();}const name=new URL(req.url,'https://fixture.test').pathname.slice(1);if(!/^(movie\.mp4|episode\.m3u8|episode\d+\.ts)$/.test(name))return res.writeHead(404).end();try{const data=await fsp.readFile(path.join(dir,name));res.writeHead(200,{'content-type':name.endsWith('.m3u8')?'application/vnd.apple.mpegurl':'application/octet-stream','content-length':data.length});res.end(data);}catch{res.writeHead(404).end();}});server.listen(0,'127.0.0.1');await once(server,'listening');
+  const lookup=(name,opts,cb)=>opts.all?cb(null,[{address:'127.0.0.1',family:4}]):cb(null,'127.0.0.1',4),connect={lookup,rejectUnauthorized:false};h1=new Agent({connect});h2=new Agent({connect,allowH2:true});
+  const localFetch=async(url,options)=>{const target=new URL(url);target.port=String(server.address().port);const response=await fetch(target,options);Object.defineProperty(response,'url',{value:String(url)});return response;};
+  const remote=async(url,headers,signal)=>(await getRemote(url,headers,signal,localFetch,h1,h2)).response;
+  const open=createSourceOpener({safeUrl,remote});transcoder=createTranscoder({tmpdir:dir,executable:bin,open,openHlsResource:(source,signal,range)=>remote(source.url,range?{range}:{},signal),safeUrl});
+  for(const name of ['movie.mp4','episode.m3u8']){const job=await transcoder.start({url:`https://fixture.test/${name}`},'viewer');const list=(await transcoder.read(job.id,'viewer','240/index.m3u8')).data.toString();const part=list.match(/index\d+\.ts/)[0],segment=await transcoder.read(job.id,'viewer',`240/${part}`);const decoded=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-frames:v','1','-f','null','-'],{input:segment.data,timeout:10000});assert.equal(decoded.status,0,String(decoded.stderr));await transcoder.stopFor(job.id,'viewer');}
+  assert.ok(versions.includes(1));assert.ok(versions.includes(2));
+ }finally{await transcoder?.close();await h1?.close();await h2?.close();if(server){server.closeAllConnections?.();await new Promise(r=>server.close(r));}await fsp.rm(dir,{recursive:true,force:true});}
 });

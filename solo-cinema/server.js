@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { Agent, fetch } = require('undici');
-const { safeUrl, publicLookup, getRemote } = require('./network');
+const { safeUrl, publicLookup, getRemote, getWithH2Fallback } = require('./network');
 const { describe } = require('./diagnostics');
 const {scope:providerScope}=require('./provider-timeout');
 
@@ -24,7 +24,7 @@ const catalog = new Map();
 const captions = require('./source-store').createSourceStore({perSession:100,maxEntries:1000});
 const captionSources = require('./source-store').createSourceStore({perSession:1000,maxEntries:4000});
 const agent = new Agent({ connect: { lookup: publicLookup() } });
-// Used only after a source explicitly advertises an HTTP/2 upgrade.
+// Used for a single GET retry after HTTP 426; it retains pinned DNS validation.
 const h2Agent = new Agent({ allowH2:true, connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
 function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null, refreshAfterMs = null) {
@@ -48,7 +48,11 @@ async function providerRequest(url, opts = {}) {
   safeUrl(url);
   const { timeoutMs = 15000, ...fetchOpts } = opts;
   const signals=[AbortSignal.timeout(Math.max(1, Math.min(15000, timeoutMs))),providerScope.getStore(),fetchOpts.signal].filter(Boolean);
-  const response = await fetch(url, { ...fetchOpts, dispatcher: agent, redirect: 'manual', signal: AbortSignal.any(signals) });
+  const options={...fetchOpts,redirect:'manual',signal:AbortSignal.any(signals)};
+  // Provider GETs can return the same 426 as media requests. Do not replay POSTs.
+  const response=(!options.method || options.method.toUpperCase()==='GET')
+    ? await getWithH2Fallback(url,options,fetch,agent,h2Agent)
+    : await fetch(url,{...options,dispatcher:agent});
   if (!response.ok) { await response.body?.cancel(); throw Object.assign(new Error(`Provider HTTP ${response.status}`), { status: response.status }); }
   const reader = response.body.getReader(); const chunks = []; let total = 0;
   while (true) {
