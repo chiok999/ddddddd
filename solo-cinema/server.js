@@ -3,7 +3,6 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { Readable } = require('node:stream');
 const { Agent, fetch } = require('undici');
 const { safeUrl, publicLookup, getRemote } = require('./network');
 const { describe } = require('./diagnostics');
@@ -31,7 +30,6 @@ function remember(url, sid, referer = null, format = null, origin = null, userAg
   sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, expires: Date.now() + 6 * 3600000 });
   return `/media/${id}`;
 }
-const { rewritePlaylist } = require('./playlist');
 const transcoder=require('./transcode').createTranscoder({open:async(entry,signal)=>{const headers={};if(entry.userAgent)headers['user-agent']=entry.userAgent;if(entry.referer)headers.referer=entry.referer;if(entry.origin)headers.origin=entry.origin;return (await getRemote(entry.url,headers,signal,fetch,agent)).response;}});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
@@ -220,32 +218,7 @@ const server = http.createServer(async (req, res) => {
       if(!match)return send(res,404,{error:'Not found'});const result=await transcoder.read(match[1],sid,match[2]);if(!result)return send(res,404,{error:'Transcode unavailable'});
       res.writeHead(200,{'Content-Type':result.type,'Cache-Control':'no-store'});return res.end(result.data);
     }
-    if (url.pathname.startsWith('/media/') && req.method === 'GET') {
-      if (!authorized) return send(res, 401, { error: 'Login required' });
-      const entry = sources.get(url.pathname.slice(7));
-      if (!entry || entry.sid !== sid || entry.expires < Date.now()) return send(res, 404, { error: 'Source expired' });
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30000);
-      res.on('close', () => { clearTimeout(timer); controller.abort(); });
-      const headers = {}; if (entry.userAgent) headers['user-agent'] = entry.userAgent; if (entry.referer) headers.referer = entry.referer; if (entry.origin) headers.origin = entry.origin; if (/^bytes=\d*-\d*$/.test(req.headers.range || '')) headers.range = req.headers.range;
-      const { response, url: finalUrl } = await getRemote(entry.url, headers, controller.signal, fetch, agent);
-      clearTimeout(timer); // The timeout is for connecting, not the duration of a movie.
-      if (!response.ok) { await response.body?.cancel(); return send(res, 502, { error: `Source returned ${response.status}` }); }
-      const contentType = response.headers.get('content-type') || 'application/octet-stream';
-      const isPlaylist = entry.format === 'hls' || /mpegurl/i.test(contentType) || /\.m3u8(?:$|\?)/i.test(finalUrl.href);
-      if (isPlaylist) {
-        const reader = response.body.getReader(); let length = 0, parts = [];
-        while (true) { const { done, value } = await reader.read(); if (done) break; length += value.length; if (length > 2 * 1024 * 1024) { await reader.cancel(); fail('Playlist too large'); } parts.push(Buffer.from(value)); }
-        const text = Buffer.concat(parts).toString('utf8'); if (!text.trimStart().startsWith('#EXTM3U')) fail('Invalid playlist');
-        const rewritten = rewritePlaylist(text, finalUrl, sid, entry.referer, (url, session, referer, format) => remember(url, session, referer, format, entry.origin, entry.userAgent));
-        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store' }); return res.end(rewritten);
-      }
-      const out = { 'Content-Type': /^(video\/|audio\/|text\/vtt|application\/octet-stream)/i.test(contentType) ? contentType : 'application/octet-stream', 'Cache-Control': 'no-store', 'Content-Disposition': 'inline' };
-      for (const name of ['content-length','content-range','accept-ranges']) { const value = response.headers.get(name); if (value) out[name] = value; }
-      res.writeHead(response.status, out);
-      if (!response.body) return res.end();
-      const stream = Readable.fromWeb(response.body); stream.on('error', () => res.destroy()); stream.pipe(res); return;
-    }
+    if (url.pathname.startsWith('/media/') && req.method === 'GET') return send(res, authorized ? 403 : 401, {error:authorized ? 'Direct playback is disabled; conversion is required' : 'Login required'});
     if (req.method === 'GET' && staticFiles[url.pathname]) {
       const [file, mime] = staticFiles[url.pathname]; res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-store' }); return fs.createReadStream(path.join(__dirname, file)).pipe(res);
     }

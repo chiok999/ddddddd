@@ -185,7 +185,7 @@ test('playback fallback tries each candidate once and ignores stale errors', () 
   fallback.play(['new']); fallback.cancel(); assert.equal(attempts[3].active(),false); failures[3](); assert.equal(exhausted,1);
 });
 
-test('HTTP flow authenticates, resolves a fixture, proxies HLS segments and blocks private redirects', async () => {
+test('HTTP flow authenticates, resolves a fixture and blocks direct playback', async () => {
   const probe=net.createServer(); await new Promise(r=>probe.listen(0,'127.0.0.1',r)); const port=probe.address().port; await new Promise(r=>probe.close(r));
   const child=spawn(process.execPath,['--require',require('node:path').join(__dirname,'test-fixtures/mock-upstream.cjs'),'server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'fixture-password-123'},stdio:['ignore','pipe','pipe']});
   try {
@@ -198,13 +198,13 @@ test('HTTP flow authenticates, resolves a fixture, proxies HLS segments and bloc
     const found=await (await post('/api/search',{query:'Fixture'},cookie)).json(); assert.equal(found.results.length,1);
     const resolved=await (await post('/api/resolve',{id:found.results[0].id,season:1,episode:1},cookie)).json();
     assert.equal(resolved.streams.length,1); assert.equal(resolved.streams[0].provider,'moviebox');
-    const manifest=await fetch(base+resolved.streams[0].url,{headers:{cookie}}); assert.equal(manifest.status,200);
-    const text=await manifest.text(), segment=text.split('\n').find(line=>line.startsWith('/media/')); assert.ok(segment);
-    assert.equal((await fetch(base+segment)).status,401);
-    assert.equal(await (await fetch(base+segment,{headers:{cookie}})).text(),'segment');
-    const redirect=(await (await post('/api/source',{url:'https://cdn.example/redirect.m3u8',format:'hls'},cookie)).json()).url;
-    assert.equal((await fetch(base+redirect,{headers:{cookie}})).status,400);
-    await post('/api/logout',{},cookie); assert.equal((await fetch(base+segment,{headers:{cookie}})).status,401);
+    const direct=resolved.streams[0].url;
+    assert.equal((await fetch(base+direct)).status,401);
+    assert.equal((await fetch(base+direct,{headers:{cookie}})).status,403);
+    const converted=await post('/api/transcode',{url:direct},cookie);
+    assert.equal(converted.status,400);
+    assert.match((await converted.json()).error,/not HLS/);
+    await post('/api/logout',{},cookie); assert.equal((await fetch(base+direct,{headers:{cookie}})).status,401);
   } finally {child.kill();}
 });
 

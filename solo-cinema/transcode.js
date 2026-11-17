@@ -20,7 +20,7 @@ function fastStartGate(limit=8*1024*1024){
     if(size32===1){if(buffer.length-offset<16)break;const n=buffer.readBigUInt64BE(offset+8);if(n>BigInt(limit))throw Error('MP4 metadata exceeds the fast-start limit');size=Number(n);header=16;}
     if(size===0 || size<header)throw Error('Invalid MP4 box');
     if(!seenFtyp && type!=='ftyp')throw Error('Only fast-start MP4 sources are supported');
-    if(type==='mdat')throw Error('MP4 is not fast-start; use its original stream');
+    if(type==='mdat')throw Error('MP4 is not fast-start; this source cannot be converted');
     if(size>limit || offset+size>limit)throw Error('MP4 metadata exceeds the fast-start limit');
     if(buffer.length-offset<size)break;
     if(type==='ftyp')seenFtyp=true;offset+=size;
