@@ -30,9 +30,24 @@ function remember(url, sid, referer = null, format = null, origin = null, userAg
   sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, refresh, refreshAt:Number.isFinite(refreshAfterMs) && refreshAfterMs>0 ? Date.now()+refreshAfterMs : null, expires: Date.now() + 6 * 3600000 });
   return `/media/${id}`;
 }
-// Informational only: never prevent playback based on storage detection.
-const transcodeTmp=process.env.CINEMA_TMPDIR || require('node:os').tmpdir();
-if(process.platform==='linux') fs.statfs(transcodeTmp,(err,stat)=>{if(!err && Number(stat.type)===0x01021994)console.warn('Troy temporary output is on tmpfs and may consume RAM.');});
+// Conversion writes growing HLS segments for the whole runtime of whatever is
+// playing. On a container whose /tmp is tmpfs that output is held in RAM, so a
+// feature-length title can exhaust the box and be killed mid-playback. Pick a
+// disk-backed directory instead, and only fall back to tmp if there is none.
+const TMPFS_MAGIC=0x01021994;
+function filesystemType(dir){try{return Number(fs.statfsSync(dir).type);}catch{return null;}}
+function freeBytes(dir){try{const s=fs.statfsSync(dir);return Number(s.bavail)*Number(s.bsize);}catch{return null;}}
+function resolveTranscodeTmp(){
+  if(process.env.CINEMA_TMPDIR) return {dir:process.env.CINEMA_TMPDIR,reason:'CINEMA_TMPDIR'};
+  const systemTmp=require('node:os').tmpdir();
+  if(process.platform!=='linux' || filesystemType(systemTmp)!==TMPFS_MAGIC) return {dir:systemTmp,reason:'system temp'};
+  // System temp is RAM. Use a directory beside the application instead.
+  for(const candidate of [path.join(process.cwd(),'.troy-media'),path.join(require('node:os').homedir(),'.troy-media')]){
+    try{fs.mkdirSync(candidate,{recursive:true});if(filesystemType(candidate)!==TMPFS_MAGIC)return {dir:candidate,reason:'disk (system temp is tmpfs)'};}catch{/* try the next one */}
+  }
+  return {dir:systemTmp,reason:'system temp (no disk-backed option)'};
+}
+const {dir:transcodeTmp,reason:transcodeTmpReason}=resolveTranscodeTmp();
 const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent)).response});
 const transcoder=require('./transcode').createTranscoder({open:openSource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
@@ -287,14 +302,32 @@ server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => {
   const net = require('./network');
   console.log('Troy is listening');
   console.log(`  outbound: ${net.forceIPv4 ? 'IPv4 preferred' : 'both families'}` + (net.ipv6Unrouted ? ' (no IPv6 route detected)' : ''));
-  const { bundledFfmpeg } = require('./transcode');
-  const binary = process.env.CINEMA_FFMPEG || bundledFfmpeg() || 'ffmpeg';
-  try {
-    require('node:child_process').execFileSync(binary, ['-version'], { stdio: 'ignore', timeout: 10000 });
-    console.log(`  ffmpeg:   ${binary}`);
-  } catch {
-    console.warn(`  ffmpeg:   NOT RUNNING (${binary})`);
-    console.warn('            Conversion is the only playback path, so install FFmpeg');
-    console.warn('            or set CINEMA_FFMPEG. Nothing will play until it exists.');
+  const { chooseFfmpeg, ffmpegCandidates, staticFfmpegExpectedPath } = require('./transcode');
+  // Conversion is the only playback path, so verify by running the same probes
+  // a real job needs rather than only checking that the binary exists.
+  chooseFfmpeg(process.env.CINEMA_FFMPEG
+    ? [{ label: 'Configured FFmpeg', path: process.env.CINEMA_FFMPEG }]
+    : ffmpegCandidates())
+    .then(binary => console.log(`  ffmpeg:   ok  ${binary}`))
+    .catch(error => {
+      console.warn('  ffmpeg:   NOT USABLE');
+      console.warn(`            ${error.message}`);
+      console.warn('            Conversion is the only playback path, so nothing will play.');
+      console.warn('            Two fixes, easiest first:');
+      console.warn('              node troy-ffmpeg.js    (downloads a static build, no root)');
+      console.warn('              apt-get install -y ffmpeg  (if the panel allows root)');
+      if (fs.existsSync(staticFfmpegExpectedPath())) {
+        console.warn(`            A downloaded build already exists: ${staticFfmpegExpectedPath()}`);
+        console.warn('            Point CINEMA_FFMPEG at it.');
+      }
+    });
+  const free = freeBytes(transcodeTmp);
+  console.log(`  temp:     ${transcodeTmp}  [${transcodeTmpReason}]` + (free === null ? '' : `  ${(free / 1073741824).toFixed(1)} GB free`));
+  if (filesystemType(transcodeTmp) === TMPFS_MAGIC) {
+    console.warn('            WARNING: this is tmpfs (RAM). A full-length title will');
+    console.warn('            consume memory and can kill the server mid-playback.');
+    console.warn('            Set CINEMA_TMPDIR to a disk-backed path.');
+  } else if (free !== null && free < 2 * 1073741824) {
+    console.warn('            WARNING: less than 2 GB free; a long title may run out.');
   }
 });

@@ -56,7 +56,25 @@ function bundledFfmpeg(platform=process.platform,arch=process.arch,report=proces
   const name=`@seydx/node-av-ffmpeg-light-linux-${arch}${libc==='musl'?'-musl':''}`;
   try{const executable=path.join(path.dirname(require.resolve(`${name}/package.json`)),'ffmpeg');return fs.existsSync(executable)?executable:null;}catch{return null;}
 }
-function ffmpegCandidates(){if(process.env.CINEMA_FFMPEG)return [{label:'Configured FFmpeg',path:process.env.CINEMA_FFMPEG}];const bundled=bundledFfmpeg();return [...(bundled?[{label:'Bundled FFmpeg',path:bundled}]:[]),{label:'System FFmpeg',path:'ffmpeg'}];}
+// A statically linked FFmpeg downloads and works without root, which is often
+// the only option inside a container. It is opt-in because it costs a download.
+const STATIC_FFMPEG={x64:'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz',arm64:'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz'};
+function staticFfmpegExpectedPath(){return path.join(require('node:os').tmpdir(),'troy-ffmpeg','ffmpeg');}
+function ffmpegCandidates(){
+  if(process.env.CINEMA_FFMPEG)return [{label:'Configured FFmpeg',path:process.env.CINEMA_FFMPEG}];
+  // The bundled build links Rockchip MPP, which logs initializer errors on hosts
+  // without that SoC. It is still worth trying, but a real system FFmpeg and an
+  // explicitly downloaded static build are more portable, so try those first
+  // when the operator has asked for the static one.
+  const bundled=bundledFfmpeg(),system={label:'System FFmpeg',path:'ffmpeg'};
+  const list=[];
+  if(process.env.CINEMA_STATIC_FFMPEG==='1' || process.env.CINEMA_STATIC_FFMPEG==='true'){
+    list.push({label:'Static FFmpeg (downloaded)',path:staticFfmpegExpectedPath()});
+  }
+  list.push(system);
+  if(bundled)list.push({label:'Bundled FFmpeg',path:bundled});
+  return list;
+}
 function executableError(error){
   if(error?.code==='ENOENT')return 'FFmpeg executable or its system loader was not found';
   if(error?.code==='EACCES' || error?.code==='EPERM')return 'FFmpeg execution was denied (permissions or noexec filesystem)';
@@ -181,4 +199,4 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
   function status(id,sid){if(active && active.id===id && active.sid===sid && !active.stopped){active.lastAccess=Date.now();return {active:true,error:null};}const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
   return {start,read,stopFor,stopRequest,stopSession,stopAny,status,close:()=>stop(active)};
 }
-module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg};
+module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg,STATIC_FFMPEG,staticFfmpegExpectedPath};

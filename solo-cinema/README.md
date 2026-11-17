@@ -16,6 +16,28 @@ Set `CINEMA_RELAY=0` to disable the relay and require conversion (the previous b
 
 **Bandwidth note:** the relay costs server bandwidth equal to what you watch, because the bytes pass through the host. If the host has a transfer allowance, watch that; there is no disk cost.
 
+## FFmpeg and temporary storage
+
+Conversion is the only playback path, so the server refuses to play anything
+useful without a working FFmpeg. Startup now says which of these you have:
+
+- **`ffmpeg: ok <path>`** — the real probes (x264, AAC, HLS muxer, scale/pad,
+  readrate) all passed.
+- **`ffmpeg: NOT USABLE`** — nothing will play. Fix with `node troy-ffmpeg.js`
+  (downloads a static build, no root needed) or `apt-get install -y ffmpeg`.
+
+**Temporary storage matters as much.** Conversion writes growing HLS segments
+for as long as something is playing. If the temp directory is `tmpfs` it lives
+in RAM, so a full-length title can consume memory and get the server killed
+mid-playback. The server now moves output off tmpfs automatically when the
+system temp is RAM-backed, and prints where it chose:
+
+```
+temp:     /home/container/.troy-media  [disk (system temp is tmpfs)]  14.2 GB free
+```
+
+Set `CINEMA_TMPDIR` to override, or keep the automatic choice.
+
 ## When one server works and another does not
 
 The same build can play on one host and fail on another. That is almost never
