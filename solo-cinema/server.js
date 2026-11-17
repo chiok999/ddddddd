@@ -34,7 +34,12 @@ function remember(url, sid, referer = null, format = null, origin = null, userAg
 const transcodeTmp=process.env.CINEMA_TMPDIR || require('node:os').tmpdir();
 if(process.platform==='linux') fs.statfs(transcodeTmp,(err,stat)=>{if(!err && Number(stat.type)===0x01021994)console.warn('Troy temporary output is on tmpfs and may consume RAM.');});
 const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent)).response});
-const transcoder=require('./transcode').createTranscoder({open:openSource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
+const openHlsResource=async(source,signal,range)=>{
+  const headers={'accept-encoding':'identity'};if(range)headers.range=range;
+  if(source.userAgent)headers['user-agent']=source.userAgent;if(source.referer)headers.referer=source.referer;if(source.origin)headers.origin=source.origin;
+  return (await getRemote(source.url,headers,signal,fetch,agent)).response;
+};
+const transcoder=require('./transcode').createTranscoder({open:openSource,openHlsResource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
 async function providerRequest(url, opts = {}) {
@@ -238,7 +243,6 @@ const server = http.createServer(async (req, res) => {
       if (!authorized) return send(res,401,{error:'Login required'});
       const data=await body(req);if(typeof data.url!=='string' || !/^\/media\/[A-Za-z0-9_-]+$/.test(data.url)) return send(res,400,{error:'Select an existing direct source'});
       const entry=sources.get(data.url.slice(7));if(!entry || entry.sid!==sid || entry.expires<Date.now())return send(res,404,{error:'Source expired'});
-      if(entry.format==='hls')return send(res,400,{error:'Transcoding currently supports direct MP4 sources, not HLS playlists'});
       if(data.requestId!==undefined && (typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId)))return send(res,400,{error:'Invalid request ID'});
       const disconnected=new AbortController();
       const onClose=()=>{if(!res.writableEnded)disconnected.abort();};res.once('close',onClose);
