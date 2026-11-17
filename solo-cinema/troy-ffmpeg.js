@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 'use strict';
+const guard = require('./tool-guard');
+if (guard.startServerIfPanelEntry('troy-ffmpeg.js')) return;
 // Gets a working FFmpeg onto a panel container where you cannot install
 // packages and cannot pass devices through.
 //

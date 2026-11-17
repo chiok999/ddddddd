@@ -756,3 +756,31 @@ test('a downloaded static FFmpeg is decompressed, executable and preferred', asy
     finally { if (previous === undefined) delete process.env.CINEMA_FFMPEG; else process.env.CINEMA_FFMPEG = previous; }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('a panel that launches a diagnostic tool still starts the server', async () => {
+ const { isPanelEntry } = require('./tool-guard');
+ const saved = { ...process.env };
+ const savedArgv = process.argv.slice(), savedTTY = process.stdout.isTTY;
+ try {
+  // A panel: no tool arguments, piped stdout, and its own environment markers.
+  process.argv = ['node', 'troy-426.js']; process.stdout.isTTY = false; process.env.MAIN_FILE = 'troy-426.js';
+  assert.equal(isPanelEntry(), true, 'a bare tool run under a panel is a misconfiguration');
+
+  // A person in a shell gets the tool, not the server.
+  process.stdout.isTTY = true;
+  assert.equal(isPanelEntry(), false, 'an interactive terminal still runs the tool');
+
+  // Explicit tool arguments always mean the tool.
+  process.stdout.isTTY = false; process.argv = ['node', 'troy-426.js', 'https://example.com/x'];
+  assert.equal(isPanelEntry(), false, 'arguments mean this is a deliberate tool run');
+
+  // The escape hatch is honoured.
+  process.argv = ['node', 'troy-426.js']; process.env.TROY_ALLOW_TOOL_EXIT = '1';
+  assert.equal(isPanelEntry(), false);
+ } finally {
+  process.argv = savedArgv; process.stdout.isTTY = savedTTY;
+  for (const key of ['MAIN_FILE', 'TROY_ALLOW_TOOL_EXIT']) {
+   if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
+  }
+ }
+});
