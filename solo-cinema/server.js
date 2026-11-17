@@ -24,6 +24,10 @@ const catalog = new Map();
 const captions = new Map();
 const captionSources = new Map();
 const agent = new Agent({ connect: { lookup: publicLookup() } });
+// Second agent that offers HTTP/2 via ALPN. Some provider edges answer 426
+// (upgrade required) to HTTP/1.1 for certain endpoints, which is why a series
+// can fail where a movie plays. Same pinned DNS lookup, same validation.
+const h2Agent = new Agent({ allowH2: true, connect: { lookup: publicLookup() } });
 const fail = msg => { throw new Error(msg); };
 function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null, refreshAfterMs = null) {
   const id = crypto.randomBytes(24).toString('base64url');
@@ -48,7 +52,7 @@ function resolveTranscodeTmp(){
   return {dir:systemTmp,reason:'system temp (no disk-backed option)'};
 }
 const {dir:transcodeTmp,reason:transcodeTmpReason}=resolveTranscodeTmp();
-const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent)).response});
+const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent,h2Agent)).response});
 const transcoder=require('./transcode').createTranscoder({open:openSource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
@@ -249,7 +253,7 @@ const server = http.createServer(async (req, res) => {
           if(source.userAgent)headers['user-agent']=source.userAgent;
           if(source.referer)headers.referer=source.referer;
           if(source.origin)headers.origin=source.origin;
-          return (await getRemote(source.url,headers,signal,fetch,agent)).response;
+          return (await getRemote(source.url,headers,signal,fetch,agent,h2Agent)).response;
         },entry);
         return send(res,200,result);
       } catch {return send(res,502,{error:'Range probe failed'});} finally {activeRangeProbes--;}

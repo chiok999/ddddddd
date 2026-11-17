@@ -49,7 +49,11 @@ test('UI searches, lists sources, and switches after fatal playback errors', asy
     instances[0].emit('error',{fatal:true,details:'late'}); await tick(); assert.equal(instances.length,2);
     instances[1].emit('error',{fatal:true,details:'failed'}); await tick(); assert.equal(instances[2].url,'/transcode/second/master.m3u8');
     instances[2].emit('error',{fatal:true,details:'failed'}); await tick(); assert.equal(instances[3].url,'/transcode/second/master.m3u8');
-    instances[3].emit('error',{fatal:true,details:'failed'}); await tick(); assert.match(w.document.getElementById('playError').textContent,/Unable to transcode any available source/);
+    instances[3].emit('error',{fatal:true,details:'failed'}); await tick(); // The final message must name each provider that was tried, and count them.
+    const finalText=w.document.getElementById('playError').textContent;
+    assert.match(finalText,/No source could be played/);
+    assert.match(finalText,/Tried 2 sources: moviebox/);
+    assert.match(finalText,/vaplayer/);
   } finally {w.close();}
 });
 

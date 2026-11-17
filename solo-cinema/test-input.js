@@ -82,3 +82,47 @@ test('provider TTL refresh runs before open without bypassing range validator ch
  const original={headers:new Headers({'etag':'"original"','content-length':'5'}),body:new ReadableStream({start(c){c.enqueue(Uint8Array.from([1,2]));setTimeout(()=>c.error(Error('disconnect')),1);}})};
  await assert.rejects(collect(resumableInput(original,()=>Promise.resolve(response),controller.signal,{retries:1,backoffMs:1})),/Source changed/);
 });
+
+test('a series host that answers 426 to HTTP/1.1 plays once HTTP/2 is offered', async t => {
+ // This is the reported failure: a movie plays, a series returns 426 from the
+ // same server. The difference is the edge demanding HTTP/2 (ALPN) for the
+ // series endpoint, which the server previously could not offer at all.
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),http2=require('node:http2');
+ const {spawnSync}=require('node:child_process');const {Agent,fetch}=require('undici');
+ const {getRemote,h2Requested}=require('./network');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'troy-series-'));
+ const key=path.join(dir,'key.pem'),cert=path.join(dir,'cert.pem');
+ const gen=spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',key,'-out',cert,'-days','1','-subj','/CN=fixture.test'],{stdio:'ignore'});
+ if(gen.error||gen.status!==0){fs.rmSync(dir,{recursive:true,force:true});return t.skip('openssl unavailable');}
+
+ const server=http2.createSecureServer({key:fs.readFileSync(key),cert:fs.readFileSync(cert),allowHTTP1:true});
+ const seen=[];
+ server.on('request',(req,res)=>{
+  seen.push({version:req.httpVersionMajor,url:req.url});
+  if(req.httpVersionMajor===1){
+   // Exactly what the series edge does: refuse HTTP/1.1, ask for an upgrade.
+   res.writeHead(426,{upgrade:'h2'});res.end();return;
+  }
+  res.writeHead(200,{'content-type':'video/mp4'});res.end('series bytes');
+ });
+ server.listen(0,'127.0.0.1');await once(server,'listening');
+
+ const lookup=(name,options,cb)=>options.all?cb(null,[{address:'127.0.0.1',family:4}]):cb(null,'127.0.0.1',4);
+ const connect={lookup,rejectUnauthorized:false};
+ const h1=new Agent({connect}),h2=new Agent({connect,allowH2:true});
+ const fixtureFetch=(url,options)=>{const u=new URL(url);u.port=String(server.address().port);return fetch(u,options);};
+ try{
+  const {response}=await getRemote('https://fixture.test/series.m3u8',{},AbortSignal.timeout(15000),fixtureFetch,h1,h2);
+  assert.equal(response.status,200,'the retry over HTTP/2 is accepted');
+  assert.equal(await response.text(),'series bytes');
+  assert.deepEqual(seen.map(s=>s.version),[1,2],'one refused HTTP/1.1 request, then HTTP/2');
+  // Without an h2 agent the failure is reported honestly rather than looping.
+  seen.length=0;
+  const plain=await getRemote('https://fixture.test/series.m3u8',{},AbortSignal.timeout(15000),fixtureFetch,h1);
+  assert.equal(plain.response.status,426);
+  assert.equal(seen.length,1);
+  // A refusal that names something other than h2 is not retried.
+  assert.equal(h2Requested({headers:{get:()=> 'websocket'}}),false);
+  assert.equal(h2Requested({headers:{get:()=> null}}),true);
+ }finally{await h1.close();await h2.close();server.closeAllConnections?.();await new Promise(r=>server.close(r));fs.rmSync(dir,{recursive:true,force:true});}
+});

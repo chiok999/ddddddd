@@ -83,10 +83,30 @@ $('sourceForm').onsubmit=e=>{ e.preventDefault(); stopTranscode(); ++resolveSequ
 const providerStats=new Map();
 function scoreProvider(name){const stat=providerStats.get(name);return stat?(stat.ok+1)/(stat.ok+stat.fail+2):0.5;}
 function recordProvider(name,success){if(!name)return;const stat=providerStats.get(name)||{ok:0,fail:0};if(stat.ok+stat.fail>=20){stat.ok=Math.floor(stat.ok/2);stat.fail=Math.floor(stat.fail/2);}stat[success?'ok':'fail']++;providerStats.set(name,stat);}
+// Every failed attempt is collected, so the final message names the providers
+// that were tried instead of showing only the last error. Movies and episodes
+// resolve through different provider mixes, which is why one can fail and the
+// other not -- the list makes that visible.
+let attemptErrors=[];
 const fallback = createFallback((item, index, total, fail, isActive) => {
+  if(index===0) attemptErrors=[];
   $('playError').textContent=index ? `Trying another source (${index+1}/${total})…` : '';
-  playItem(item, ()=>{if(isActive()){recordProvider(item.provider,false);fail();}}, index>0, isActive);
-}, () => { pendingFailure=null; stopTranscode(); if(hls){hls.destroy();hls=null;} const video=$('video');video.pause();video.removeAttribute('src');video.load(); $('playError').textContent='Unable to transcode any available source. '+lastTranscodeError; });
+  playItem(item, ()=>{
+    if(isActive()){
+      recordProvider(item.provider,false);
+      const reason=String(lastTranscodeError||'failed').replace(/https?:\/\/\S+/g,'[source]');
+      attemptErrors.push(`${item.provider||'Direct'}${item.format?' ('+item.format+')':''}: ${reason}`);
+      fail();
+    }
+  }, index>0, isActive);
+}, () => {
+  pendingFailure=null; stopTranscode(); if(hls){hls.destroy();hls=null;}
+  const video=$('video');video.pause();video.removeAttribute('src');video.load();
+  // Name every provider that was tried: episodes and movies resolve through
+  // different provider mixes, so the list is what shows which engine failed.
+  const summary=attemptErrors.length>1 ? ` Tried ${attemptErrors.length} sources: ${attemptErrors.join(' · ')}` : '';
+  $('playError').textContent='No source could be played. '+lastTranscodeError+summary;
+});
 async function playItem(item, fail, isFallback = false, isActive = () => true) {
   stopTranscode(); const sequence=transcodeSequence; const oldVideo=$('video'); if(hls){hls.destroy();hls=null;} oldVideo.pause();oldVideo.removeAttribute('src');oldVideo.load();
   directControls(true);

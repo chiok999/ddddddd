@@ -17,6 +17,8 @@ const { chooseFfmpeg, ffmpegCandidates, bundledFfmpeg } = require('./transcode')
 const say = line => console.log(line);
 const pad = (label, width = 20) => String(label).padEnd(width);
 const agent = new Agent({ connect: { lookup: publicLookup() } });
+// The server retries a 426 over HTTP/2, so test the same way it does.
+const h2Agent = new Agent({ allowH2: true, connect: { lookup: publicLookup() } });
 
 // Usage is a source URL, because that is the only thing that decides whether
 // conversion can succeed.
@@ -59,7 +61,7 @@ const target = urlIndex > 0 ? process.argv[urlIndex + 1] : null;
   let response;
   const started = Date.now();
   try {
-    response = (await getRemote(safe.href, headers, AbortSignal.timeout(30000), fetch, agent)).response;
+    response = (await getRemote(safe.href, headers, AbortSignal.timeout(30000), fetch, agent, h2Agent)).response;
   } catch (error) {
     say(pad('  open') + `FAILED ${error.code || error.message} (${Date.now() - started}ms)`);
     say('');
@@ -70,6 +72,17 @@ const target = urlIndex > 0 ? process.argv[urlIndex + 1] : null;
   say(pad('  status') + `${response.status} (${ms}ms)`);
   say(pad('  content-type') + (response.headers.get('content-type') || 'none'));
   say(pad('  encoding') + (response.headers.get('content-encoding') || 'identity'));
+  // Reporting the protocol matters: a 426 here means HTTP/2 was needed, and
+  // seeing HTTP/2 accepted is how we know the retry is what fixed it.
+  say(pad('  protocol') + (response.headers.get('x-troy-protocol') || (response.httpVersion ? `HTTP/${response.httpVersion}` : 'negotiated')));
+  if (response.status === 426) {
+    await response.body?.cancel().catch(() => {});
+    say('');
+    say('The host answered 426 (upgrade required) even after retrying over');
+    say('HTTP/2. That means it is refusing this server\'s address or TLS');
+    say('fingerprint, not asking for a protocol it did not get.');
+    return;
+  }
   if (response.status !== 200) {
     await response.body?.cancel().catch(() => {});
     say('');
@@ -111,7 +124,7 @@ const target = urlIndex > 0 ? process.argv[urlIndex + 1] : null;
   say(pad('  ffmpeg') + binary);
 
   // Fetch a second time so FFmpeg gets a clean stream from the start.
-  const second = (await getRemote(safe.href, headers, AbortSignal.timeout(30000), fetch, agent)).response;
+  const second = (await getRemote(safe.href, headers, AbortSignal.timeout(30000), fetch, agent, h2Agent)).response;
   if (second.status !== 200) { say(`  could not refetch: HTTP ${second.status}`); await second.body?.cancel().catch(() => {}); return; }
   const { Readable } = require('node:stream');
   const input = Readable.fromWeb(second.body);
@@ -135,7 +148,7 @@ const target = urlIndex > 0 ? process.argv[urlIndex + 1] : null;
     say('the demuxer; if it is MP4, it may not be fast-start.');
   }
 })().catch(error => { console.error('test failed:', error.message); process.exit(1); })
-  .finally(() => agent.close().catch(() => {}));
+  .finally(() => Promise.all([agent.close().catch(() => {}), h2Agent.close().catch(() => {})]));
 
 async function streamToBuffer(stream, limit) {
   const chunks = []; let size = 0;

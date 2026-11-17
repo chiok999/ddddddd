@@ -56,11 +56,29 @@ function publicLookup(resolve = dns.lookup) {
     }).catch(callback);
   };
 }
-async function getRemote(input, headers, signal, fetch, agent) {
+// A 426 means "upgrade required": the edge wants this request over HTTP/2.
+// Some provider CDNs (series hosts especially) accept HTTP/1.1 for some
+// endpoints and refuse it for others, which is why one title plays and another
+// returns 426 from the same server. HTTP/2 is negotiated by TLS ALPN, so the
+// fix is to offer it rather than to change any header.
+function h2Requested(response){
+  const upgrade=response.headers.get('upgrade');
+  // An absent Upgrade header is treated as a request to negotiate h2: a
+  // misconfigured edge often omits it, and a needless retry costs one request.
+  return !upgrade || /(?:^|[,\s])h2(?:$|[,\s])/i.test(upgrade);
+}
+async function getRemote(input, headers, signal, fetch, agent, h2Agent = null) {
   let url = safeUrl(input);
   let forwarded=new Headers(headers);
   for (let n = 0; n <= 5; n++) {
-    const response = await fetch(url, { dispatcher: agent, headers:forwarded, redirect: 'manual', signal });
+    let response = await fetch(url, { dispatcher: agent, headers:forwarded, redirect: 'manual', signal });
+    // Retry once over HTTP/2 before following anything. Only GET-like reads are
+    // ever reached here, and the body has not been consumed yet.
+    if (response.status === 426 && h2Agent && h2Requested(response)) {
+      await response.body?.cancel().catch(()=>{});
+      try { response = await fetch(url, { dispatcher: h2Agent, headers:forwarded, redirect: 'manual', signal }); }
+      catch (error) { if (signal?.aborted) throw error; }
+    }
     if (![301,302,303,307,308].includes(response.status)) return { response, url };
     const location = response.headers.get('location');
     await response.body?.cancel();
@@ -70,4 +88,4 @@ async function getRemote(input, headers, signal, fetch, agent) {
     url=next;
   }
 }
-module.exports = { safeUrl, publicLookup, getRemote, forceIPv4, ipv6Unrouted };
+module.exports = { safeUrl, publicLookup, getRemote, forceIPv4, ipv6Unrouted, h2Requested };
