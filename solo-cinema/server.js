@@ -18,6 +18,7 @@ if (password.length < 12) { console.error('Set CINEMA_PASSWORD to at least 12 ch
 const sessions = new Map();
 const sources = new Map();
 let loginFailures = [];
+let activeRangeProbes = 0;
 const catalog = new Map();
 const captions = new Map();
 const captionSources = new Map();
@@ -193,7 +194,7 @@ const server = http.createServer(async (req, res) => {
       const streams = result.streams.map(stream => {
         let captionId=null;
         if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
-        return { provider:stream.provider, quality:stream.quality, format:stream.format, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent) };
+        return { provider:stream.provider, quality:stream.quality, format:stream.format, duration:Number.isFinite(stream.duration) && stream.duration>0 && stream.duration<=86400 ? stream.duration : null, captionId, url:remember(stream.url, sid, stream.referer, stream.format, stream.origin, stream.userAgent) };
       });
       return send(res, 200, { title:selected.item.title, streams, providers:result.providers });
     }
@@ -201,6 +202,26 @@ const server = http.createServer(async (req, res) => {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const data = await body(req);
       return send(res, 200, { url: remember(data.url, sid, null, data.format === 'hls' ? 'hls' : null) });
+    }
+    if (url.pathname === '/api/source/probe' && req.method === 'POST') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      const data=await body(req);
+      if(typeof data.url!=='string' || !/^\/media\/[A-Za-z0-9_-]+$/.test(data.url)) return send(res,400,{error:'Invalid source handle'});
+      const entry=sources.get(data.url.slice(7));
+      if(!entry || entry.sid!==sid || entry.expires<Date.now())return send(res,404,{error:'Source expired'});
+      if(entry.format==='hls')return send(res,400,{error:'This probe is for progressive files, not playlists'});
+      if(activeRangeProbes>=2)return send(res,429,{error:'Too many range probes'});
+      activeRangeProbes++;
+      try {
+        const result=await require('./source-probe').probeRange(async(source,signal,start,end)=>{
+          const headers={range:`bytes=${start}-${end}`,'accept-encoding':'identity'};
+          if(source.userAgent)headers['user-agent']=source.userAgent;
+          if(source.referer)headers.referer=source.referer;
+          if(source.origin)headers.origin=source.origin;
+          return (await getRemote(source.url,headers,signal,fetch,agent)).response;
+        },entry);
+        return send(res,200,result);
+      } catch {return send(res,502,{error:'Range probe failed'});} finally {activeRangeProbes--;}
     }
     if (url.pathname === '/api/transcode' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
