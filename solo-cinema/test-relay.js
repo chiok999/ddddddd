@@ -221,6 +221,16 @@ test('the worker reports its own health and refuses a missing key', async () => 
   assert.equal(refused.status, 500);
 });
 
+test('the paste-ready worker is the tested worker with a different header', async () => {
+  const fs = require('node:fs');
+  const body = (file) => fs.readFileSync(path.join(__dirname, 'worker', file), 'utf8').slice(fs.readFileSync(path.join(__dirname, 'worker', file), 'utf8').indexOf('const VERSION'));
+  assert.equal(body('troy-relay-paste.js'), body('troy-relay.mjs'), 'the two worker files must not drift apart');
+  // and it is the one that actually runs
+  const pasted = await import(pathToFileURL(WORKER).href);
+  assert.equal(typeof pasted.createFetchHandler, 'function');
+  assert.equal(typeof pasted.default.fetch, 'function');
+});
+
 test('relay settings are validated instead of silently half-configured', () => {
   assert.equal(relayConfig({}), null);
   assert.equal(relayConfig({ CINEMA_RELAY_URL: '  ' }), null);

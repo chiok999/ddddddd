@@ -25,7 +25,10 @@ four-byte-range probing, FFmpeg. Only the address the bytes come from changes.
 
 1. Cloudflare dashboard → **Workers & Pages** → **Create** → **Worker**.
 2. Name it anything (`troy-relay`), **Deploy** the starter.
-3. **Edit code**, delete what is there, paste all of [`troy-relay.mjs`](./troy-relay.mjs), **Deploy**.
+3. **Edit code**, select everything, paste all of [`troy-relay-paste.js`](./troy-relay-paste.js), **Deploy**.
+   (`troy-relay-paste.js` is the same program as `troy-relay.mjs` with the
+   deployment steps written at the top, because the dashboard editor has no
+   comment-free copy. Keep the two in step.)
 4. **Settings → Variables and Secrets → Add**:
    - Type **Secret**, name `RELAY_KEY`, value: a long random string. Make one with
      `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
@@ -133,6 +136,7 @@ so the allow-list is unnecessary -- signed is enough.
 | File | What it is |
 |---|---|
 | `troy-relay.mjs` | the worker. This is the whole thing; nothing to install. |
+| `troy-relay-paste.js` | the same program plus the deployment steps at the top, for pasting into the dashboard editor. |
 | `../relay.js` | the Troy-side client: signs URLs, turns the artifact back into a normal-looking response. |
 | `../troy-relay.js` | the harness: runs that same worker locally against a 426 fixture. |
 | `../test-relay.js` | 11 tests covering the client and the worker contract. |
