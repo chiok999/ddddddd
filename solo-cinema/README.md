@@ -16,6 +16,31 @@ Set `CINEMA_RELAY=0` to disable the relay and require conversion (the previous b
 
 **Bandwidth note:** the relay costs server bandwidth equal to what you watch, because the bytes pass through the host. If the host has a transfer allowance, watch that; there is no disk cost.
 
+## When one server works and another does not
+
+The same build can play on one host and fail on another. That is almost never
+the application: it is how that machine reaches the internet. Run this **on the
+machine that fails**:
+
+```sh
+node diagnose-host.js "https://<the-media-host>/path"
+```
+
+It reports IPv6 routability, what the media host resolves to, whether a TCP
+connection to each answer actually opens, and the same request under both
+address-family policies.
+
+**`CINEMA_IPV4=1` forces IPv4** for all outbound source and provider traffic.
+Set it when the diagnostic reports `IPv6 route NOT reachable` while the media
+host returns AAAA records — the very common case on cheap VPS hosts, where DNS
+keeps handing out an IPv6 address the machine cannot route, so every source
+fails for a reason that has nothing to do with the providers. Leave it unset on
+a working dual-stack or IPv6-only network.
+
+```sh
+CINEMA_IPV4=1 npm start
+```
+
 ## Run
 
 Requires Node.js 22.13+.
