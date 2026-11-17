@@ -70,13 +70,12 @@ module.exports = function createMoviebox({ request, safeUrl }) {
           const qs = new URLSearchParams({ subjectId:candidate.subjectId, detailPath:candidate.detailPath, se:String(se), ep:String(ep) });
           const referer = `${player}/spa/videoPlayPage/movies/${encodeURIComponent(candidate.detailPath)}?${new URLSearchParams({ id:candidate.subjectId, type:'/movie/detail', detailSe:String(se), detailEp:String(ep), lang:'en' })}`;
           let response;
-          // The playback API can live on the BFF even when the player domain is
-          // a static site. Keep the guest bearer on the fixed BFF origin only.
-          const bffQuery=new URLSearchParams(qs);bffQuery.set('host','moviebox.ph');
-          try { response=await bff(`/subject/play?${bffQuery}`,null,refresh>0,referer); }
+          // Match the bot: ask the player domain first, with the BFF as fallback.
+          try { response=await request(`${player}/wefeed-h5api-bff/subject/play?${qs}`,{headers:{...headers,referer,'x-source':''}}); }
           catch(e) { if(e.name==='AbortError')throw e; }
           if(!response?.json?.data?.streams?.length && !response?.json?.data?.hls?.length){
-            try{response=await request(`${player}/wefeed-h5api-bff/subject/play?${qs}`,{headers:{...headers,referer,'x-source':''}});}
+            const bffQuery=new URLSearchParams(qs);bffQuery.set('host','moviebox.ph');
+            try { response=await bff(`/subject/play?${bffQuery}`,null,refresh>0,referer); }
             catch(e){if([403,404].includes(e.status) && refresh===0)continue;throw e;}
           }
           const data = response.json?.data || {};

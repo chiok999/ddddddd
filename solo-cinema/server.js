@@ -37,7 +37,7 @@ const transcodeTmp=process.env.CINEMA_TMPDIR || require('node:os').tmpdir();
 if(process.platform==='linux') fs.statfs(transcodeTmp,(err,stat)=>{if(!err && Number(stat.type)===0x01021994)console.warn('Troy temporary output is on tmpfs and may consume RAM.');});
 const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent,h2Agent)).response});
 const openHlsResource=async(source,signal,range)=>{
-  const headers={'accept-encoding':'identity'};if(range)headers.range=range;
+  const headers={'accept-encoding':'identity','user-agent':source.userAgent || require('./source-opener').DEFAULT_USER_AGENT};if(range)headers.range=range;
   if(source.userAgent)headers['user-agent']=source.userAgent;if(source.referer)headers.referer=source.referer;if(source.origin)headers.origin=source.origin;
   return (await getRemote(source.url,headers,signal,fetch,agent,h2Agent)).response;
 };

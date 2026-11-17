@@ -1,9 +1,10 @@
 'use strict';
 // `remote` is responsible for URL validation and DNS pinning on every request
 // and redirect. Refresh is only supplied for provider-resolved sources.
+const DEFAULT_USER_AGENT = process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 function createSourceOpener({remote,safeUrl,now=Date.now}) {
   async function request(entry,signal,offset,validator) {
-    const headers={'accept-encoding':'identity'};
+    const headers={'accept-encoding':'identity','user-agent':entry.userAgent || DEFAULT_USER_AGENT};
     if(offset){headers.range=`bytes=${offset}-`;headers['if-range']=validator;}
     if(entry.userAgent)headers['user-agent']=entry.userAgent;
     if(entry.referer)headers.referer=entry.referer;
@@ -27,4 +28,4 @@ function createSourceOpener({remote,safeUrl,now=Date.now}) {
     return request(refreshed,signal,offset,validator);
   };
 }
-module.exports={createSourceOpener};
+module.exports={createSourceOpener,DEFAULT_USER_AGENT};

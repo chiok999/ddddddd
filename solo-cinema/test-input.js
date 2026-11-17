@@ -120,3 +120,12 @@ test('real FFmpeg plays movie and series-style HLS fixtures after 426 without Up
   assert.ok(versions.includes(1));assert.ok(versions.includes(2));
  }finally{await transcoder?.close();await h1?.close();await h2?.close();if(server){server.closeAllConnections?.();await new Promise(r=>server.close(r));}await fsp.rm(dir,{recursive:true,force:true});}
 });
+
+test('source requests use the bot user agent unless a provider supplies one',async()=>{
+ const {createSourceOpener,DEFAULT_USER_AGENT}=require('./source-opener');
+ const seen=[];const open=createSourceOpener({safeUrl:u=>new URL(u),remote:async(url,headers)=>{seen.push(headers);return new Response('ok',{status:headers['user-agent']===DEFAULT_USER_AGENT || headers['user-agent']==='provider-agent'?200:426});}});
+ const signal=new AbortController().signal;
+ assert.equal((await open({url:'https://example.com/movie',referer:'https://player.example/'},signal)).status,200);
+ assert.equal((await open({url:'https://example.com/episode',userAgent:'provider-agent'},signal)).status,200);
+ assert.equal(seen[0]['user-agent'],DEFAULT_USER_AGENT);assert.equal(seen[0].referer,'https://player.example/');assert.equal(seen[1]['user-agent'],'provider-agent');
+});
