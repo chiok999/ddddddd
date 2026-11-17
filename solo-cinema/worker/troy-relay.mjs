@@ -32,9 +32,10 @@
  *   x-troy-etag       upstream etag
  *   x-troy-modified   upstream last-modified
  *   x-troy-encoding   upstream content-encoding
+ *   x-troy-accept-ranges  upstream accept-ranges
  *
  * The body is the upstream bytes, unmodified and streamed, so a 4 GB file costs
- * this worker no more than a 4 URL file.
+ * this worker no more than a 4 KB file.
  *
  * Without art=1 the response is passed through as-is, which is useful for
  * checking a source in a browser.
