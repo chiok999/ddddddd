@@ -413,7 +413,7 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  assert.equal(await t.stopFor(job.id,'bob'),false);assert.equal(await t.stopFor(job.id,'alice'),true);assert.equal(await t.read(job.id,'alice','master.m3u8'),null);assert.deepEqual((await fsp.readdir(dir)).sort(),['sample.mp4']);
  const silent=path.join(dir,'silent.mp4');const noAudio=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-t','10','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart',silent],{encoding:'utf8'});assert.equal(noAudio.status,0,noAudio.stderr);
  const limited=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
- try{const small=await limited.start({},'alice');await new Promise(r=>setTimeout(r,3000));assert.equal(await limited.read(small.id,'alice','master.m3u8'),null);}finally{await limited.close();}
+ try{const small=await limited.start({},'alice');await new Promise(r=>setTimeout(r,3000));assert.equal(await limited.read(small.id,'alice','master.m3u8'),null);assert.match(limited.status(small.id,'alice').error,/temporary storage/);assert.equal(limited.status(small.id,'bob'),null);}finally{await limited.close();}
  }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true})}
 });
 
@@ -470,4 +470,22 @@ test('FFmpeg EVENT retains early segments and ends a completed short fixture', {
   const manifest=await fs.readFile(file,'utf8');const segments=manifest.split('\n').filter(x=>/^index\d+\.ts$/.test(x));assert.match(manifest,/#EXT-X-PLAYLIST-TYPE:EVENT/);assert.match(manifest,/#EXT-X-ENDLIST/);assert.ok(segments.length>8);assert.equal(segments[0],'index0.ts');const first=await fs.readFile(path.join(dir,segments[0]));assert.ok(first.length>0);
   const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-frames:v','1','-f','null','-'],{input:first,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));
  }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
+
+test('production transcoder retains earlier segments throughout an EVENT and finalizes on completion', {skip:!testFfmpeg,timeout:100000},async()=>{
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-event-job-')),file=path.join(dir,'source.mp4');
+ const input=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-f','lavfi','-i','sine=frequency=440','-t','44','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac',file],{encoding:'utf8',timeout:20000});assert.equal(input.status,0,input.stderr);
+ const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,startupMs:35000,idleMs:90000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(file))})});
+ try{
+  const job=await t.start({},'alice');const start=await t.read(job.id,'alice','240/index.m3u8');assert.match(start.data.toString(),/#EXT-X-PLAYLIST-TYPE:EVENT/);assert.doesNotMatch(start.data.toString(),/#EXT-X-ENDLIST/);assert.match(start.data.toString(),/index0\.ts/);
+  const deadline=Date.now()+65000;let manifests=[];
+  while(Date.now()<deadline){await new Promise(r=>setTimeout(r,1000));manifests=await Promise.all(['240','360'].map(q=>t.read(job.id,'alice',`${q}/index.m3u8`)));if(manifests.every(m=>m && /#EXT-X-ENDLIST/.test(m.data.toString())))break;}
+  for(let i=0;i<2;i++){
+   const quality=['240','360'][i],text=manifests[i].data.toString(),segments=text.split('\n').filter(s=>/^index\d+\.ts$/.test(s));
+   assert.match(text,/#EXT-X-PLAYLIST-TYPE:EVENT/);assert.match(text,/#EXT-X-ENDLIST/);assert.ok(segments.length>8);assert.equal(segments[0],'index0.ts');assert.equal(await t.read(job.id,'bob',`${quality}/index0.ts`),null);
+   const first=await t.read(job.id,'alice',`${quality}/index0.ts`),last=await t.read(job.id,'alice',`${quality}/${segments.at(-1)}`);assert.ok(first?.data.length);assert.ok(last?.data.length);
+   for(const part of [first,last]){const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:part.data,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));}
+  }
+ }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true});}
 });

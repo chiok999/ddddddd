@@ -1,3 +1,5 @@
+> Current update: bounded EVENT output is now implemented for supported MP4 inputs; see `TRANSCODING-AUDIT.md`. Seek only through the already-converted portion. The earlier investigations below are historical.
+
 # Full-length seeking and mandatory transcoding investigation
 
 **Status:** mandatory conversion was added after this investigation; full-length VOD seeking remains unimplemented. The transcoder is still a rolling live HLS window.
