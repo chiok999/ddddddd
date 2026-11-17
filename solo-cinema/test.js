@@ -12,12 +12,13 @@ test('login, origin, and private URL protections', async () => {
   const base=`http://127.0.0.1:${port}`;
   const post=(p,data,extra={})=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...extra},body:JSON.stringify(data)});
   assert.equal((await post('/api/source',{url:'https://example.com/video'})).status,401);
-  assert.equal((await post('/api/vidrift',{id:'not-a-session-id',season:1,episode:1})).status,401);
-  const page=await fetch(base+'/'); assert.match(page.headers.get('content-security-policy'),/frame-src https:\/\/embed\.vidrift\.net/);
+  const page=await fetch(base+'/'); assert.match(page.headers.get('content-security-policy'),/frame-src 'none'/);
   assert.equal((await post('/api/login',{password:'wrong'})).status,401);
   assert.equal((await post('/api/login',{password:'a-strong-test-password'},{origin:'https://evil.test'})).status,403);
   const login=await post('/api/login',{password:'a-strong-test-password'}); assert.equal(login.status,200);
   const cookie=login.headers.get('set-cookie').split(';')[0];
+  assert.equal((await post('/api/vidrift',{id:'x'},{cookie})).status,404);
+  assert.equal((await post('/api/embed',{id:'x'},{cookie})).status,404);
   for(const url of ['http://127.0.0.1/','https://127.0.0.1/','https://localhost/','https://example.com:8443/','https://user:pass@example.com/']) {
     const res=await post('/api/source',{url},{cookie}); assert.equal(res.status,400,url);
   }
@@ -191,6 +192,8 @@ test('HTTP flow authenticates, resolves a fixture, proxies HLS segments and bloc
     const base=`http://127.0.0.1:${port}`;
     const post=(path,data,cookie)=>fetch(base+path,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});
     const login=await post('/api/login',{password:'fixture-password-123'}); const cookie=login.headers.get('set-cookie').split(';')[0];
+  assert.equal((await post('/api/vidrift',{id:'x'},{cookie})).status,404);
+  assert.equal((await post('/api/embed',{id:'x'},{cookie})).status,404);
     const found=await (await post('/api/search',{query:'Fixture'},cookie)).json(); assert.equal(found.results.length,1);
     const resolved=await (await post('/api/resolve',{id:found.results[0].id,season:1,episode:1},cookie)).json();
     assert.equal(resolved.streams.length,1); assert.equal(resolved.streams[0].provider,'moviebox');
@@ -353,20 +356,7 @@ test('metadata prefers exact release year over an undated namesake',async()=>{
  const item=await enrich({title:'Film',type:'movie',year:'2020'});assert.equal(item.imdbId,'tt2');assert.equal(item.tmdbId,'123');
 });
 
-test('VidRift embeds use validated IDs and the documented fixed movie and TV paths',()=>{
-  const {embedUrl}=require('./vidrift');
-  const movie=new URL(embedUrl({tmdbId:'438631',type:'movie',title:'Dune'},1,1));
-  assert.equal(movie.origin,'https://embed.vidrift.net');assert.equal(movie.pathname,'/embed/movie/438631');assert.equal(movie.searchParams.get('title'),'Dune');
-  const series=new URL(embedUrl({tmdbId:'1399',type:'series',title:'A & B'},2,3));assert.equal(series.pathname,'/embed/tv/1399/2/3');assert.equal(series.searchParams.get('title'),'A & B');
-  assert.throws(()=>embedUrl({tmdbId:'1/../../evil',type:'movie'},1,1),/TMDB/);assert.throws(()=>embedUrl({tmdbId:'42',type:'series'},0,1),/valid season/);assert.throws(()=>embedUrl({tmdbId:'42',type:'series'},1,10000),/valid season/);assert.throws(()=>embedUrl({tmdbId:'42',type:'bad'},1,1),/type/);
-});
 
-test('documented alternate embeds accept only fixed providers and validated IDs',()=>{
- const {embedUrl}=require('./vidrift');const item={type:'series',tmdbId:'1399',imdbId:'tt0944947'};
- assert.equal(embedUrl(item,2,3,'vixsrc'),'https://vixsrc.to/tv/1399/2/3');assert.equal(embedUrl(item,2,3,'vidlink'),'https://vidlink.pro/tv/1399/2/3');assert.equal(embedUrl(item,2,3,'vidfast'),'https://vidfast.vc/tv/1399/2/3');
- assert.equal(embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vixsrc'),'https://vixsrc.to/movie/tt1375666');assert.equal(embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vidfast'),'https://vidfast.vc/movie/tt1375666');
- assert.throws(()=>embedUrl({type:'movie',imdbId:'tt1375666'},1,1,'vidlink'),/ID unavailable/);assert.throws(()=>embedUrl(item,2,3,'https://evil.example'),/Unknown/);assert.throws(()=>embedUrl({...item,tmdbId:'https://evil'},0,1,'vidlink'));
-});
 
 test('discovery produces per-session title IDs without changing the shared metadata cache',()=>{
  const {bindDiscovery}=require('./catalog-session');const item={title:'Film',type:'movie',year:'2024',imdbId:'tt123',tmdbId:'321',poster:null};const sections=[{id:'popular-movies',items:[item],error:null}],catalog=new Map();
