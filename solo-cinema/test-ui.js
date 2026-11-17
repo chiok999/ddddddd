@@ -464,11 +464,15 @@ test('relay playback starts the provider stream immediately without converting',
   assert.deepEqual([...d.getElementById('quality').options].map(o=>o.value),['auto','240','360','720','1080']);
   d.getElementById('quality').value='720';d.getElementById('quality').dispatchEvent(new w.Event('change'));
   assert.equal(player.currentLevel,1);
-  // Asking for a level the stream lacks caps to the nearest lower one and says so.
+  assert.ok([...d.getElementById('quality').options].map(o=>o.value).includes('auto'),'Auto returns to the provider stream');
+  assert.equal(transcodes.length,0,'switching provider levels never starts a conversion');
+  // 240p is a real conversion the server can produce, so choosing it on a
+  // relayed stream starts one instead of pretending to cap a provider level.
   d.getElementById('quality').value='240';d.getElementById('quality').dispatchEvent(new w.Event('change'));
-  assert.equal(player.currentLevel,0);
-  assert.match(d.getElementById('playError').textContent,/no 240p/);
-  assert.equal(w.localStorage.getItem('solo-quality-height'),'240');
+  await tick();
+  assert.equal(transcodes.length,1,'choosing 240p converts, it does not silently cap');
+  assert.equal(transcodes[0].url,'/media/first','the conversion uses the session-bound handle');
+  assert.equal(w.localStorage.getItem('solo-quality-height'),'240','the choice is remembered');
   assert.equal(d.getElementById('video').getAttribute('src'),null,'hls.js path does not set a native src');
  }finally{w.close()}
 });
