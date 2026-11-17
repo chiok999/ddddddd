@@ -26,6 +26,28 @@ useful without a working FFmpeg. Startup now says which of these you have:
 - **`ffmpeg: NOT USABLE`** — nothing will play. Fix with `node troy-ffmpeg.js`
   (downloads a static build, no root needed) or `apt-get install -y ffmpeg`.
 
+### Getting FFmpeg without root
+
+On a panel container you usually cannot `apt install` and cannot pass devices
+through. Two supported routes, both the same prebuilt release:
+
+```sh
+# 1. the panel's own npm install, which runs on every restart
+npm install ffmpeg-static
+
+# 2. or fetch it once into the application directory
+node troy-ffmpeg.js
+```
+
+`node troy-ffmpeg.js` first checks anything already present, including the
+`ffmpeg-static` package, and only then downloads. It writes to
+`.troy-ffmpeg/ffmpeg` beside the application, not `/tmp`, so it survives panel
+restarts. Both routes need no root.
+
+If the download fails, the container cannot reach GitHub — install through the
+panel, or ask the host to allow `github.com` and
+`release-assets.githubusercontent.com`.
+
 ### Software or hardware encoding
 
 Software (`libx264`) is the default and always works: no device passthrough, no

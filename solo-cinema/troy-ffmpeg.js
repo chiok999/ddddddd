@@ -1,65 +1,49 @@
 #!/usr/bin/env node
 'use strict';
-// Gets a working FFmpeg onto a container where you cannot install packages.
+// Gets a working FFmpeg onto a panel container where you cannot install
+// packages and cannot pass devices through.
 //
 //   node troy-ffmpeg.js
 //
-// It first tries the FFmpeg candidates already on the machine. Only if none of
-// them satisfies the probes does it download a static build into the temp
-// directory. Nothing needs root and nothing is written outside the temp dir.
+// Order of preference:
+//   1. an FFmpeg already on the machine that passes the real capability probes;
+//   2. the ffmpeg-static npm package, if it is installed;
+//   3. a direct download of the same prebuilt binary into .troy-ffmpeg/ beside
+//      the application, which survives restarts because it is in the app
+//      directory rather than /tmp.
+//
+// No root. Nothing outside the application directory.
 
 const fs = require('node:fs');
 const fsp = require('node:fs').promises;
-const os = require('node:os');
 const path = require('node:path');
-const https = require('node:https');
 const { spawnSync } = require('node:child_process');
-const { ffmpegCandidates, probeFfmpeg, chooseFfmpeg, STATIC_FFMPEG, staticFfmpegExpectedPath } = require('./transcode');
+const { ffmpegCandidates, probeFfmpeg, staticFfmpegExpectedPath } = require('./transcode');
+const staticFfmpeg = require('./static-ffmpeg');
 
 const say = line => console.log(line);
-
-function download(url, destination, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    if (redirects > 5) return reject(new Error('too many redirects'));
-    https.get(url, { headers: { 'user-agent': 'troy-ffmpeg' }, timeout: 120000 }, res => {
-      if ([301, 302, 307, 308].includes(res.statusCode)) {
-        res.resume();
-        return resolve(download(new URL(res.headers.location, url).href, destination, redirects + 1));
-      }
-      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode} from ${url}`)); }
-      const total = Number(res.headers['content-length']) || 0;
-      let received = 0, lastReport = 0;
-      const file = fs.createWriteStream(destination);
-      res.on('data', chunk => {
-        received += chunk.length;
-        if (total && Date.now() - lastReport > 3000) {
-          lastReport = Date.now();
-          say(`  ${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`);
-        }
-      });
-      res.pipe(file);
-      file.on('finish', () => file.close(() => resolve(destination)));
-      file.on('error', reject);
-    }).on('error', reject).on('timeout', function () { this.destroy(new Error('download timed out')); });
-  });
-}
 
 (async () => {
   say('');
   say('Troy FFmpeg setup');
   say('='.repeat(58));
-  say(`platform  ${process.platform} ${process.arch}`);
+  say(`platform   ${process.platform} ${process.arch}`);
+  say(`target     ${staticFfmpegExpectedPath()}`);
 
-  // 1. Anything already here?
-  const candidates = ffmpegCandidates();
+  // 1. Anything already usable?
   say('');
-  say('Checking what is already installed:');
+  say('Checking what is already available:');
+  const candidates = ffmpegCandidates();
+  const seen = new Set();
   for (const candidate of candidates) {
+    if (seen.has(candidate.path)) continue;
+    seen.add(candidate.path);
     try {
       await probeFfmpeg(candidate.path);
-      say(`  OK        ${candidate.label}: ${candidate.path}`);
+      say(`  OK        ${candidate.label}`);
+      say(`            ${candidate.path}`);
       say('');
-      say('Nothing to do. Set this if the server does not find it on its own:');
+      say('Nothing to do. Pin it so the server always uses this one:');
       say(`  CINEMA_FFMPEG=${candidate.path}`);
       say('');
       return;
@@ -68,48 +52,52 @@ function download(url, destination, redirects = 0) {
     }
   }
 
-  // 2. Download a static build.
-  const url = STATIC_FFMPEG[process.arch];
-  if (!url) {
+  // 2. The npm package, if present.
+  const packaged = staticFfmpeg.fromNpmPackage();
+  if (packaged) {
     say('');
-    say(`No static build is available for ${process.arch}.`);
-    say('Install FFmpeg with your panel, or set CINEMA_FFMPEG to a binary path.');
-    process.exit(1);
+    say(`Found the ffmpeg-static package: ${packaged}`);
+    try {
+      await probeFfmpeg(packaged);
+      say('  verified');
+      say('');
+      say('Pin it:');
+      say(`  CINEMA_FFMPEG=${packaged}`);
+      say('');
+      return;
+    } catch (error) {
+      say(`  unusable: ${error.message}`);
+    }
   }
 
+  // 3. Download the prebuilt binary.
+  const target = staticFfmpegExpectedPath();
   say('');
-  say(`Downloading a static build for ${process.arch}.`);
-  say('This is a one-time download and needs no root.');
-  const dir = path.dirname(staticFfmpegExpectedPath());
-  await fsp.mkdir(dir, { recursive: true });
-  const archive = path.join(dir, 'ffmpeg.tar.xz');
-
+  say('Downloading a prebuilt static FFmpeg.');
+  say(`  from ${staticFfmpeg.downloadUrl()}`);
+  say('  one-time, needs no root');
   try {
-    await download(url, archive);
-    say('  downloaded');
-    const unpack = spawnSync('tar', ['-xJf', archive, '-C', dir, '--strip-components=1'], { encoding: 'utf8' });
-    if (unpack.status !== 0) {
-      say(`  could not unpack: ${(unpack.stderr || '').trim().slice(0, 200)}`);
-      say('  the archive may use a format this container cannot extract;');
-      say('  extract it manually and set CINEMA_FFMPEG to the ffmpeg binary.');
-      process.exit(1);
-    }
-    const binary = staticFfmpegExpectedPath();
-    await fsp.chmod(binary, 0o755);
-    say(`  extracted to ${binary}`);
+    await staticFfmpeg.download(target);
+    const bytes = fs.statSync(target).size;
+    say(`  saved ${(bytes / 1048576).toFixed(1)} MB to ${target}`);
 
-    await probeFfmpeg(binary);
-    say('  verified: encoders, HLS muxer, filters and options all present');
+    await probeFfmpeg(target);
+    say('  verified: x264, AAC, HLS muxer, filters and readrate all present');
     say('');
-    say('Add this to the server environment and restart:');
-    say(`  CINEMA_FFMPEG=${binary}`);
+    say('Done. The server picks this up automatically on the next start.');
+    say('To pin it explicitly:');
+    say(`  CINEMA_FFMPEG=${target}`);
     say('');
-    say('To make it permanent, place the binary somewhere under the');
-    say('application directory and point CINEMA_FFMPEG at that copy,');
-    say('because the temp directory may be cleared on restart.');
+  } catch (error) {
+    say(`  download failed: ${error.message}`);
     say('');
-  } finally {
-    await fsp.rm(archive, { force: true }).catch(() => {});
+    say('Try the other route instead, which uses the panel\'s own npm install:');
+    say('  npm install ffmpeg-static');
+    say('');
+    say('If npm also cannot reach the network, ask the host to allow');
+    say('github.com and release-assets.githubusercontent.com, or install');
+    say('FFmpeg through the panel.');
+    process.exit(1);
   }
 })().catch(error => {
   console.error('');
