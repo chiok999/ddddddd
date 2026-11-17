@@ -52,7 +52,23 @@ function resolveTranscodeTmp(){
   return {dir:systemTmp,reason:'system temp (no disk-backed option)'};
 }
 const {dir:transcodeTmp,reason:transcodeTmpReason}=resolveTranscodeTmp();
-const openSource=require('./source-opener').createSourceOpener({safeUrl,remote:async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent,h2Agent)).response});
+// The direct path: this machine's address, pinned to public DNS answers.
+const directRemote=async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent,h2Agent)).response;
+// Some CDNs refuse this machine's address outright (426 for every protocol and
+// header combination), so the bytes are read through a Cloudflare Worker whose
+// address is not refused. Off unless CINEMA_RELAY_URL and CINEMA_RELAY_KEY are
+// both set; see relay.js and worker/troy-relay.mjs. CINEMA_RELAY_FALLBACK=1
+// additionally lets a dead relay fall back to the direct path rather than
+// failing the source.
+let relay=null,relayError=null;
+try{relay=require('./relay').relayConfig();}catch(error){relayError=error.message;}
+const remote=relay ? require('./relay').createRelayRemote({
+  config:relay,
+  send:(url,headers,signal)=>fetch(url,{dispatcher:agent,headers,redirect:'manual',signal}),
+  direct:directRemote,
+  fallback:['1','true','yes'].includes(String(process.env.CINEMA_RELAY_FALLBACK||'').toLowerCase()),
+}) : directRemote;
+const openSource=require('./source-opener').createSourceOpener({safeUrl,remote});
 const transcoder=require('./transcode').createTranscoder({open:openSource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
 // never follow a redirect. Every connection uses the public-IP-pinning agent.
@@ -253,7 +269,7 @@ const server = http.createServer(async (req, res) => {
           if(source.userAgent)headers['user-agent']=source.userAgent;
           if(source.referer)headers.referer=source.referer;
           if(source.origin)headers.origin=source.origin;
-          return (await getRemote(source.url,headers,signal,fetch,agent,h2Agent)).response;
+          return remote(source.url,headers,signal);
         },entry);
         return send(res,200,result);
       } catch {return send(res,502,{error:'Range probe failed'});} finally {activeRangeProbes--;}
@@ -325,6 +341,9 @@ server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => {
         console.warn('            Point CINEMA_FFMPEG at it.');
       }
     });
+  if (relay) console.log(`  relay:    on  ${relay.origin}${relay.path}/  (source bytes fetched by Cloudflare)`);
+  else if (relayError) console.warn(`  relay:    NOT USABLE\n            ${relayError}`);
+  else console.log('  relay:    off (direct fetch from this address)');
   const free = freeBytes(transcodeTmp);
   console.log(`  temp:     ${transcodeTmp}  [${transcodeTmpReason}]` + (free === null ? '' : `  ${(free / 1073741824).toFixed(1)} GB free`));
   if (filesystemType(transcodeTmp) === TMPFS_MAGIC) {

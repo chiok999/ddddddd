@@ -81,6 +81,63 @@ temp:     /home/container/.troy-media  [disk (system temp is tmpfs)]  14.2 GB fr
 
 Set `CINEMA_TMPDIR` to override, or keep the automatic choice.
 
+## When the provider refuses this address outright
+
+There is a failure that no header, protocol or retry can fix: a CDN that answers
+`426` (or `403`) to this machine for every request, including HTTP/1.1 with a
+browser User-Agent. The refusal belongs to the **address**, not the request.
+
+`troy-426.js` measures it instead of guessing:
+
+```sh
+node troy-426.js "https://<the-media-host>/path"
+```
+
+Four lines come out. If all four are `426`, the address is refused and the bytes
+have to be read from somewhere else. That is what the **Cloudflare relay** is for:
+
+```
+browser ──> Troy (this server) ──> Worker (Cloudflare) ──> provider CDN
+```
+
+The Worker fetches the media; Troy reads the Worker. Troy's own address never
+touches the provider. Everything else is unchanged -- same player, same session,
+same range probing, same FFmpeg, same two qualities. Cloudflare's free plan
+charges nothing for egress and sets no limit on a response body.
+
+Setup is two steps and is written out in [`worker/README.md`](worker/README.md):
+create the Worker, then set the two variables below and restart.
+
+```
+CINEMA_RELAY_URL=https://troy-relay.<your-subdomain>.workers.dev
+CINEMA_RELAY_KEY=<a long random secret, at least 16 characters>
+```
+
+The startup banner then shows one of:
+
+```
+  relay:    on  https://troy-relay.….workers.dev/  (source bytes fetched by Cloudflare)
+  relay:    off (direct fetch from this address)
+  relay:    NOT USABLE
+            CINEMA_RELAY_KEY must be at least 16 characters when CINEMA_RELAY_URL is set
+```
+
+Requests are signed with `CINEMA_RELAY_KEY`, so the Worker is not an open proxy
+and a leaked link is useless without the secret. `CINEMA_RELAY_FALLBACK=1` allows
+a fall back to the direct fetch when the *Worker itself* is unreachable; it never
+retries a refused direct request.
+
+Prove it on any machine, without deploying anything:
+
+```sh
+node troy-relay.js --test
+```
+
+That runs the real `worker/troy-relay.mjs` locally against a fixture CDN that
+refuses with `426` and accepts a browser-shaped request, and checks 25 properties
+including byte-identical bodies and `Range`/`206`/`If-Range`. Add
+`--worker-url https://…workers.dev` to check a deployed Worker as well.
+
 ## When one server works and another does not
 
 The same build can play on one host and fail on another. That is almost never

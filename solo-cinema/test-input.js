@@ -163,3 +163,63 @@ test('a host that wants HTTP/2 and a player client is satisfied by escalation', 
   assert.deepEqual(seen,['h1','h2','h2+ua'],'HTTP/1.1, then plain HTTP/2, then HTTP/2 as a player');
  }finally{await h1.close();await h2.close();server.closeAllConnections?.();await new Promise(r=>server.close(r));fs.rmSync(dir,{recursive:true,force:true});}
 });
+
+// The relay adds a network hop, so the two properties the pipeline depends on
+// are asserted through it end to end: an MP4 that is not fast-start is refused
+// by name, and a fast-start MP4 survives the hop byte-for-byte and reaches
+// FFmpeg. Both use the real worker file, driven in-process.
+test('relayed input keeps the fast-start gate and the byte stream intact', {timeout:60000}, async t=>{
+ const http=require('node:http'),crypto=require('node:crypto'),path=require('node:path');
+ const {once}=require('node:events');const {pathToFileURL}=require('node:url');
+ const {createRelayRemote}=require('./relay');const {fastStartGate,bundledFfmpeg,createTranscoder}=require('./transcode');
+ const SECRET='test-secret-'.padEnd(32,'x');
+ const handler=(await import(pathToFileURL(path.join(__dirname,'worker','troy-relay.mjs')).href)).createFetchHandler({secret:SECRET,allowPrivate:true});
+ // A minimal but valid ftyp+moov+mdat MP4, built both fast-start and not.
+ const box=(type,payload)=>{const head=Buffer.alloc(8);head.writeUInt32BE(payload.length+8);head.write(type,4,'ascii');return Buffer.concat([head,payload]);};
+ const mvhd=()=>{const p=Buffer.alloc(100);p.writeUInt32BE(0,0);p.writeUInt32BE(1000,12);p.writeUInt32BE(4000,16);return box('mvhd',p);};
+ const ftyp=()=>box('ftyp',Buffer.from('isom\0\0\0\0isom','latin1'));
+ const mdat=()=>box('mdat',Buffer.alloc(2048,7));
+ const fast=Buffer.concat([ftyp(),box('moov',mvhd()),mdat()]),slow=Buffer.concat([ftyp(),mdat(),box('moov',mvhd())]);
+ const served={'slow.mp4':slow};
+ const server=http.createServer((req,res)=>{
+  const name=new URL(req.url,'http://local').pathname.slice(1),bytes=served[name]||fast;
+  if(!/Mozilla\/5\.0/.test(req.headers['user-agent']||'')){res.writeHead(426);return res.end('upgrade');}
+  const range=/^bytes=(\d+)-(\d*)$/.exec(req.headers.range||'');
+  const headers={'content-type':'video/mp4',etag:'"r1"','accept-ranges':'bytes'};
+  if(range){const start=Number(range[1]),end=range[2]===''?bytes.length-1:Number(range[2]);res.writeHead(206,{...headers,'content-range':`bytes ${start}-${end}/${bytes.length}`,'content-length':String(end-start+1)});return res.end(bytes.subarray(start,end+1));}
+  res.writeHead(200,{...headers,'content-length':String(bytes.length)});res.end(bytes);
+ });
+ server.listen(0,'127.0.0.1');await once(server,'listening');const base=`http://127.0.0.1:${server.address().port}`;
+ const remote=createRelayRemote({config:{origin:'http://worker',path:'',secret:SECRET},send:url=>handler(new Request(url)),direct:null});
+ try{
+  const opened=await remote(`${base}/fast.mp4`,{'accept-encoding':'identity'},AbortSignal.timeout(15000));
+  assert.equal(opened.status,200);
+  const forGate=opened;
+  const gate=fastStartGate();
+  const collected=[];await new Promise((resolve,reject)=>{
+   const {Readable}=require('node:stream');
+   Readable.fromWeb(forGate.body).pipe(gate).on('data',c=>collected.push(c)).on('end',resolve).on('error',reject);
+  });
+  assert.deepEqual(Buffer.concat(collected),fast,'relayed fast-start MP4 arrives byte-identical');
+  assert.equal(gate.duration,4,'duration survives the relay');
+  const bad=await remote(`${base}/slow.mp4`,{'accept-encoding':'identity'},AbortSignal.timeout(15000));
+  const {Readable}=require('node:stream');
+  await assert.rejects(new Promise((resolve,reject)=>{Readable.fromWeb(bad.body).pipe(fastStartGate()).on('data',()=>{}).on('end',resolve).on('error',reject);}),/not fast-start/);
+  // And the whole conversion path, when an FFmpeg is available.
+  const bin=process.env.CINEMA_TEST_FFMPEG||bundledFfmpeg();
+  if(!bin)return t.diagnostic('skipped the FFmpeg leg: no local FFmpeg');
+  const {spawnSync}=require('node:child_process'),fs=require('node:fs'),os=require('node:os');
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'troy-relay-ffmpeg-')),file=path.join(dir,'input.mp4');
+  const made=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-f','lavfi','-i','sine=frequency=440','-t','4','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-c:a','aac','-movflags','+faststart',file],{timeout:20000});
+  if(made.status!==0){t.diagnostic('fixture MP4 could not be made');return;}
+  served['real.mp4']=fs.readFileSync(file);
+  const transcode=createTranscoder({tmpdir:dir,executable:bin,open:async(entry,signal,offset=0,validator=null)=>remote(`${base}/real.mp4`,{'accept-encoding':'identity',...(offset?{range:`bytes=${offset}-`,'if-range':validator}:{})},signal)});
+  const job=await transcode.start({url:`${base}/real.mp4`},'owner');
+  const deadline=Date.now()+30000;let manifest;
+  while(Date.now()<deadline){await new Promise(r=>setTimeout(r,300));const list=await transcode.read(job.id,'owner','240/index.m3u8');assert.ok(list,'job disappeared');manifest=list.data.toString();if(manifest.includes('#EXT-X-ENDLIST'))break;}
+  assert.ok(manifest&&manifest.includes('#EXT-X-ENDLIST'),`conversion through the relay completed: ${manifest?.slice(0,120)}`);
+  assert.ok((await transcode.read(job.id,'owner','360/index.m3u8')),'the 360 rung exists too');
+  await transcode.stopFor(job.id,'owner');
+  fs.rmSync(dir,{recursive:true,force:true});
+ }finally{server.closeAllConnections?.();await new Promise(r=>server.close(r));}
+});
