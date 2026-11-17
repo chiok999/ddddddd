@@ -398,3 +398,20 @@ test('continue watching restores the actual saved series episode',async()=>{
  w.fetch=async(url,opts={})=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true};if(url==='/api/discover')return {sections:[]};if(url==='/api/search')return {results:[{id:'show',title:'Real Series',type:'series',year:'2022',source:'moviebox'}],providers:[]};if(url==='/api/episodes')return {episodes:[{season:1,episode:1,title:'One'},{season:2,episode:3,title:'Three'}],source:'Fixture'};if(url==='/api/resolve'){request=JSON.parse(opts.body);return {title:'Real Series',providers:[],streams:[{provider:'moviebox',format:'file',url:'/media/a'}]};}return {sections:[]};}});mockConversion(w);
  try{for(const f of ['fallback.js','app.js'])w.eval(fs.readFileSync(path.join(__dirname,'public',f),'utf8'));await tick();await tick();assert.equal(d.getElementById('continueSection').classList.contains('hidden'),false);d.querySelector('.continue-card').click();await tick();await tick();assert.deepEqual(request,{id:'show',season:2,episode:3});assert.equal(d.getElementById('episodeSelect').value,'2:3');}finally{w.close()}
 });
+
+test('prototype player controls use actual selections, episode data and media state', async () => {
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window,d=w.document; w.scrollTo=()=>{};
+ w.HTMLMediaElement.prototype.pause=function(){};w.HTMLMediaElement.prototype.load=function(){};w.HTMLMediaElement.prototype.play=function(){return Promise.resolve()};
+ class Hls{constructor(){this.listeners={}} static isSupported(){return true} loadSource(){} attachMedia(){} on(e,cb){this.listeners[e]=cb} destroy(){}}
+ Hls.Events={MANIFEST_PARSED:'manifest',SUBTITLE_TRACKS_UPDATED:'subs',AUDIO_TRACKS_UPDATED:'audio',ERROR:'error'};w.Hls=Hls;const requests=[];
+ w.fetch=async(url,opts={})=>({ok:true,json:async()=>{if(url==='/api/session')return {authenticated:true};if(url==='/api/search')return {results:[{id:'a',title:'Show',type:'series',source:'moviebox'}]};if(url==='/api/episodes')return {source:'fixture',episodes:[{season:1,episode:1,title:'One'},{season:1,episode:2,title:'Two'}]};if(url==='/api/resolve'){requests.push(JSON.parse(opts.body));return {title:'Show',providers:[],streams:[{provider:'test',format:'file',quality:720,url:'/media/a'}]};}throw Error(url)}});mockConversion(w);
+ try{for(const file of ['fallback.js','app.js','player-ui.js'])w.eval(fs.readFileSync(path.join(__dirname,'public',file),'utf8'));await tick();d.getElementById('query').value='Show';d.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();d.querySelector('.result').click();await tick();await tick();
+ assert.equal(d.getElementById('screen').classList.contains('player-expanded'),true);assert.match(d.getElementById('playerMeta').textContent,/S1 E1/);
+ d.getElementById('playerEpisodes').click();const episode=[...d.querySelectorAll('#playerEpisodeList button')].find(b=>b.textContent.includes('Two'));assert.ok(episode);episode.click();await tick();await tick();assert.equal(requests.at(-1).episode,2);assert.match(d.getElementById('playerMeta').textContent,/S1 E2/);
+ d.getElementById('playerSpeed').click();[...d.querySelectorAll('#playerMenuRows button')].find(b=>b.textContent.includes('1.5')).click();assert.equal(d.getElementById('video').playbackRate,1.5);assert.equal(d.getElementById('playerSpeed').textContent,'1.5×');
+ d.getElementById('playerSources').click();assert.match(d.getElementById('playerMenuRows').textContent,/test/);
+ d.getElementById('playerAspect').click();d.getElementById('playerAspect').click();assert.equal(d.getElementById('video').style.objectFit,'cover');
+ const volume=d.getElementById('volumeSlider');volume.value='40';volume.dispatchEvent(new w.Event('input'));assert.equal(d.getElementById('video').volume,.4);
+ d.getElementById('playerBack').click();assert.equal(d.getElementById('screen').classList.contains('player-expanded'),false);
+ }finally{w.close()}
+});
