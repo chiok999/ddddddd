@@ -412,8 +412,9 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.data.length>0);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:segment.data,encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
  assert.equal(await t.stopFor(job.id,'bob'),false);assert.equal(await t.stopFor(job.id,'alice'),true);assert.equal(await t.read(job.id,'alice','master.m3u8'),null);assert.deepEqual((await fsp.readdir(dir)).sort(),['sample.mp4']);
  const silent=path.join(dir,'silent.mp4');const noAudio=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-t','10','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart',silent],{encoding:'utf8'});assert.equal(noAudio.status,0,noAudio.stderr);
- const limited=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
- try{const small=await limited.start({},'alice');await new Promise(r=>setTimeout(r,3000));assert.equal(await limited.read(small.id,'alice','master.m3u8'),null);assert.match(limited.status(small.id,'alice').error,/temporary storage/);assert.equal(limited.status(small.id,'bob'),null);}finally{await limited.close();}
+ const statfs=fsp.statfs;let calls=0;fsp.statfs=async()=>{calls++;throw Error('statfs unavailable')};
+ const uncapped=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,maxMs:1,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
+ try{const small=await uncapped.start({},'alice');await new Promise(r=>setTimeout(r,3000));assert.ok(await uncapped.read(small.id,'alice','master.m3u8'));assert.equal(calls,0);assert.equal(uncapped.status(small.id,'alice').active,true);}finally{fsp.statfs=statfs;await uncapped.close();}
  }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true})}
 });
 
@@ -518,4 +519,23 @@ test('MP4 duration parser handles mvhd versions and rejects unknown or malformed
  const v1=Buffer.alloc(32);v1[0]=1;v1.writeUInt32BE(1000,20);v1.writeBigUInt64BE(120000n,24);const moov1=box('moov',box('mvhd',v1));assert.equal(movieDuration(moov1,0,moov1.length,8),120);
  v1.writeBigUInt64BE(0xffffffffffffffffn,24);const unknown=box('moov',box('mvhd',v1));assert.equal(movieDuration(unknown,0,unknown.length,8),null);
  const broken=Buffer.from(moov0);broken.writeUInt32BE(0xfffffff0,8);assert.equal(movieDuration(broken,0,broken.length,8),null);
+});
+
+
+test('actual filesystem-full FFmpeg failures are reported without leaking stderr',()=>{
+ const {ffmpegExitError}=require('./transcode');assert.match(ffmpegExitError(1,'Error: No space left on device'),/filesystem is full/);assert.match(ffmpegExitError(1,'Disk quota exceeded'),/quota/);assert.doesNotMatch(ffmpegExitError(1,'secret upstream URL'),/secret/);
+});
+
+test('FFmpeg disk-full failure reaches the client error and cleans up',async()=>{
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-full-test-')),exe=path.join(dir,'ffmpeg-fixture');
+ const script=String.raw`#!/usr/bin/env node
+if(process.argv.includes('-version')) console.log('fixture');
+else if(process.argv.includes('-encoders')) console.log(' V..... libx264\n A..... aac');
+else if(process.argv.includes('-muxers')) console.log(' E hls');
+else if(process.argv.includes('-filters')) console.log(' ... scale\n ... pad');
+else {process.stderr.write('No space left on device\n');process.exit(1);}
+`;
+ await fs.writeFile(exe,script,{mode:0o755});const box=name=>{const b=Buffer.alloc(8);b.writeUInt32BE(8);b.write(name,4);return b};
+ const t=createTranscoder({tmpdir:dir,executable:exe,startupMs:5000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(Readable.from([Buffer.concat([box('ftyp'),box('moov')])]))})});
+ try{await assert.rejects(t.start({},'owner'),/filesystem is full or its quota has been exceeded/);assert.deepEqual(await fs.readdir(dir),['ffmpeg-fixture']);}finally{await t.close();await fs.rm(dir,{recursive:true,force:true});}
 });
