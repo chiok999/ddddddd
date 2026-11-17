@@ -199,8 +199,8 @@ test('HTTP flow authenticates, resolves a fixture and blocks direct playback', a
     assert.equal((await fetch(base+direct)).status,401);
     assert.equal((await fetch(base+direct,{headers:{cookie}})).status,403);
     const converted=await post('/api/transcode',{url:direct},cookie);
-    assert.equal(converted.status,400);
-    assert.match((await converted.json()).error,/not HLS/);
+    assert.equal(converted.status,502);
+    assert.ok((await converted.json()).error);
     await post('/api/logout',{},cookie); assert.equal((await fetch(base+direct,{headers:{cookie}})).status,401);
   } finally {child.kill();}
 });
@@ -390,7 +390,7 @@ test('transcode API rejects unauthenticated and invalid source requests',async()
 test('transcoder reports missing ffmpeg and rejects playlist content',async()=>{
  const {createTranscoder}=require('./transcode');const {Readable}=require('node:stream');const make=(type)=>({ok:true,status:200,headers:new Headers({'content-type':type}),body:Readable.toWeb(Readable.from(Buffer.from('0000000866747970000000086d6f6f76','hex')))});
  let opened=0;const bad=createTranscoder({executable:'/definitely/not/a/real/ffmpeg',open:async()=>{opened++;return make('video/mp4')},startupMs:5000});try{await assert.rejects(bad.start({},'a'),/FFmpeg executable or its system loader was not found/);assert.equal(opened,0);assert.equal(await bad.read('bad','a','master.m3u8'),null);}finally{await bad.close()}
- const hls=createTranscoder({open:async()=>make('application/vnd.apple.mpegurl')});try{await assert.rejects(hls.start({},'a'),/Only uncompressed direct MP4/)}finally{await hls.close()}
+ const hls=createTranscoder({open:async()=>({status:200,headers:new Headers({'content-type':'application/vnd.apple.mpegurl'}),body:Readable.toWeb(Readable.from(['#EXTM3U\n']))})});try{await assert.rejects(hls.start({},'a'),/HLS input unavailable/)}finally{await hls.close()}
 });
 
 const testFfmpeg=process.env.CINEMA_TEST_FFMPEG || require('./transcode').bundledFfmpeg();

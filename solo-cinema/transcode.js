@@ -7,7 +7,8 @@ const path=require('node:path');
 const os=require('node:os');
 const crypto=require('node:crypto');
 const {spawn,execFile}=require('node:child_process');
-const {Transform}=require('node:stream');
+const {Transform,Readable}=require('node:stream');
+const {createHlsInput}=require('./hls-input');
 const {resumableInput}=require('./resumable-input');
 const {playlistDuration,leadAction}=require('./lead-control');
 
@@ -88,7 +89,7 @@ async function probeFfmpeg(executable){
 
 async function chooseFfmpeg(candidates){const failures=[];for(const candidate of candidates){try{await probeFfmpeg(candidate.path);return candidate.path;}catch(err){failures.push(`${candidate.label}: ${err.message}`);}}throw Error(failures.join('; '));}
 
-function createTranscoder({open, executable, tmpdir=os.tmpdir(), startupMs=45000, aheadSeconds=1200, leadTickMs=2000, authorize=()=>true}={}){
+function createTranscoder({open, openHlsResource, safeUrl=require('./network').safeUrl, executable, tmpdir=os.tmpdir(), startupMs=45000, aheadSeconds=1200, leadTickMs=2000, authorize=()=>true}={}){
   const jobs=new Map(),failures=new Map();let admission=Promise.resolve(),binaryPromise=null;
   function getBinary(){if(!binaryPromise)binaryPromise=chooseFfmpeg(executable?[{label:'FFmpeg',path:executable}]:ffmpegCandidates()).catch(err=>{binaryPromise=null;throw err;});return binaryPromise;}
   // Reap abandoned private directories after a crash, without touching a live Troy process.
@@ -104,7 +105,7 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), startupMs=45000
     if(!job)return Promise.resolve();if(job.stopPromise)return job.stopPromise;
     job.stopped=true;if(job.error){failures.set(job.id,{sid:job.sid,error:job.error,expires:Date.now()+300000});while(failures.size>100)failures.delete(failures.keys().next().value);}job.controller.abort();clearInterval(job.monitor);
     job.stopPromise=(async()=>{
-      job.input?.destroy();job.gate?.destroy();if(job.proc && job.proc.exitCode===null && job.proc.signalCode===null)job.proc.kill('SIGKILL');
+      job.input?.destroy();job.gate?.destroy();job.relay?.close();if(job.proc && job.proc.exitCode===null && job.proc.signalCode===null)job.proc.kill('SIGKILL');
       if(job.proc && job.proc.exitCode===null)await Promise.race([new Promise(resolve=>job.proc.once('close',resolve)),interval(3000)]);
       if(job.readers)await new Promise(resolve=>job.drainWaiters.push(resolve));
       if(job.dir)await fsp.rm(job.dir,{recursive:true,force:true}).catch(()=>{});if(jobs.get(job.id)===job)jobs.delete(job.id);
@@ -130,14 +131,23 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), startupMs=45000
       if(job.stopped){await response.body?.cancel();throw Error('Transcode stopped');}
       if(response.status!==200 || !response.body){await response.body?.cancel().catch(()=>{});throw Error(`Source returned ${response.status}`);}
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';
-      if(/mpegurl|text\/html/i.test(type) || encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Only uncompressed direct MP4 sources can be transcoded');}
+      if(/text\/html/i.test(type) || encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Unsupported or compressed source');}
+      // Sniff the bytes: provider labels and opaque URLs are often inaccurate.
+      const iterator=Readable.fromWeb(response.body)[Symbol.asyncIterator](),prefix=[];let size=0,done=false;
+      while(size<16 && !done){const next=await iterator.next();done=next.done;if(!done){prefix.push(next.value);size+=next.value.length;}}
+      const sample=Buffer.concat(prefix);const isHls=sample.toString('utf8').replace(/^\uFEFF/,'').startsWith('#EXTM3U');
+      const body=Readable.toWeb(Readable.from((async function*(){try{for(const chunk of prefix)yield chunk;if(!done)for(;;){const next=await iterator.next();if(next.done)break;yield next.value;}}finally{await iterator.return?.();}})()));
+      response={status:response.status,headers:response.headers,url:response.url,body};
+      if(job.stopped){await body.cancel().catch(()=>{});throw Error('Transcode stopped');}
+      if(isHls){if(!openHlsResource){await body.cancel().catch(()=>{});throw Error('HLS input unavailable');}job.relay=await createHlsInput({source,first:response,fetchResource:openHlsResource,openRoot:open,signal:job.controller.signal,safeUrl});if(job.stopped)throw Error('Transcode stopped');}
       const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,'-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames','expr:gte(t,n_forced*4)','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
       const pacing=seekOffset>0?['-ss',String(seekOffset)]:[];
-      const args=['-hide_banner','-loglevel','error','-nostdin',...pacing,'-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...output(426,240,'250k','48k','240'),...output(640,360,'600k','64k','360')];
+      const input=isHls?['-protocol_whitelist','http,tcp,crypto','-format_whitelist','hls,mpegts,mov,aac,mp3','-allowed_extensions','ALL','-allowed_segment_extensions','ALL','-extension_picky','0','-seg_max_retry','3','-f','hls','-i',job.relay.url]:['-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0'];
+      const args=['-hide_banner','-loglevel','error','-nostdin',...pacing,...input,...output(426,240,'250k','48k','240'),...output(640,360,'600k','64k','360')];
       job.proc=spawn(binary,args,{stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
-      job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
-      job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);
+      job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=job.relay?.error || ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
+      if(!isHls){job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);}else job.proc.stdin.end();
       job.monitor=setInterval(()=>{
         if(job.stopped)return;
         if(!authorize(job.sid)){job.error='Session expired';void stop(job);return;}
@@ -151,7 +161,7 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), startupMs=45000
         }).catch(()=>{if(!job.stopped && job.paused && job.proc?.exitCode===null && job.proc?.signalCode===null && job.proc.kill('SIGCONT'))job.paused=false;}).finally(()=>{job.leadBusy=false;});
       },leadTickMs);job.monitor.unref();
       const deadline=Date.now()+(seekOffset ? Math.max(startupMs,180000+Math.ceil(seekOffset*1000)) : startupMs);
-      while(Date.now()<deadline && !job.stopped){if(job.error)throw Error(job.error);const ready=await Promise.all(['240','360'].map(d=>fsp.stat(path.join(job.dir,d,'index.m3u8')).then(s=>s.size>0,()=>false)));if(ready.every(Boolean)){job.ready=true;job.lastAccess=Date.now();return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate.duration || null,offset:seekOffset};}await interval(250);}
+      while(Date.now()<deadline && !job.stopped){if(job.error)throw Error(job.error);const ready=await Promise.all(['240','360'].map(d=>fsp.stat(path.join(job.dir,d,'index.m3u8')).then(s=>s.size>0,()=>false)));if(ready.every(Boolean)){job.ready=true;job.lastAccess=Date.now();return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate?.duration || job.relay?.duration || null,offset:seekOffset};}await interval(250);}
       throw Error(job.error || 'Transcode did not start in time');
     }catch(err){await stop(job);if(job.dir)await fsp.rm(job.dir,{recursive:true,force:true}).catch(()=>{});if(err.code==='ENOSPC'||err.code==='EDQUOT')throw Error('Temporary filesystem is full or its quota has been exceeded');throw err;}finally{requestSignal?.removeEventListener('abort',onDisconnect);}
   }

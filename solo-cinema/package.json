@@ -5,8 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test.js test-ui.js test-input.js",
-    "test:soak": "node --test test-soak.js"
+    "test": "node --test test.js test-ui.js test-input.js test-hls.js",
+    "test:soak": "node --test test-soak.js",
+    "test:hls-soak": "node --test test-hls-soak.js"
   },
   "keywords": [],
   "author": "",
