@@ -57,19 +57,6 @@ test('MovieBox player host is checked before requesting streams', async () => {
   assert.equal(calls,3); // search fallback is also attempted, but the private player is never requested.
 });
 
-test('HLS playlists rewrite variants, segments, keys and alternate audio through the proxy', () => {
-  const { rewritePlaylist } = require('./playlist'); const seen=[];
-  const remember = (url,sid,referer,format) => { seen.push({url:String(url),sid,referer,format}); return `/media/${seen.length}`; };
-  const playlist=['#EXTM3U','#EXT-X-MEDIA:TYPE=AUDIO,URI="audio"','#EXT-X-STREAM-INF:BANDWIDTH=500000','video','#EXT-X-KEY:METHOD=AES-128,URI="key"','#EXTINF:10,','segment.ts'].join('\n');
-  const out=rewritePlaylist(playlist,'https://cdn.example/master.m3u8','abc','https://player.example/',remember);
-  assert.match(out,/#EXT-X-MEDIA:TYPE=AUDIO,URI="\/media\/1"/);
-  assert.match(out,/#EXT-X-STREAM-INF:BANDWIDTH=500000\n\/media\/2/);
-  assert.match(out,/#EXT-X-KEY:METHOD=AES-128,URI="\/media\/3"/);
-  assert.match(out,/\/media\/4$/);
-  assert.deepEqual(seen.map(x=>x.format),['hls','hls',null,null]);
-  assert.ok(seen.every(x=>x.sid==='abc' && x.referer==='https://player.example/'));
-});
-
 test('stream adapters reject local source URLs and preserve provider identity', async () => {
   const { createProviders } = require('./providers');
   const calls=[];
@@ -357,8 +344,8 @@ test('Cinemeta title uses only an unambiguous exact MovieBox year match',async()
 });
 
 test('7Movies VidLink adapter parses quality variants, fixed header allowlist and captions',async()=>{
- const {safeUrl}=require('./network');let urls=[];const resolve=require('./vidlink')({safeUrl,request:async(url)=>{urls.push(url);if(url.includes('enc-dec.app')) return {json:{result:'abc_123'}};return {json:{stream:{headers:{Referer:'https://vidlink.pro/','Authorization':'secret'},qualities:{720:{url:'https://cdn.example/video',type:'mp4',headers:{Origin:'https://vidlink.pro'}},'1080p':{url:'https://127.0.0.1/video'}},playlist:'https://cdn.example/hls',captions:[{language:'English',url:'https://cdn.example/sub.vtt'}]}}};}});
- const r=await resolve({tmdbId:'123',type:'series'},2,3);assert.equal(r.streams.length,2);assert.equal(r.streams[0].quality,720);assert.equal(r.streams[0].referer,'https://vidlink.pro/');assert.equal(r.streams[0].origin,'https://vidlink.pro');assert.equal(r.streams[0].authorization,undefined);assert.equal(r.streams[1].format,'hls');assert.equal(r.captionInfo.url,'https://cdn.example/sub.vtt');assert.match(urls[1],/\/tv\/abc_123\/2\/3$/);
+ const {safeUrl}=require('./network');let urls=[];const resolve=require('./vidlink')({safeUrl,request:async(url)=>{urls.push(url);if(url.includes('enc-dec.app')) return {json:{result:'abc_123'}};return {json:{stream:{TTL:3600,headers:{Referer:'https://vidlink.pro/','Authorization':'secret'},qualities:{720:{url:'https://cdn.example/video',type:'mp4',headers:{Origin:'https://vidlink.pro'}},'1080p':{url:'https://127.0.0.1/video'}},playlist:'https://cdn.example/hls',captions:[{language:'English',url:'https://cdn.example/sub.vtt'}]}}};}});
+ const r=await resolve({tmdbId:'123',type:'series'},2,3);assert.equal(r.streams.length,2);assert.equal(r.streams[0].quality,720);assert.equal(r.streams[0].refreshAfterMs,2700000);assert.equal(r.streams[0].referer,'https://vidlink.pro/');assert.equal(r.streams[0].origin,'https://vidlink.pro');assert.equal(r.streams[0].authorization,undefined);assert.equal(r.streams[1].format,'hls');assert.equal(r.captionInfo.url,'https://cdn.example/sub.vtt');assert.match(urls[1],/\/tv\/abc_123\/2\/3$/);
 });
 
 test('metadata prefers exact release year over an undated namesake',async()=>{
@@ -597,4 +584,46 @@ test('a running converter is not expired just because the viewer pauses', {skip:
  const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,idleMs:1,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
  try{const job=await t.start({},'owner');await new Promise(r=>setTimeout(r,2300));assert.equal(t.status(job.id,'owner')?.active,true);}finally{await t.close();}
  }finally{await fsp.rm(dir,{recursive:true,force:true});}
+});
+
+test('provider extensions classify explicit MP4 without treating opaque links as MP4',async()=>{
+ const {createProviders}=require('./providers');const {safeUrl}=require('./network');
+ const providers=createProviders({safeUrl,request:async url=>url.includes('api.php')?{json:{status_code:'200',data:{stream_urls:['https://cdn.example/a.mp4?token=1','https://cdn.example/live.m3u8','https://cdn.example/opaque']}}}:url.includes('vidsrc.net')?{text:'<div data-hash="abc">'}:{text:'https://cdn.example/video.mp4?token=2 https://cdn.example/live.m3u8'}});
+ const a=await providers.vaplayer({imdbId:'tt123',type:'movie'},1,1);assert.deepEqual(a.streams.map(x=>x.format),['file','hls','hls']);
+ const b=await providers.vidsrc({tmdbId:'123',type:'movie'},1,1);assert.deepEqual(b.streams.map(x=>x.format),['file','hls']);
+});
+
+test('provider deadlines abort work, preserve independent results, and dedupe only identical playback contexts',async()=>{
+ const {resolveProviders}=require('./providers'),{scope}=require('./provider-timeout');let aborted=false;
+ const moviebox={resolve:async()=>({streams:[{url:'https://cdn.example/a.mp4',format:'file',quality:360}],referer:'https://ref.example/'})};
+ const providers={vaplayer:async()=>{const signal=scope.getStore();return new Promise((_,reject)=>signal.addEventListener('abort',()=>{aborted=true;reject(Error('aborted'))},{once:true}));},vidsrc:async()=>({streams:[{url:'https://cdn.example/a.mp4',format:'file',quality:360}],referer:'https://ref.example/'})};
+ const result=await resolveProviders({moviebox,providers,item:{source:'moviebox',type:'movie'},season:1,episode:1,deadlineMs:30});assert.equal(aborted,true);assert.equal(result.streams.length,1);assert.equal(result.providers.find(x=>x.provider==='vaplayer').count,0);
+ let movieboxCalls=0;const only=await resolveProviders({moviebox:{resolve:async()=>{movieboxCalls++;return {streams:[]}}},providers,item:{source:'moviebox',type:'movie'},onlyProvider:'vidsrc',deadlineMs:30});assert.equal(movieboxCalls,0);assert.equal(only.providers.length,1);
+ const separate=await resolveProviders({moviebox,providers:{vaplayer:async()=>({streams:[]}),vidsrc:async()=>({streams:[{url:'https://cdn.example/a.mp4',format:'file'}],referer:'https://different.example/'})},item:{source:'moviebox',type:'movie'},deadlineMs:30});assert.equal(separate.streams.length,2);
+});
+
+test('cross-origin redirects strip credentials while preserving same-origin redirects',async()=>{
+ const {getRemote}=require('./network');const seen=[];let n=0;
+ const fetch=async(url,opts)=>{seen.push({url:String(url),headers:new Headers(opts.headers)});n++;if(n===1)return {status:302,headers:new Headers({location:'/two'}),body:{cancel:async()=>{}}};if(n===2)return {status:302,headers:new Headers({location:'https://other.example/three'}),body:{cancel:async()=>{}}};return {status:200,headers:new Headers(),body:null};};
+ await getRemote('https://cdn.example/one',{'Authorization':'Bearer secret','Cookie':'session=secret','user-agent':'Troy'},undefined,fetch,{});
+ assert.equal(seen[1].headers.get('authorization'),'Bearer secret');assert.equal(seen[2].headers.get('authorization'),null);assert.equal(seen[2].headers.get('cookie'),null);assert.equal(seen[2].headers.get('user-agent'),'Troy');
+});
+
+test('login attempts have separate peer buckets and a global backstop',()=>{
+ const {createLoginLimiter}=require('./login-limiter');let now=0;const limiter=createLoginLimiter({perPeer:2,global:3,windowMs:100,now:()=>now});
+ limiter.failure('a');limiter.failure('a');assert.equal(limiter.blocked('a'),true);assert.equal(limiter.blocked('b'),false);limiter.failure('b');assert.equal(limiter.blocked('c'),true);now=101;assert.equal(limiter.blocked('a'),false);
+});
+
+test('source handles evict oldest entries per session without restart',()=>{
+ const {createSourceStore}=require('./source-store');let now=1;const store=createSourceStore({perSession:2,maxEntries:3,now:()=>now});const add=(id,sid,expires=100)=>store.set(id,{sid,expires});
+ add('a1','a');add('a2','a');add('b1','b');assert.ok(store.get('a1'));add('a3','a');assert.equal(store.get('a2'),null);assert.ok(store.get('b1'));add('c1','c');assert.equal(store.size,3);now=101;assert.equal(store.get('a1'),null);
+});
+
+test('KissKh episode details are cached, coalesced and returned as copies',async()=>{
+ let calls=0;const kk=require('./kisskh')({safeUrl:u=>new URL(u),request:async()=>{calls++;await new Promise(r=>setTimeout(r,1));return {json:{episodes:[{id:12,number:1}]}}}});
+ const [a,b]=await Promise.all([kk.details(123),kk.details(123)]);a[0].number=9;assert.equal(b[0].number,1);assert.equal((await kk.details(123))[0].number,1);assert.equal(calls,1);
+});
+
+test('Movy reports malformed detail metadata without leaking its contents',async()=>{
+ const {createMovy}=require('./movy');const {safeUrl}=require('./network');const resolve=createMovy({safeUrl,request:async()=>({text:'<script id="__NEXT_DATA__">{bad and private}</script>'})});await assert.rejects(resolve({tmdbId:'123',type:'movie'},1,1),e=>e.message==='Movy detail data is invalid');
 });

@@ -54,11 +54,21 @@ module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToke
     }
     const seen=new Set(); return groups.flatMap(g=>g.status==='fulfilled' ? g.value : []).filter(item=>{ if (seen.has(item.kissId)) return false; seen.add(item.kissId); return true; });
   }
-  async function details(id) {
+  const detailCache=new Map(),detailInflight=new Map();
+  async function fetchDetails(id) {
     if (!Number.isSafeInteger(id) || id < 1) throw Error('Invalid KissKh title');
     const {json} = await fetchKiss(`${BASE}api/DramaList/Drama/${id}`, {headers});
     const list = Array.isArray(json?.episodes) ? json.episodes : [];
     return list.slice(0,5000).map(e=>({ id:Number(e.id), number:Number(e.number) })).filter(e=>Number.isSafeInteger(e.id) && e.id>0 && Number.isSafeInteger(e.number) && e.number>0 && e.number<=9999).sort((a,b)=>a.number-b.number);
+  }
+  async function details(id) {
+    if(!Number.isSafeInteger(id) || id<1)throw Error('Invalid KissKh title');
+    const cached=detailCache.get(id);if(cached && cached.expires>Date.now())return cached.list.map(e=>({...e}));
+    if(!detailInflight.has(id)){
+      const pending=fetchDetails(id).then(list=>{if(detailCache.size>=100)detailCache.delete(detailCache.keys().next().value);detailCache.set(id,{list,expires:Date.now()+120000});return list;}).finally(()=>detailInflight.delete(id));
+      detailInflight.set(id,pending);
+    }
+    return (await detailInflight.get(id)).map(e=>({...e}));
   }
   async function tokenScript() {
     if (script && Date.now()-scriptAt < 30*60000) return script;
@@ -82,7 +92,7 @@ module.exports = function createKisskh({ request, safeUrl, tokenRunner = runToke
     const params=new URLSearchParams({kkey:token});
     const {json}=await fetchKiss(`${BASE}api/DramaList/Episode/${ep.id}.png?${params}`,{headers});
     const url=safeUrl(json?.Video);
-    if (url.hostname.endsWith('tickcounter.com')) throw Error('Episode not released yet');
+    if (url.hostname==='tickcounter.com' || url.hostname.endsWith('.tickcounter.com')) throw Error('Episode not released yet');
     const format=/\.m3u8$/i.test(url.pathname) ? 'hls' : /\.mp4$/i.test(url.pathname) ? 'file' : null;
     if (!format) throw Error('Unsupported KissKh stream format');
     return {streams:[{url:url.href,format,quality:0}],referer:BASE,origin:new URL(BASE).origin};

@@ -1,4 +1,5 @@
 'use strict';
+const {sourceFormat}=require('./source-format');
 // User-supplied Movy protocol. Server names are upstream labels, not proof of location.
 const SERVERS = ['miami','boise','nashville','chicago','vegas','reno','oakland','seattle','phoenix','atlanta','portland','austin','dallas'];
 const SITE='https://www.movy.sx', API='https://api.wecollege.net';
@@ -17,17 +18,17 @@ function decrypt(text,seed,id){
 }
 function createMovy({request,safeUrl,now=Date.now}){
   let queue=Promise.resolve(), cooldown=0, pending=0; const cache=new Map();
-  async function run(item,season,episode){
+  async function run(item,season,episode,{forceRefresh=false}={}){
     const deadline=now()+12000;
     const get=(url,options={})=>{const remaining=deadline-now(); if(remaining<=0) throw Error('Movy lookup timed out'); return request(url,{...options,timeoutMs:Math.max(1,Math.min(3500,remaining))});};
     const id=String(item.tmdbId||''); if(!/^\d{1,10}$/.test(id)) throw Error('TMDB ID unavailable');
     if(now()<cooldown) throw Error('Movy rate limited; wait before retrying');
     const type=item.type==='series'?'tv':'movie', key=`${type}:${id}:${season}:${episode}`, cached=cache.get(key);
-    if(cached && cached.expires>now()) return cached.result;
+    if(!forceRefresh && cached && cached.expires>now()) return cached.result;
     const html=(await get(`${SITE}/${type}/${id}`,{headers})).text;
     const match=/<script\b[^>]*\bid=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i.exec(html);
     if(!match) throw Error('Movy detail data unavailable');
-    const det=JSON.parse(match[1])?.props?.pageProps?.details;
+    let det;try{det=JSON.parse(match[1])?.props?.pageProps?.details;}catch{throw Error('Movy detail data is invalid');}
     if(!det || typeof det.title!=='string' || !det.title || !det.year || (type==='tv' && !Array.isArray(det.seasons))) throw Error('Movy detail metadata incomplete');
     const q=new URLSearchParams({title:encodeURIComponent(det.title),mediaType:type,year:String(det.year),totalSeasons:String(type==='tv'?det.seasons.length:0),episodeId:String(type==='tv'?episode:1),seasonId:String(type==='tv'?season:1),tmdbId:id,imdbId:String(det.imdbId||''),enc:'2'});
     let seed,seedExpires=0;
@@ -43,13 +44,13 @@ function createMovy({request,safeUrl,now=Date.now}){
           catch(err){if(attempt===0 && (err.status===401 || err.message==='Movy seed mismatch')) continue;throw err;}
         }
         const rows=Array.isArray(data?.sources)?data.sources.slice(0,30):[];if(typeof data?.playlist==='string') rows.unshift({url:data.playlist,quality:'Auto'});
-        const streams=[],seen=new Set(); for(const row of rows){if(server==='austin' && row.quality!=='English' && row.quality!=='Auto')continue; if(typeof row?.url!=='string')continue; try{const url=safeUrl(row.url).href; if(seen.has(url)) continue; seen.add(url); const label=String(row.quality||'');const quality=/(\d{3,4})/.exec(label); streams.push({url,format:'hls',quality:quality?Number(quality[1]):/\b(?:4k|uhd)\b/i.test(label)?2160:0,provider:`movy:${server}`});}catch{}}
+        const streams=[],seen=new Set(); for(const row of rows){if(server==='austin' && row.quality!=='English' && row.quality!=='Auto')continue; if(typeof row?.url!=='string')continue; try{const url=safeUrl(row.url).href; if(seen.has(url)) continue; seen.add(url); const label=String(row.quality||'');const quality=/(\d{3,4})/.exec(label); streams.push({url,format:sourceFormat(url),quality:quality?Number(quality[1]):/\b(?:4k|uhd)\b/i.test(label)?2160:0,provider:`movy:${server}`});}catch{}}
         consecutiveErrors=0; if(streams.length){let captionInfo=null; const subtitles=Array.isArray(data?.subtitles)?data.subtitles.slice(0,30):[]; const english=subtitles.find(x=>/^(en|eng|english)(?:$|[-_\s])/i.test(String(x?.language||x?.lang||x?.label||''))); if(english) {try {captionInfo={url:safeUrl(english.url||english.file).href};} catch {}} const result={streams,referer:SITE+'/',origin:SITE,userAgent:'okhttp/4.12.0',captionInfo}; if(cache.size>=100)cache.delete(cache.keys().next().value);cache.set(key,{result,expires:now()+600000});return result;}
       }catch(err){if(err.status===429){cooldown=now()+60000;throw Error('Movy rate limited; wait before retrying');}lastError=err; if(++consecutiveErrors>=2) break;}
     }
     if(lastError) throw Error(`Movy unavailable: ${String(lastError.message).slice(0,100)}`);
     return {streams:[]};
   }
-  return function resolve(item,season,episode){if(pending>=8) return Promise.reject(Error('Movy queue full')); pending++; const job=queue.then(()=>run(item,season,episode));queue=job.catch(()=>{});return job.finally(()=>pending--);};
+  return function resolve(item,season,episode,options={}){if(pending>=8) return Promise.reject(Error('Movy queue full')); pending++; const job=queue.then(()=>run(item,season,episode,options));queue=job.catch(()=>{});return job.finally(()=>pending--);};
 }
 module.exports={createMovy,decrypt,SERVERS};
