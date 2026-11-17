@@ -644,12 +644,19 @@ test('an unroutable IPv6 answer cannot be chosen when IPv4 is preferred', async 
     // An IPv6-only network still works when it asks for that family explicitly.
     assert.equal(await pick({ family: 6 }), '2600:9000::1');
 
-    // Default stays hands-off: the resolver order is preserved.
-    delete process.env.CINEMA_IPV4;
+    // Explicitly off: the resolver order is preserved, whatever the host.
+    process.env.CINEMA_IPV4 = '0';
     const auto = fresh();
     const autoPick = options => new Promise((ok, bad) => auto.publicLookup(dualStack)('cdn.example', options, (e, a) => e ? bad(e) : ok(a)));
     assert.equal(await autoPick({}), '2600:9000::1');
     assert.equal(auto.forceIPv4, false);
+
+    // Unset: decided by whether this machine actually has an IPv6 route, so
+    // the same code does the right thing on either kind of host.
+    delete process.env.CINEMA_IPV4;
+    const detected = fresh();
+    assert.equal(detected.forceIPv4, detected.ipv6Unrouted,
+      'IPv4 is preferred exactly when the host has no IPv6 route');
   } finally {
     if (previous === undefined) delete process.env.CINEMA_IPV4; else process.env.CINEMA_IPV4 = previous;
     delete require.cache[require.resolve('./network')];
