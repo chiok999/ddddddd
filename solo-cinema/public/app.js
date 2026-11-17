@@ -9,13 +9,13 @@ async function api(url, options = {}) {
 }
 const post = (url, data) => api(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(data) });
 let route='home', resolveSequence=0, watchReturn='search', discoveryEpoch=0;
-let transcodeJob=null, transcodeSequence=0, transcodeQueue=Promise.resolve(), lastTranscodeError='';
+let transcodeJob=null, transcodeSequence=0, transcodeQueue=Promise.resolve(), lastTranscodeError='', pendingRequestId=null;
 function enqueueTranscode(fn){const task=transcodeQueue.then(fn,fn);transcodeQueue=task.catch(()=>{});return task;}
 async function conversionFailed(item,fail){
   const sequence=transcodeSequence;let message='Converted playback failed.';try{const result=await post('/api/transcode/status',{id:item.transcodeId});if(result.error)message=result.error;}catch{}
   if(current!==item || route!=='watch' || sequence!==transcodeSequence)return;lastTranscodeError=message;fail();
 }
-function stopTranscode(){++transcodeSequence;const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
+function stopTranscode(){++transcodeSequence;const pending=pendingRequestId;pendingRequestId=null;if(pending)post('/api/transcode/cancel',{requestId:pending}).catch(()=>{});const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
 
 let dataSaver = (()=>{try{const v=localStorage.getItem('solo-data-saver'); return v===null ? !!navigator.connection?.saveData : v==='true';}catch{return !!navigator.connection?.saveData;}})();
 let preferredHeight = (()=>{try{return Number(localStorage.getItem('solo-quality-height'))===360?360:240;}catch{return 240;}})();
@@ -80,28 +80,30 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     const url = item.proxy || (await post('/api/source', {url:item.url, format:item.format})).url;
     if (!isActive()) return;
     if(!item.proxy) item.proxy=url;
-    $('playError').textContent='Preparing 240p / 360p conversion…';
+    const offset=Number.isFinite(item.seekAt) ? item.seekAt : 0;
+    $('playError').textContent=offset ? 'Seeking: preparing conversion at the selected point…' : 'Preparing 240p / 360p conversion…';
     const result=await enqueueTranscode(async()=>{
       if(sequence!==transcodeSequence || !isActive()) return null;
-      const job=await post('/api/transcode',{url});
+      const requestId=Array.from(crypto.getRandomValues(new Uint8Array(16)),n=>n.toString(16).padStart(2,'0')).join('');pendingRequestId=requestId;
+      let job;try{job=await post('/api/transcode',{url,offset,requestId});}finally{if(pendingRequestId===requestId)pendingRequestId=null;}
       if(!job || typeof job.id!=='string' || !/^[A-Za-z0-9_-]+$/.test(job.id) || job.url!==`/transcode/${job.id}/master.m3u8`){if(typeof job?.id==='string' && /^[A-Za-z0-9_-]+$/.test(job.id))await post('/api/transcode/stop',{id:job.id}).catch(()=>{});throw Error('Invalid conversion response');}
       if(sequence!==transcodeSequence || !isActive() || route!=='watch'){await post('/api/transcode/stop',{id:job.id}).catch(()=>{});return null;}
       return job;
     });
     if(!result || !isActive())return;
     transcodeJob=result.id;
-    item={...item,format:'hls',transcodeId:result.id,noResume:true};
+    item={...item,format:'hls',transcodeId:result.id,noResume:true,seekBase:offset,totalDuration:Number.isFinite(result.duration) && result.duration>0 ? result.duration : (Number.isFinite(item.totalDuration)?item.totalDuration:null)};
     const outputUrl=result.url;
-    $('playError').textContent='Conversion is growing: seek within the portion converted so far. Long pauses or storage limits can end the session.';
-    current=item; pendingFailure=null; subtitleTouched=false; if(uploadUrl){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
+    $('playError').textContent=item.totalDuration?'Seeking to an unconverted point restarts conversion and may take time.':'Duration unavailable: seeking is limited to the converted portion.';
+    current=item; pendingFailure=null; const keepUpload=!!(item.keepUpload && uploadUrl);subtitleTouched=keepUpload; if(uploadUrl && !keepUpload){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('subtitleFile').value=''; $('back10').disabled=false; $('forward10').disabled=false; updateNext(); const video=$('video'); video.querySelectorAll('track').forEach(track=>track.remove()); externalTrack=null; if (hls) { hls.destroy(); hls=null; } video.pause(); video.removeAttribute('src'); video.load();
     $('server').replaceChildren(); const variants=item.variants || [item]; variants.forEach((source,i)=>$('server').add(new Option(`${source.provider || 'Direct'} · ${source.quality ? source.quality+'p' : 'source'} · ${(source.format || 'file').toUpperCase()}`,String(i)))); $('server').disabled=variants.length<2; const serverIndex=variants.findIndex(source=>source.proxy ? source.proxy===item.proxy : source===item); $('server').value=String(Math.max(0,serverIndex));
-    $('quality').replaceChildren(new Option('240p', '240'),new Option('360p', '360')); $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
+    $('quality').replaceChildren(new Option('240p', '240'),new Option('360p', '360')); $('quality').value=String(preferredHeight); $('subtitles').replaceChildren(new Option('Off', '-1')); $('audio').replaceChildren(new Option('Default', '-1')); if(keepUpload){uploadTrack=document.createElement('track');uploadTrack.kind='subtitles';uploadTrack.label='Uploaded subtitles';uploadTrack.srclang='en';uploadTrack.src=uploadUrl;video.append(uploadTrack);$('subtitles').add(new Option('Uploaded subtitles','upload'));$('subtitles').value='upload';const track=uploadTrack;track.addEventListener('load',()=>{if(uploadTrack===track && current===item){shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}});} $('placeholder').classList.add('hidden'); video.classList.remove('hidden'); $('playing').textContent=item.title;
     const resume=()=>{ if(item.noResume)return; const progress=load('solo-progress'); const match=progress.find(x=>x.url===(item.progressKey || item.url)); const time=Number.isFinite(item.resumeAt) ? item.resumeAt : match?.time; if(Number.isFinite(time) && time>0 && (!Number.isFinite(video.duration) || time<video.duration-1)) video.currentTime=time; };
     video.onloadedmetadata=resume; video.playbackRate=Number($('speed').value); pendingFailure=fail;
     if (item.subtitleRequest) {
       post(item.subtitleRequest.path,item.subtitleRequest.data).then(result=>{
         if (!result.url || current!==item) return;
-        const track=document.createElement('track'); track.kind='subtitles'; track.label='English (provider)'; track.srclang='en'; track.src=result.url; track.default=!uploadTrack && !subtitleTouched; externalTrack=track; video.append(track); $('subtitles').add(new Option('English (provider)', 'external')); if(!uploadTrack && !subtitleTouched) { $('subtitles').value='external'; if(hls) hls.subtitleTrack=-1; } track.addEventListener('load',()=>{ if (current===item && $('subtitles').value==='external') {track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);} });
+        const track=document.createElement('track'); track.kind='subtitles'; track.label='English (provider)'; track.srclang='en'; track.src=result.url; track.default=!uploadTrack && !subtitleTouched; externalTrack=track; video.append(track); $('subtitles').add(new Option('English (provider)', 'external')); if(!uploadTrack && !subtitleTouched) { $('subtitles').value='external'; if(hls) hls.subtitleTrack=-1; } track.addEventListener('load',()=>{ if (current===item && $('subtitles').value==='external') {shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);} });
       }).catch(()=>{});
     }
     // hls.js can detect a playlist whose URL itself is opaque.
@@ -139,6 +141,11 @@ try {const speed=localStorage.getItem('solo-playback-speed');if([...$('speed').o
 // Position native WebVTT cues rather than painting an overlay: their text, timing,
 // markup and track selection remain browser-controlled, including in fullscreen.
 const captionTracks=new WeakSet();
+// Subtitle timestamps refer to the original title, while restarted output starts at zero.
+function shiftCaptionCues(track,offset){
+ if(!track || !offset || !track.cues)return;
+ try{for(const cue of Array.from(track.cues)){if(cue.endTime<=offset){track.removeCue(cue);continue;}cue.startTime=Math.max(0,cue.startTime-offset);cue.endTime=Math.max(0,cue.endTime-offset);}}catch{$('playError').textContent='Subtitle timing may be inaccurate after seeking on this browser.';}
+}
 function positionActiveCues(track){
   try {
     if(!track || !['subtitles','captions'].includes(track.kind)) return;
@@ -167,7 +174,7 @@ $('subtitleFile').onchange=async()=>{
     text=text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g,'$1.$2'); if(!/^WEBVTT(?:\s|$)/.test(text)) text='WEBVTT\n\n'+text;
     if(uploadTrack) uploadTrack.remove(); if(uploadUrl) URL.revokeObjectURL(uploadUrl);
     uploadUrl=URL.createObjectURL(new Blob([text],{type:'text/vtt'})); uploadTrack=document.createElement('track'); uploadTrack.kind='subtitles'; uploadTrack.label='Uploaded subtitles'; uploadTrack.srclang='en'; uploadTrack.src=uploadUrl; $('video').append(uploadTrack);
-    $('subtitles').querySelector('option[value="upload"]')?.remove(); $('subtitles').add(new Option('Uploaded subtitles','upload')); $('subtitles').value='upload'; $('subtitles').dispatchEvent(new Event('change')); const track=uploadTrack; track.addEventListener('load',()=>{if(uploadTrack===track && $('subtitles').value==='upload') {track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}}); $('playError').textContent='';
+    $('subtitles').querySelector('option[value="upload"]')?.remove(); $('subtitles').add(new Option('Uploaded subtitles','upload')); $('subtitles').value='upload'; $('subtitles').dispatchEvent(new Event('change')); const track=uploadTrack; track.addEventListener('load',()=>{if(uploadTrack===track && $('subtitles').value==='upload') {shiftCaptionCues(track.track,item.seekBase);track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}}); $('playError').textContent='';
   } catch { if(current===item) $('playError').textContent='Could not read that subtitle file.'; }
 };
 $('video').ontimeupdate=()=>{ if(!current || current.noResume || Date.now()-lastSave<5000) return; lastSave=Date.now(); const key=current.progressKey || current.url; const progress=load('solo-progress').filter(x=>x.url!==key); progress.unshift({url:key,time:$('video').currentTime}); save('solo-progress', progress.slice(0,100)); };
@@ -239,11 +246,20 @@ function updateNext(){
   $('nextEpisode').disabled=!ctx || !selected || selected.id!==ctx.id;
   $('prevEpisode').disabled=!ctx || !selected || selected.id!==ctx.id || (episodes.length ? !episodes.some(e=>e.season<ctx.season || (e.season===ctx.season && e.episode<ctx.episode)) : ctx.episode<=1);
 }
-function skip(seconds){
-  const video=$('video'); if(!current || !Number.isFinite(video.currentTime)) return;
-  const end=Number.isFinite(video.duration) ? video.duration : Infinity;
-  video.currentTime=Math.max(0,Math.min(end,video.currentTime+seconds));
-}
+// Video time is relative to the current conversion; the overlay owns the full timeline.
+window.troyTimeline={
+ duration(){const v=$('video');return current?.totalDuration || (Number.isFinite(v.duration)?v.duration:0);},
+ time(){return (current?.seekBase || 0)+($('video').currentTime || 0);},
+ seek(value){
+  const item=current,video=$('video');if(!item || !Number.isFinite(value))return;
+  const duration=this.duration();if(duration<=0){if(!item.totalDuration)video.currentTime=Math.max(0,value);return;}
+  const target=Math.max(0,Math.min(Math.max(0,duration-1),value)),base=item.seekBase||0,relative=target-base;
+  if(relative>=0 && Number.isFinite(video.duration) && relative<video.duration-0.1){video.currentTime=relative;return;}
+  if(!item.totalDuration){$('playError').textContent='This source has no usable duration for seeking beyond converted video.';return;}
+  fallback.play([{...item,format:'file',seekAt:target,transcodeId:null,wasPaused:video.paused,keepUpload:!!uploadTrack}]);
+ }
+};
+function skip(seconds){if(current)window.troyTimeline.seek(window.troyTimeline.time()+seconds);}
 $('back10').onclick=()=>skip(-10);
 $('forward10').onclick=()=>skip(10);
 $('prevEpisode').onclick=async()=>{
