@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 'use strict';
+const guard = require('./tool-guard');
+if (guard.startServerIfPanelEntry('troy-426.js', '"https://<source url>"')) return;
 // Why is a source returning 426? Measures it instead of guessing.
 //
 //   node troy-426.js "https://<source url>"

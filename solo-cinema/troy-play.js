@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 'use strict';
+const guard = require('./tool-guard');
+if (guard.startServerIfPanelEntry('troy-play.js', '--url "https://..."')) return;
 // Server-side playback test. Runs the same provider calls the browser makes,
 // then tries to actually READ the winning source, and reports exactly where it
 // fails. Use it when the app shows an error you cannot read on a phone.

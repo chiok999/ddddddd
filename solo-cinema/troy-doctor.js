@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 'use strict';
+const guard = require('./tool-guard');
+if (guard.startServerIfPanelEntry('troy-doctor.js')) return;
 // Troy network doctor -- ONE self-contained file. No npm install, no server, no
 // login, nothing to configure.
 //
