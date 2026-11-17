@@ -720,3 +720,36 @@ exit 0
     assert.equal(midFile,1,'no replay once bytes may already have been consumed');
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
+
+test('a downloaded static FFmpeg is decompressed, executable and preferred', async () => {
+  // Mirrors static-ffmpeg.download() without network: gunzip, chmod, rename.
+  const zlib = require('node:zlib');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const { pipeline } = require('node:stream/promises');
+  const { assetName, downloadUrl } = require('./static-ffmpeg');
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'troy-dl-'));
+  try {
+    // The URL scheme must match ffmpeg-static's own releases.
+    assert.equal(assetName('linux', 'arm64'), 'ffmpeg-linux-arm64.gz');
+    assert.match(downloadUrl('linux', 'arm64'), /releases\/download\/b6\.1\.1\/ffmpeg-linux-arm64\.gz$/);
+
+    const partial = path.join(dir, 'ffmpeg.part');
+    const source = path.join(dir, 'asset.gz');
+    fs.writeFileSync(source, zlib.gzipSync(Buffer.from('#!/bin/sh\necho stub\n')));
+    await pipeline(fs.createReadStream(source), zlib.createGunzip(), fs.createWriteStream(partial));
+    await fs.promises.chmod(partial, 0o755);
+    const binary = path.join(dir, 'ffmpeg');
+    await fs.promises.rename(partial, binary);
+
+    assert.equal(fs.statSync(binary).mode & 0o777, 0o755, 'binary is executable');
+    const run = require('node:child_process').execFileSync(binary, ['-version'], { encoding: 'utf8' });
+    assert.match(run, /stub/, 'the decompressed file runs');
+
+    // A downloaded binary is offered to selection, ahead of the system one.
+    const previous = process.env.CINEMA_FFMPEG;
+    delete process.env.CINEMA_FFMPEG;
+    try { process.env.CINEMA_FFMPEG = binary; assert.equal(require('./transcode').ffmpegCandidates()[0].path, binary); }
+    finally { if (previous === undefined) delete process.env.CINEMA_FFMPEG; else process.env.CINEMA_FFMPEG = previous; }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
