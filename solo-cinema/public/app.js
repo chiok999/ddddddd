@@ -91,7 +91,7 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     if (item.subtitleRequest) {
       post(item.subtitleRequest.path,item.subtitleRequest.data).then(result=>{
         if (!result.url || current!==item) return;
-        const track=document.createElement('track'); track.kind='subtitles'; track.label='English (provider)'; track.srclang='en'; track.src=result.url; track.default=!uploadTrack && !subtitleTouched; externalTrack=track; video.append(track); $('subtitles').add(new Option('English (provider)', 'external')); if(!uploadTrack && !subtitleTouched) { $('subtitles').value='external'; if(hls) hls.subtitleTrack=-1; } track.addEventListener('load',()=>{ if (current===item && $('subtitles').value==='external') track.track.mode='showing'; });
+        const track=document.createElement('track'); track.kind='subtitles'; track.label='English (provider)'; track.srclang='en'; track.src=result.url; track.default=!uploadTrack && !subtitleTouched; externalTrack=track; video.append(track); $('subtitles').add(new Option('English (provider)', 'external')); if(!uploadTrack && !subtitleTouched) { $('subtitles').value='external'; if(hls) hls.subtitleTrack=-1; } track.addEventListener('load',()=>{ if (current===item && $('subtitles').value==='external') {track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);} });
       }).catch(()=>{});
     }
     // hls.js can detect a playlist whose URL itself is opaque.
@@ -126,9 +126,27 @@ $('video').audioTracks?.addEventListener?.('removetrack',nativeAudioOptions);
 $('audio').onchange=()=>{ if(hls) hls.audioTrack=Number($('audio').value); else {const tracks=$('video').audioTracks,index=Number($('audio').value);if(tracks && index>=0 && index<tracks.length)for(let i=0;i<tracks.length;i++)tracks[i].enabled=i===index;} };
 $('speed').onchange=()=>{ $('video').playbackRate=Number($('speed').value); try{localStorage.setItem('solo-playback-speed',$('speed').value);}catch{} };
 try {const speed=localStorage.getItem('solo-playback-speed');if([...$('speed').options].some(o=>o.value===speed)) $('speed').value=speed;}catch{}
-function applyCaptionAppearance(){ const video=$('video'); for(const value of ['small','large','xlarge','yellow']) video.classList.remove(`caption-${value}`); const size=$('subtitleSize').value, color=$('subtitleColor').value; if(['small','large','xlarge'].includes(size)) video.classList.add(`caption-${size}`); if(color==='yellow') video.classList.add('caption-yellow'); try {localStorage.setItem('solo-caption-style',JSON.stringify({size,color}));} catch {} }
-$('subtitleSize').onchange=applyCaptionAppearance; $('subtitleColor').onchange=applyCaptionAppearance;
-try {const settings=JSON.parse(localStorage.getItem('solo-caption-style') || '{}'); if(['normal','small','large','xlarge'].includes(settings.size)) $('subtitleSize').value=settings.size; if(['white','yellow'].includes(settings.color)) $('subtitleColor').value=settings.color;} catch {} applyCaptionAppearance();
+// Position native WebVTT cues rather than painting an overlay: their text, timing,
+// markup and track selection remain browser-controlled, including in fullscreen.
+const captionTracks=new WeakSet();
+function positionActiveCues(track){
+  try {
+    if(!track || !['subtitles','captions'].includes(track.kind)) return;
+    const cues=track.activeCues; if(!cues) return; const line=100-Number($('subtitlePosition').value);
+    for(let i=0;i<cues.length;i++){
+      const cue=cues[i]; if(!cue || !('line' in cue) || cue.vertical)continue;
+      try{if(cue.snapToLines!==false)cue.snapToLines=false;if(cue.line!==line)cue.line=line;if('lineAlign' in cue && cue.lineAlign!=='end')cue.lineAlign='end';}catch{/* Native/non-WebVTT cues may be read-only. */}
+    }
+  }catch{/* Some native tracks do not expose cues. */}
+}
+function watchCaptionTrack(track){if(!track || captionTracks.has(track))return;captionTracks.add(track);track.addEventListener?.('cuechange',()=>positionActiveCues(track));positionActiveCues(track);}
+function syncCaptionPosition(){const tracks=$('video').textTracks;if(!tracks)return;for(let i=0;i<tracks.length;i++){watchCaptionTrack(tracks[i]);positionActiveCues(tracks[i]);}}
+$('video').textTracks?.addEventListener?.('addtrack',event=>{watchCaptionTrack(event.track);syncCaptionPosition();});
+$('video').textTracks?.addEventListener?.('change',syncCaptionPosition);
+$('video').addEventListener('timeupdate',syncCaptionPosition);
+function applyCaptionAppearance(){ const video=$('video'); for(const value of ['small','large','xlarge','yellow']) video.classList.remove(`caption-${value}`); const size=$('subtitleSize').value, color=$('subtitleColor').value, position=Number($('subtitlePosition').value); if(['small','large','xlarge'].includes(size)) video.classList.add(`caption-${size}`); if(color==='yellow') video.classList.add('caption-yellow'); syncCaptionPosition(); try {localStorage.setItem('solo-caption-style',JSON.stringify({size,color,position}));} catch {} }
+$('subtitleSize').onchange=applyCaptionAppearance; $('subtitleColor').onchange=applyCaptionAppearance; $('subtitlePosition').onchange=applyCaptionAppearance;
+try {const settings=JSON.parse(localStorage.getItem('solo-caption-style') || '{}'); if(['normal','small','large','xlarge'].includes(settings.size)) $('subtitleSize').value=settings.size; if(['white','yellow'].includes(settings.color)) $('subtitleColor').value=settings.color; if([...$('subtitlePosition').options].some(option=>option.value===String(settings.position))) $('subtitlePosition').value=String(settings.position);} catch {} applyCaptionAppearance();
 $('server').onchange=()=>{ if(!current?.variants) return; const picked=current.variants[Number($('server').value)]; if(!picked || picked.proxy===current.proxy) return; const video=$('video'); fallback.play([{...picked,resumeAt:video.currentTime,wasPaused:video.paused},...current.variants.filter(x=>x!==picked)]); };
 $('subtitleFile').onchange=async()=>{
   const file=$('subtitleFile').files[0], item=current; if(!file) return; if(!item){ $('playError').textContent='Start a stream before uploading subtitles.'; $('subtitleFile').value=''; return; }
@@ -139,7 +157,7 @@ $('subtitleFile').onchange=async()=>{
     text=text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g,'$1.$2'); if(!/^WEBVTT(?:\s|$)/.test(text)) text='WEBVTT\n\n'+text;
     if(uploadTrack) uploadTrack.remove(); if(uploadUrl) URL.revokeObjectURL(uploadUrl);
     uploadUrl=URL.createObjectURL(new Blob([text],{type:'text/vtt'})); uploadTrack=document.createElement('track'); uploadTrack.kind='subtitles'; uploadTrack.label='Uploaded subtitles'; uploadTrack.srclang='en'; uploadTrack.src=uploadUrl; $('video').append(uploadTrack);
-    $('subtitles').querySelector('option[value="upload"]')?.remove(); $('subtitles').add(new Option('Uploaded subtitles','upload')); $('subtitles').value='upload'; $('subtitles').dispatchEvent(new Event('change')); const track=uploadTrack; track.addEventListener('load',()=>{if(uploadTrack===track && $('subtitles').value==='upload') track.track.mode='showing';}); $('playError').textContent='';
+    $('subtitles').querySelector('option[value="upload"]')?.remove(); $('subtitles').add(new Option('Uploaded subtitles','upload')); $('subtitles').value='upload'; $('subtitles').dispatchEvent(new Event('change')); const track=uploadTrack; track.addEventListener('load',()=>{if(uploadTrack===track && $('subtitles').value==='upload') {track.track.mode='showing';watchCaptionTrack(track.track);positionActiveCues(track.track);}}); $('playError').textContent='';
   } catch { if(current===item) $('playError').textContent='Could not read that subtitle file.'; }
 };
 $('video').ontimeupdate=()=>{ if(!current || current.noResume || Date.now()-lastSave<5000) return; lastSave=Date.now(); const key=current.progressKey || current.url; const progress=load('solo-progress').filter(x=>x.url!==key); progress.unshift({url:key,time:$('video').currentTime}); save('solo-progress', progress.slice(0,100)); };

@@ -13,7 +13,7 @@
     const rows=$('playerMenuRows');rows.replaceChildren();$('playerSaver').classList.toggle('hidden',menuView!=='main');$('playerAdvanced').classList.toggle('hidden',menuView!=='advanced');
     const row=(label,value,action,selected=false)=>{const button=document.createElement('button');button.type='button';button.className='player-menu-row'+(selected?' selected':'');const name=document.createElement('span');name.textContent=label;const detail=document.createElement('span');detail.textContent=value||'';button.append(name,detail);button.onclick=()=>{action();poke();};rows.append(button);};
     if(menuView==='main'){
-      for(const [id,label] of [['quality','Quality'],['speed','Speed'],['subtitles','Subtitles']]){const select=$(id);row(label,(select.selectedOptions[0]?.textContent||'Unavailable')+' ›',()=>{menuView=id;renderMenu();});}
+      for(const [id,label] of [['quality','Quality'],['speed','Speed'],['subtitles','Subtitles'],['subtitlePosition','Subtitle height']]){const select=$(id);row(label,(select.selectedOptions[0]?.textContent||'Unavailable')+' ›',()=>{menuView=id;renderMenu();});}
       row('More settings','›',()=>{menuView='advanced';renderMenu();});
     }else{
       row('‹ Back','',()=>{menuView='main';renderMenu();});
