@@ -78,7 +78,7 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     if (item.subtitleRequest) {
       post(item.subtitleRequest.path,item.subtitleRequest.data).then(result=>{
         if (!result.url || current!==item) return;
-        const track=document.createElement('track'); track.kind='subtitles'; track.label='English (provider)'; track.srclang='en'; track.src=result.url; track.default=!uploadTrack && !subtitleTouched; video.append(track); externalTrack=track; $('subtitles').add(new Option('English (provider)', 'external')); if(!uploadTrack && !subtitleTouched) { $('subtitles').value='external'; if(hls) hls.subtitleTrack=-1; } track.addEventListener('load',()=>{ if (current===item && $('subtitles').value==='external') track.track.mode='showing'; });
+        const track=document.createElement('track'); track.kind='subtitles'; track.label='English (provider)'; track.srclang='en'; track.src=result.url; track.default=!uploadTrack && !subtitleTouched; externalTrack=track; video.append(track); $('subtitles').add(new Option('English (provider)', 'external')); if(!uploadTrack && !subtitleTouched) { $('subtitles').value='external'; if(hls) hls.subtitleTrack=-1; } track.addEventListener('load',()=>{ if (current===item && $('subtitles').value==='external') track.track.mode='showing'; });
       }).catch(()=>{});
     }
     // hls.js can detect a playlist whose URL itself is opaque.
@@ -88,13 +88,31 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('subtitles').value; $('subtitles').replaceChildren(new Option('Off', '-1')); (data.subtitleTracks || []).forEach((track,i)=>$('subtitles').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if(externalTrack) $('subtitles').add(new Option('English (provider)','external')); if(uploadTrack) $('subtitles').add(new Option('Uploaded subtitles','upload')); if([...$('subtitles').options].some(o=>o.value===previous)) $('subtitles').value=previous; });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('audio').value; $('audio').replaceChildren(new Option('Default', '-1')); (data.audioTracks || []).forEach((track,i)=>$('audio').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if([...$('audio').options].some(o=>o.value===previous)) $('audio').value=previous; });
       hls.on(Hls.Events.ERROR, (_event,data)=>{ if(data.fatal && current===item && pendingFailure===fail) { pendingFailure=null; fail(); } });
-    } else { video.src=url; if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); }
+    } else { video.src=url; nativeSubtitleOptions(); nativeAudioOptions(); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); }
   } catch(e) { if(isActive()) { pendingFailure=null; fail(); } }
 }
 $('quality').onchange=()=>{ const value=$('quality').value; if(hls && /^-?\d+$/.test(value)) { hls.currentLevel=Number(value); preferredHeight=Number(value)<0?0:Number(activeLevels[Number(value)]?.height)||0; try{localStorage.setItem('solo-quality-height',String(preferredHeight));}catch{} return; } if(value.startsWith('file:') && current?.variants){ const chosen=current.variants[Number(value.slice(5))]; if(chosen && chosen.proxy!==current.proxy){ const video=$('video'); const next={...chosen,resumeAt:video.currentTime,wasPaused:video.paused}; fallback.play([next,...current.variants.filter(x=>x!==chosen)]); } } };
-$('subtitles').onchange=()=>{ subtitleTouched=true; const value=$('subtitles').value; if(uploadTrack) uploadTrack.track.mode=value==='upload'?'showing':'disabled'; if(externalTrack) externalTrack.track.mode=value==='external'?'showing':'disabled'; if(hls) hls.subtitleTrack=(value==='external'||value==='upload')?-1:Number(value); };
-$('audio').onchange=()=>{ if(hls) hls.audioTrack=Number($('audio').value); };
-$('speed').onchange=()=>{ $('video').playbackRate=Number($('speed').value); };
+function nativeSubtitleOptions(){
+  if(hls || !current) return;
+  const select=$('subtitles'), previous=select.value, tracks=$('video').textTracks;
+  for(const option of [...select.options]) if(option.value.startsWith('native:')) option.remove();
+  for(let i=0;i<tracks.length;i++){const track=tracks[i];if(track===uploadTrack?.track || track===externalTrack?.track || !['subtitles','captions'].includes(track.kind))continue;select.add(new Option(track.label || track.language || `Track ${i+1}`,`native:${i}`));}
+  if([...select.options].some(o=>o.value===previous)) select.value=previous;
+}
+$('video').textTracks?.addEventListener?.('addtrack',nativeSubtitleOptions);
+$('video').textTracks?.addEventListener?.('removetrack',nativeSubtitleOptions);
+$('subtitles').onchange=()=>{ subtitleTouched=true; const value=$('subtitles').value; if(!hls){const tracks=$('video').textTracks;for(let i=0;i<tracks.length;i++){const track=tracks[i];if(track!==uploadTrack?.track && track!==externalTrack?.track && ['subtitles','captions'].includes(track.kind))track.mode=value===`native:${i}`?'showing':'disabled';}} if(uploadTrack) uploadTrack.track.mode=value==='upload'?'showing':'disabled'; if(externalTrack) externalTrack.track.mode=value==='external'?'showing':'disabled'; if(hls) hls.subtitleTrack=(value==='external'||value==='upload')?-1:Number(value); };
+function nativeAudioOptions(){
+  if(hls || !current) return; const tracks=$('video').audioTracks;if(!tracks)return;
+  const select=$('audio'), previous=select.value;select.replaceChildren(new Option('Default','-1'));
+  for(let i=0;i<tracks.length;i++) select.add(new Option(tracks[i].label || tracks[i].language || `Track ${i+1}`,String(i)));
+  if([...select.options].some(o=>o.value===previous))select.value=previous;
+}
+$('video').audioTracks?.addEventListener?.('addtrack',nativeAudioOptions);
+$('video').audioTracks?.addEventListener?.('removetrack',nativeAudioOptions);
+$('audio').onchange=()=>{ if(hls) hls.audioTrack=Number($('audio').value); else {const tracks=$('video').audioTracks,index=Number($('audio').value);if(tracks && index>=0 && index<tracks.length)for(let i=0;i<tracks.length;i++)tracks[i].enabled=i===index;} };
+$('speed').onchange=()=>{ $('video').playbackRate=Number($('speed').value); try{localStorage.setItem('solo-playback-speed',$('speed').value);}catch{} };
+try {const speed=localStorage.getItem('solo-playback-speed');if([...$('speed').options].some(o=>o.value===speed)) $('speed').value=speed;}catch{}
 function applyCaptionAppearance(){ const video=$('video'); for(const value of ['small','large','xlarge','yellow']) video.classList.remove(`caption-${value}`); const size=$('subtitleSize').value, color=$('subtitleColor').value; if(['small','large','xlarge'].includes(size)) video.classList.add(`caption-${size}`); if(color==='yellow') video.classList.add('caption-yellow'); try {localStorage.setItem('solo-caption-style',JSON.stringify({size,color}));} catch {} }
 $('subtitleSize').onchange=applyCaptionAppearance; $('subtitleColor').onchange=applyCaptionAppearance;
 try {const settings=JSON.parse(localStorage.getItem('solo-caption-style') || '{}'); if(['normal','small','large','xlarge'].includes(settings.size)) $('subtitleSize').value=settings.size; if(['white','yellow'].includes(settings.color)) $('subtitleColor').value=settings.color;} catch {} applyCaptionAppearance();
@@ -173,9 +191,11 @@ async function findStreams(autoplay = false) {
 }
 $('findStreams').onclick=()=>findStreams(true);
 
+$('video').addEventListener('ended',()=>{ if(current){const key=current.progressKey || current.url; if(key) try{save('solo-progress',load('solo-progress').filter(x=>x.url!==key));}catch{}} const ctx=current?.context; if(ctx && selected?.id===ctx.id && episodes.some(e=>e.season>ctx.season || (e.season===ctx.season && e.episode>ctx.episode))) $('nextEpisode').click(); });
 function updateNext(){
   const ctx=current?.context;
   $('nextEpisode').disabled=!ctx || !selected || selected.id!==ctx.id;
+  $('prevEpisode').disabled=!ctx || !selected || selected.id!==ctx.id || (episodes.length ? !episodes.some(e=>e.season<ctx.season || (e.season===ctx.season && e.episode<ctx.episode)) : ctx.episode<=1);
 }
 function skip(seconds){
   const video=$('video'); if(!current || !Number.isFinite(video.currentTime)) return;
@@ -184,6 +204,15 @@ function skip(seconds){
 }
 $('back10').onclick=()=>skip(-10);
 $('forward10').onclick=()=>skip(10);
+$('prevEpisode').onclick=async()=>{
+  const ctx=current?.context; if(!ctx || !selected || selected.id!==ctx.id) return;
+  const prev=episodes.filter(e=>e.season<ctx.season || (e.season===ctx.season && e.episode<ctx.episode)).at(-1);
+  if(!prev && (episodes.length || ctx.episode<=1)){ $('playError').textContent='No earlier episode is listed.'; return; }
+  const season=prev?.season ?? ctx.season, episode=prev?.episode ?? ctx.episode-1;
+  $('season').value=String(season); $('episode').value=String(episode);
+  const option=`${season}:${episode}`; if([...$('episodeSelect').options].some(x=>x.value===option)) $('episodeSelect').value=option;
+  await findStreams(true);
+};
 $('nextEpisode').onclick=async()=>{
   const ctx=current?.context; if(!ctx || !selected || selected.id!==ctx.id) return;
   const next=episodes.find(e=>e.season>ctx.season || (e.season===ctx.season && e.episode>ctx.episode));

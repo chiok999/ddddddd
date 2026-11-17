@@ -76,7 +76,7 @@ function sameOrigin(req) {
 const staticFiles = {
   '/cinema-hero.jpg': ['public/cinema-hero.jpg', 'image/jpeg'],
   '/': ['public/index.html', 'text/html; charset=utf-8'], '/fallback.js': ['public/fallback.js', 'text/javascript; charset=utf-8'], '/app.js': ['public/app.js', 'text/javascript; charset=utf-8'],
-  '/style.css': ['public/style.css', 'text/css; charset=utf-8'], '/hls.js': ['node_modules/hls.js/dist/hls.min.js', 'text/javascript; charset=utf-8']
+  '/style.css': ['public/style.css', 'text/css; charset=utf-8'], '/player.css': ['public/player.css', 'text/css; charset=utf-8'], '/player-ui.js': ['public/player-ui.js', 'text/javascript; charset=utf-8'], '/hls.js': ['node_modules/hls.js/dist/hls.min.js', 'text/javascript; charset=utf-8']
 };
 const server = http.createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
