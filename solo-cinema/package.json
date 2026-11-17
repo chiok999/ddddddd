@@ -19,5 +19,11 @@
   "private": true,
   "devDependencies": {
     "jsdom": "^26.1.0"
+  },
+  "optionalDependencies": {
+    "@seydx/node-av-ffmpeg-light-linux-arm64": "7.1.0",
+    "@seydx/node-av-ffmpeg-light-linux-arm64-musl": "7.1.0",
+    "@seydx/node-av-ffmpeg-light-linux-x64": "7.1.0",
+    "@seydx/node-av-ffmpeg-light-linux-x64-musl": "7.1.0"
   }
 }
