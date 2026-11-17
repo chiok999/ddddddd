@@ -423,7 +423,7 @@ test('FFmpeg selection checks packaged executable, falls back safely, and distin
  const {bundledFfmpeg,ffmpegCandidates,chooseFfmpeg,probeFfmpeg}=require('./transcode');const fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
  assert.equal(bundledFfmpeg('win32','x64'),null);assert.equal(bundledFfmpeg('linux','riscv64'),null);if(bundledFfmpeg()){const chosen=await chooseFfmpeg([{label:'Missing',path:'/does/not/exist'}, {label:'Packaged',path:bundledFfmpeg()}]);assert.equal(chosen,bundledFfmpeg());}
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-probe-test-'));try{const file=path.join(dir,'blocked');await fs.writeFile(file,'#!/bin/sh\nexit 0\n',{mode:0o600});await assert.rejects(probeFfmpeg(file),/execution was denied/);await assert.rejects(chooseFfmpeg([{label:'Bundled FFmpeg',path:file},{label:'System FFmpeg',path:'/does/not/exist'}]),/execution was denied.*not found/);const limited=path.join(dir,'limited');await fs.writeFile(limited,"#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo 'ffmpeg version test'; else echo ' V....D libx264 x264'; fi\n",{mode:0o700});await assert.rejects(probeFfmpeg(limited),/missing the libx264 or AAC encoder/);}finally{await fs.rm(dir,{recursive:true,force:true});}
- const old=process.env.CINEMA_FFMPEG;try{delete process.env.CINEMA_FFMPEG;assert.deepEqual(ffmpegCandidates('linux','arm64','/bundle').map(x=>x.path),['ffmpeg','/bundle']);assert.deepEqual(ffmpegCandidates('linux','x64','/bundle').map(x=>x.path),['/bundle','ffmpeg']);assert.deepEqual(ffmpegCandidates('linux','arm64',null).map(x=>x.path),['ffmpeg']);process.env.CINEMA_FFMPEG='/custom/path';assert.deepEqual(ffmpegCandidates('linux','arm64','/bundle').map(x=>x.path),['/custom/path']);}finally{if(old===undefined)delete process.env.CINEMA_FFMPEG;else process.env.CINEMA_FFMPEG=old;}
+ const old=process.env.CINEMA_FFMPEG;try{delete process.env.CINEMA_FFMPEG;assert.deepEqual(ffmpegCandidates('linux','arm64','/bundle','/software').map(x=>x.path),['/software','ffmpeg','/bundle']);assert.deepEqual(ffmpegCandidates('linux','x64','/bundle').map(x=>x.path),['/bundle','ffmpeg']);assert.deepEqual(ffmpegCandidates('linux','arm64',null,null).map(x=>x.path),['ffmpeg']);process.env.CINEMA_FFMPEG='/custom/path';assert.deepEqual(ffmpegCandidates('linux','arm64','/bundle').map(x=>x.path),['/custom/path']);}finally{if(old===undefined)delete process.env.CINEMA_FFMPEG;else process.env.CINEMA_FFMPEG=old;}
 });
 
 test('FFmpeg can discard to a later MP4 timestamp on a pipe, but pipe input is not range-seekable', {skip:!testFfmpeg,timeout:30000},async()=>{
@@ -531,7 +531,7 @@ else if(process.argv.includes('-muxers')) console.log(' E hls');
 else if(process.argv.includes('-filters')) console.log(' ... scale\n ... pad');
 else if(process.argv.includes('full')) console.log('-readrate <speed>\n-readrate_initial_burst <seconds>');
 else if(process.argv.includes('muxer=hls')) console.log('temp_file');
-else if(process.argv.includes('demuxer=hls')) console.log('allowed_extensions allowed_segment_extensions extension_picky seg_max_retry');
+else if(process.argv.includes('demuxer=hls')) console.log('-allowed_extensions -allowed_segment_extensions -extension_picky -seg_max_retry');
 else {process.stderr.write('No space left on device\n');process.exit(1);}
 `;
  await fs.writeFile(exe,script,{mode:0o755});const box=name=>{const b=Buffer.alloc(8);b.writeUInt32BE(8);b.write(name,4);return b};
@@ -692,13 +692,23 @@ test('real FFmpeg keeps converting past 20 minutes without player progress', {sk
  }finally{if(t)await t.close();await fsp.rm(dir,{recursive:true,force:true});}
 });
 
-test('FFmpeg selection rejects a system binary missing secure HLS options and falls back',async t=>{
+test('FFmpeg selection rejects a system binary missing required HLS options and falls back',async t=>{
  const {bundledFfmpeg,chooseFfmpeg}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const actual=bundledFfmpeg();if(!actual)return t.skip('Bundled FFmpeg unavailable');
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-select-'));try{
   const good=path.join(dir,'system-good'),old=path.join(dir,'system-old');const quote=x=>`'${x.replace(/'/g,"'\\''")}'`;
   await fs.writeFile(good,`#!/bin/sh\nexec ${quote(actual)} "$@"\n`,{mode:0o700});
-  await fs.writeFile(old,`#!/bin/sh\nif [ "$3" = demuxer=hls ]; then echo allowed_extensions; exit 0; fi\nexec ${quote(actual)} "$@"\n`,{mode:0o700});
+  await fs.writeFile(old,`#!/bin/sh\nif [ "$3" = demuxer=hls ]; then echo -allowed_extensions; exit 0; fi\nexec ${quote(actual)} "$@"\n`,{mode:0o700});
   assert.equal(await chooseFfmpeg([{label:'System',path:good},{label:'Bundle',path:actual}]),good);
   assert.equal(await chooseFfmpeg([{label:'System',path:old},{label:'Bundle',path:actual}]),actual);
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
+
+test('software FFmpeg is selected only after real video and HLS smoke tests', {skip:!testFfmpeg,timeout:30000},async()=>{
+ const {chooseFfmpeg,probeSoftwareFfmpeg}=require('./transcode'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');const dir=await fs.mkdtemp(path.join(os.tmpdir(),'troy-software-'));
+ try{
+  const bad=path.join(dir,'broken-ffmpeg');await fs.writeFile(bad,`#!/bin/sh\nfor arg in "$@"; do if [ "$arg" = "lavfi" ]; then exit 1; fi; done\nexec '${testFfmpeg.replace(/'/g,"'\\''")}' "$@"\n`,{mode:0o700});
+  await assert.rejects(probeSoftwareFfmpeg(bad),/software test failed/);
+  const selected=await chooseFfmpeg([{label:'Software FFmpeg',path:bad},{label:'System FFmpeg',path:testFfmpeg}]);assert.equal(selected,testFfmpeg);
+  assert.equal(await chooseFfmpeg([{label:'Software FFmpeg',path:testFfmpeg}]),testFfmpeg);
  }finally{await fs.rm(dir,{recursive:true,force:true});}
 });
