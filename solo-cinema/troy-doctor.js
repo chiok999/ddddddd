@@ -139,6 +139,42 @@ function tlsProbe(host) {
   say(pad('hostname') + os.hostname());
   say(pad('FFmpeg env') + (process.env.CINEMA_FFMPEG || 'not set'));
 
+  // 0. What is this box, and could it encode in hardware?
+  say('');
+  say('0. Hardware and encoder');
+  say('-'.repeat(58));
+  const fs = require('node:fs');
+  const read = file => { try { return fs.readFileSync(file, 'utf8').trim(); } catch { return null; } };
+  const compatible = read('/proc/device-tree/compatible');
+  say(pad('machine') + `${os.arch()}`);
+  say(pad('kernel') + (read('/proc/sys/kernel/osrelease') || 'unknown'));
+  say(pad('SoC') + (compatible ? compatible.split('\0').filter(Boolean).join(', ') : 'not exposed to this container'));
+  const devices = ['/dev/mpp_service', '/dev/rga', '/dev/dma_heap', '/dev/dri'];
+  const present = devices.filter(d => fs.existsSync(d));
+  say(pad('devices') + (present.length ? present.join(', ') : 'none of ' + devices.join(' ')));
+  if (!present.length) {
+    say('   No media devices are passed into this container, so hardware');
+    say('   encoding is not available. Software encoding (libx264) is the');
+    say('   correct choice; it needs no device passthrough.');
+  }
+
+  // Check the FFmpeg the app would use, using the app's own probes.
+  try {
+    const { ffmpegCandidates, chooseFfmpeg, hardwareAvailable, probeCommand } = require('./transcode');
+    const binary = await chooseFfmpeg(ffmpegCandidates());
+    say(pad('ffmpeg') + binary);
+    const encoders = await probeCommand(binary, ['-hide_banner', '-encoders']);
+    say(pad('  libx264') + (/^\s*[A-Z.]{6}\s+libx264\s/m.test(encoders) ? 'available (software works)' : 'MISSING'));
+    say(pad('  h264_rkmpp') + (hardwareAvailable(encoders) ? 'available (hardware possible)' : 'not present'));
+    if (hardwareAvailable(encoders) && !present.length) {
+      say('   The build supports h264_rkmpp but no device is passed in, so it');
+      say('   would fail at runtime. Keep software encoding.');
+    }
+  } catch (error) {
+    say(pad('ffmpeg') + `NOT USABLE -- ${error.message}`);
+    say('   Run: node troy-ffmpeg.js');
+  }
+
   // 1. Can this machine route IPv6 at all?
   say('');
   say('1. Address family');

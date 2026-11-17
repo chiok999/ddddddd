@@ -85,16 +85,31 @@ function ffmpegExitError(code,stderr=''){
   if(/no space left on device|disk quota exceeded/i.test(stderr))return 'Temporary filesystem is full or its quota has been exceeded';
   return `Transcoding failed (FFmpeg exit ${code}); this MP4 may not support streaming input`;
 }
+const ffmpegEncoders=new Map();
 function probeCommand(executable,args){return new Promise((resolve,reject)=>{
   execFile(executable,args,{timeout:10000,maxBuffer:2*1024*1024,windowsHide:true},(err,stdout,stderr)=>{
     if(err){if(err.killed)return reject(Error('FFmpeg capability check timed out'));if(typeof err.code==='string')return reject(Error(executableError(err)));return reject(Error(`FFmpeg capability check failed (exit ${err.code})`));}
     resolve(stdout+'\n'+stderr);
   });
 });}
+// Hardware encoding is optional. libx264 always works and is the default; a
+// Rockchip build is used only when the operator asks for it, because it also
+// needs /dev/mpp_service passed into the container.
+function hardwareAvailable(encoders){
+  return /^\s*[A-Z.]{6}\s+h264_rkmpp\s/m.test(encoders);
+}
+function probeCapabilities(encoders){
+  if(/^\s*[A-Z.]{6}\s+libx264\s/m.test(encoders)) return 'libx264';
+  if(hardwareAvailable(encoders)) return 'h264_rkmpp';
+  return null;
+}
 async function probeFfmpeg(executable){
   await probeCommand(executable,['-version']);
   const encoders=await probeCommand(executable,['-hide_banner','-encoders']);
-  if(!/^\s*[A-Z.]{6}\s+libx264\s/m.test(encoders) || !/^\s*[A-Z.]{6}\s+aac\s/m.test(encoders))throw Error('FFmpeg is missing the libx264 or AAC encoder');
+  const encoder=probeCapabilities(encoders);
+  if(!encoder) throw Error('FFmpeg has neither the libx264 nor the h264_rkmpp encoder');
+  if(!/^\s*[A-Z.]{6}\s+aac\s/m.test(encoders)) throw Error('FFmpeg is missing the AAC encoder');
+  ffmpegEncoders.set(executable,encoder);
   const muxers=await probeCommand(executable,['-hide_banner','-muxers']);
   if(!/^\s*E\s+hls\s/m.test(muxers))throw Error('FFmpeg is missing the HLS muxer');
   const filters=await probeCommand(executable,['-hide_banner','-filters']);
@@ -105,7 +120,19 @@ async function probeFfmpeg(executable){
   if(!/\btemp_file\b/.test(hls))throw Error('FFmpeg HLS muxer lacks temp_file support');
 }
 
-async function chooseFfmpeg(candidates){const failures=[];for(const candidate of candidates){try{await probeFfmpeg(candidate.path);return candidate.path;}catch(err){failures.push(`${candidate.label}: ${err.message}`);}}throw Error(failures.join('; '));}
+async function chooseFfmpeg(candidates){
+  const failures=[];
+  for(const candidate of candidates){
+    try{await probeFfmpeg(candidate.path);return candidate.path;}
+    catch(err){failures.push(`${candidate.label}: ${err.message}`);}
+  }
+  throw Error(failures.join('; '));
+}
+function videoEncoder(executable){
+  // Software unless the operator explicitly opted into hardware encoding.
+  if(process.env.CINEMA_ENCODER==='rkmpp' && ffmpegEncoders.get(executable)==='h264_rkmpp') return 'h264_rkmpp';
+  return 'libx264';
+}
 
 function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, startupMs=45000, authorize=()=>true}={}){
   let active=null;const failures=new Map();let admission=Promise.resolve(),binaryPromise=null;
@@ -171,7 +198,13 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
       }
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';
       if(/mpegurl|text\/html/i.test(type) || encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Only uncompressed direct MP4 sources can be transcoded');}
-      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,'-c:v','libx264','-preset','veryfast','-threads','1','-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames','expr:gte(t,n_forced*4)','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
+      const encoder=videoEncoder(binary);
+      // h264_rkmpp takes neither -preset nor -threads, and scaling stays on the
+      // plain software filter so it works on any build.
+      const videoOptions=encoder==='h264_rkmpp'
+        ? ['-c:v','h264_rkmpp','-rc_mode','CBR']
+        : ['-c:v','libx264','-preset','veryfast','-threads','1'];
+      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,...videoOptions,'-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames','expr:gte(t,n_forced*4)','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
       const pacing=seekOffset>0?['-readrate','3','-readrate_initial_burst',String(Math.ceil(seekOffset+12)),'-ss',String(seekOffset)]:['-readrate','3'];
       const args=['-hide_banner','-loglevel','error','-nostdin','-filter_threads','1',...pacing,'-threads','2','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...output(426,240,'250k','48k','240'),...output(640,360,'600k','64k','360')];
       job.proc=spawn(binary,args,{stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
@@ -199,4 +232,4 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
   function status(id,sid){if(active && active.id===id && active.sid===sid && !active.stopped){active.lastAccess=Date.now();return {active:true,error:null};}const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
   return {start,read,stopFor,stopRequest,stopSession,stopAny,status,close:()=>stop(active)};
 }
-module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg,STATIC_FFMPEG,staticFfmpegExpectedPath};
+module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg,STATIC_FFMPEG,staticFfmpegExpectedPath,hardwareAvailable,probeCapabilities,videoEncoder};

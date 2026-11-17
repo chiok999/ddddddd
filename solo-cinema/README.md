@@ -26,6 +26,27 @@ useful without a working FFmpeg. Startup now says which of these you have:
 - **`ffmpeg: NOT USABLE`** — nothing will play. Fix with `node troy-ffmpeg.js`
   (downloads a static build, no root needed) or `apt-get install -y ffmpeg`.
 
+### Software or hardware encoding
+
+Software (`libx264`) is the default and always works: no device passthrough, no
+BSP kernel, nothing to break. It is the right choice on a normal container.
+
+Hardware encoding is opt-in only, because it needs matching hardware *and* the
+device nodes passed in:
+
+```sh
+CINEMA_ENCODER=rkmpp npm start
+```
+
+That is honoured only when the FFmpeg in use actually advertises `h264_rkmpp`
+**and** `/dev/mpp_service` exists. Otherwise the server silently stays on
+software rather than failing. Run `node troy-doctor.js` and look at section 0:
+it prints the SoC, the kernel, which media devices are visible, and whether the
+installed FFmpeg offers `libx264` / `h264_rkmpp`.
+
+In practice: unless the box is really a Rockchip board with its devices passed
+through, use software.
+
 **Temporary storage matters as much.** Conversion writes growing HLS segments
 for as long as something is playing. If the temp directory is `tmpfs` it lives
 in RAM, so a full-length title can consume memory and get the server killed
