@@ -77,9 +77,9 @@ function executableError(error){
   if(error?.code==='ENOEXEC')return 'FFmpeg binary is incompatible with this system';
   return `FFmpeg could not start${error?.code ? ` (${String(error.code).slice(0,30)})` : ''}`;
 }
-function ffmpegExitError(code,stderr=''){
+function ffmpegExitError(code,stderr='',kind='file'){
   if(/no space left on device|disk quota exceeded/i.test(stderr))return 'Temporary filesystem is full or its quota has been exceeded';
-  return `Transcoding failed (FFmpeg exit ${code}); this MP4 may not support streaming input`;
+  return kind==='hls'?`HLS conversion failed (FFmpeg exit ${code})`:`Transcoding failed (FFmpeg exit ${code}); this MP4 may not support streaming input`;
 }
 function probeCommand(executable,args){return new Promise((resolve,reject)=>{
   execFile(executable,args,{timeout:10000,maxBuffer:2*1024*1024,windowsHide:true},(err,stdout,stderr)=>{
@@ -185,11 +185,12 @@ function createTranscoder({open, openHlsResource, safeUrl=require('./network').s
       if(job.stopped){await response.body?.cancel();throw Error('Transcode stopped');}
       if(response.status!==200 || !response.body){await response.body?.cancel().catch(()=>{});throw Error(`Source returned ${response.status}`);}
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';
-      if(/text\/html/i.test(type) || encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Unsupported or compressed source');}
+      if(encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Source returned compressed content; uncompressed video or HLS is required');}
+      if(/text\/html|application\/(?:json|problem\+json)/i.test(type)){await response.body.cancel().catch(()=>{});throw Error('Source returned HTML or JSON instead of video or HLS');}
       // Sniff the bytes: provider labels and opaque URLs are often inaccurate.
       const iterator=Readable.fromWeb(response.body)[Symbol.asyncIterator](),prefix=[];let size=0,done=false;
       while(size<16 && !done){const next=await iterator.next();done=next.done;if(!done){prefix.push(next.value);size+=next.value.length;}}
-      const sample=Buffer.concat(prefix);const isHls=sample.toString('utf8').replace(/^\uFEFF/,'').startsWith('#EXTM3U');
+      const sample=Buffer.concat(prefix);const textPrefix=sample.toString('utf8').replace(/^\uFEFF/,'').trimStart();if(/^(?:<!doctype|<html|\{|\[)/i.test(textPrefix)){await iterator.return?.();throw Error('Source returned HTML or JSON instead of video or HLS');}const isHls=sample.toString('utf8').replace(/^\uFEFF/,'').startsWith('#EXTM3U');
       const body=Readable.toWeb(Readable.from((async function*(){try{for(const chunk of prefix)yield chunk;if(!done)for(;;){const next=await iterator.next();if(next.done)break;yield next.value;}}finally{await iterator.return?.();}})()));
       response={status:response.status,headers:response.headers,url:response.url,body};
       if(job.stopped){await body.cancel().catch(()=>{});throw Error('Transcode stopped');}
@@ -201,7 +202,7 @@ function createTranscoder({open, openHlsResource, safeUrl=require('./network').s
       const args=['-hide_banner','-loglevel','error','-nostdin',...pacing,...input,...output(426,240,'250k','48k','240'),...output(640,360,'600k','64k','360')];
       job.proc=spawn(binary,args,{stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
-      job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=job.relay?.error || ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
+      job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=job.relay?.error?`HLS playlist or resource error: ${job.relay.error}`:ffmpegExitError(code,diskFull?'no space left on device':stderr,isHls?'hls':'file');void stop(job);}});
       if(!isHls){job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);}else job.proc.stdin.end();
       // Encoding is deliberately independent of the viewer's playhead. Keep
       // only session authorization monitoring, not a conversion lead limit.
