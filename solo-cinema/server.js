@@ -105,7 +105,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
     if (url.pathname === '/api/discover' && req.method === 'GET') {
       if (!authorized) return send(res,401,{error:'Login required'});
-      return send(res,200,{sections:await discover()});
+      const sections=require('./catalog-session').bindDiscovery(await discover(),catalog,sid);
+      return send(res,200,{sections});
     }
     if (url.pathname === '/api/search' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
