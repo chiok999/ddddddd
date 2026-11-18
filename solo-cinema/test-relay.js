@@ -440,3 +440,77 @@ test('the bot-keep relay refuses what the Worker refuses', async () => {
     await new Promise((resolve) => relay.close(resolve));
   }
 });
+
+test('the relay refuses to start without a usable secret, and says why', async () => {
+  // Exit 78 (EX_CONFIG) rather than 1: a panel showing "crashed" is what sent the
+  // operator looking in the wrong place last time.
+  const { spawnSync } = require('node:child_process');
+  const run = (env) => spawnSync(process.execPath, [path.join(__dirname, 'troy-relay-server.js')], {
+    cwd: __dirname,
+    env: { ...process.env, TROY_RELAY_KEY: '', PORT: '4199', ...env },
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+  const missing = run({});
+  assert.equal(missing.status, 78, 'no key is a configuration refusal, not a crash');
+  assert.match(missing.stderr, /TROY_RELAY_KEY is not set/);
+  assert.match(missing.stderr, /open proxy/, 'and it says why refusing matters');
+  const short = run({ TROY_RELAY_KEY: 'abc' });
+  assert.equal(short.status, 78);
+  assert.match(short.stderr, /too short \(3 characters\)/);
+});
+
+test('the relay can be started from a host entry file that already runs', async () => {
+  // A panel that launches one file is the reason this exists: no second process,
+  // no MAIN_FILE change. require(...).start() must come up and answer /health.
+  const { spawn, spawnSync } = require('node:child_process');
+  const port = 4198;
+  const entry = path.join(__dirname, 'tmp-entry-check.js');
+  require('node:fs').writeFileSync(entry, "require('./troy-relay-server').start();\n");
+  const child = spawn(process.execPath, [entry], {
+    cwd: __dirname,
+    env: { ...process.env, TROY_RELAY_KEY: 'entry-check-key-'.padEnd(32, 'e'), PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const started = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 8000);
+      child.stdout.on('data', (chunk) => {
+        if (/listening/.test(String(chunk))) {
+          clearTimeout(timer);
+          resolve(true);
+        }
+      });
+    });
+    assert.ok(started, 'start() announced itself');
+    const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+    assert.equal(health.signed, true);
+    assert.equal(health.host, 'node');
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => child.once('close', resolve));
+    require('node:fs').rmSync(entry, { force: true });
+  }
+});
+
+test('the relay says so when its port is already taken, instead of looping', async () => {
+  const { spawn, spawnSync } = require('node:child_process');
+  const net = require('node:net');
+  const port = 4197;
+  const blocker = net.createServer(() => {});
+  blocker.listen(port, '127.0.0.1');
+  await once(blocker, 'listening');
+  try {
+    const result = spawnSync(process.execPath, [path.join(__dirname, 'troy-relay-server.js')], {
+      cwd: __dirname,
+      env: { ...process.env, TROY_RELAY_KEY: 'port-check-key-'.padEnd(32, 'p'), PORT: String(port), TROY_RELAY_HOST: '127.0.0.1' },
+      encoding: 'utf8',
+      timeout: 15000,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /already in use/);
+    assert.match(result.stderr, /already running/, 'and tells the operator to check before changing anything');
+  } finally {
+    await new Promise((resolve) => blocker.close(resolve));
+  }
+});
