@@ -127,6 +127,29 @@ and a leaked link is useless without the secret. `CINEMA_RELAY_FALLBACK=1` allow
 a fall back to the direct fetch when the *Worker itself* is unreachable; it never
 retries a refused direct request.
 
+If a source still reports a status, `troy-relay-probe.js` measures which route
+gives what, so the cause is named rather than guessed:
+
+```sh
+node troy-relay-probe.js "https://<source url>" --referer "https://moviebox.ph/"
+```
+
+```
+  what   route                      took      upstream
+  ------ -------------------------- --------- -----------------------------------------
+  200    1. direct                    180ms  video/mp4  2147483648 bytes  ok
+  200    2. relay                     240ms  video/mp4  2147483648 bytes  ok
+  427    3. relay after a gap        6200ms  text/plain  rate limited (nginx limit_req)  [worker retried 4x]
+```
+
+**427 and 429 are rate limits, not refusals** (`limit_req_status 427` is a common
+nginx choice for exactly this). A Worker shares its egress address with thousands
+of other Workers, so these CDNs count it as a very busy client and its bucket is
+often full. The worker therefore waits and asks again up to four times, honouring
+`Retry-After` when the CDN sends one and giving up after twelve seconds. Only then
+is a 427 reported, marked `[worker retried 4x]` so it is never mistaken for a
+refusal. One retry a minute later usually plays.
+
 Prove it on any machine, without deploying anything:
 
 ```sh
@@ -135,7 +158,8 @@ node troy-relay.js --test
 
 That runs the real `worker/troy-relay.mjs` locally against a fixture CDN that
 refuses with `426` and accepts a browser-shaped request, and checks 25 properties
-including byte-identical bodies and `Range`/`206`/`If-Range`. Add
+including byte-identical bodies, `Range`/`206`/`If-Range`, and a CDN that answers
+`427` twice before serving. Add
 `--worker-url https://…workers.dev` to check a deployed Worker as well.
 
 ## When one server works and another does not

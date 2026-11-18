@@ -45,6 +45,15 @@ const VERSION = '1';
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+// A rate limit, not a refusal. nginx's `limit_req_status` is often set to 427
+// instead of 503 for exactly this, and a Worker's egress is a single shared
+// address that thousands of other Workers also leave from, so its bucket is
+// full far more often than a private server's. The request is valid; it arrived
+// too soon. Waiting and asking again is the documented cure, and it costs
+// nothing but time. 429 is the standard form of the same answer.
+const RATE_LIMITED = new Set([427, 429]);
+const RETRY_DELAYS_MS = [400, 900, 1800, 3000];
+const RETRY_BUDGET_MS = 12000;
 const PASS_THROUGH_HEADERS = [
   'content-type',
   'content-length',
@@ -131,12 +140,41 @@ function equalHex(a, b) {
   return diff === 0;
 }
 
-/** Follow redirects here, because Troy cannot: it would leave the relay. */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function retryAfterMs(response) {
+  const value = response.headers.get('retry-after');
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 10000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.min(Math.max(date - Date.now(), 0), 10000) : null;
+}
+
+/**
+ * Follow redirects here, because Troy cannot: it would leave the relay. Wait out
+ * a rate limit, because the caller's next move otherwise is to report a failure
+ * that was never about the file.
+ */
 async function upstream(target, headers, fetchUpstream, allowPrivate) {
   let current = target;
   let request = headers;
+  let waited = 0;
+  let attempt = 0;
   for (let hop = 0; hop <= 5; hop++) {
-    const response = await fetchUpstream(current, { method: 'GET', headers: request, redirect: 'manual' });
+    let response = await fetchUpstream(current, { method: 'GET', headers: request, redirect: 'manual' });
+    // Retry in place: a rate limit says nothing about the URL, so the redirect
+    // and range state stay exactly as they were.
+    while (RATE_LIMITED.has(response.status) && attempt < RETRY_DELAYS_MS.length) {
+      const asked = retryAfterMs(response);
+      const delay = asked ?? RETRY_DELAYS_MS[attempt];
+      if (waited + delay > RETRY_BUDGET_MS) break;
+      await response.body?.cancel().catch(() => {});
+      await sleep(delay);
+      waited += delay;
+      attempt++;
+      response = await fetchUpstream(current, { method: 'GET', headers: request, redirect: 'manual' });
+    }
     if (!REDIRECTS.has(response.status)) return response;
     const location = response.headers.get('location');
     await response.body?.cancel().catch(() => {});
@@ -168,6 +206,12 @@ function artifactHeaders(response) {
     'access-control-allow-origin': '*',
     'x-troy-status': String(response.status),
   });
+  if (RATE_LIMITED.has(response.status)) {
+    // Seen after every retry: the CDN is still counting this Worker's address as
+    // over its limit. Say so, because the same status from a direct fetch means
+    // something else entirely and the operator needs to tell them apart.
+    headers.set('x-troy-retried', 'exhausted');
+  }
   const mapping = {
     'content-type': 'x-troy-type',
     'content-length': 'x-troy-length',

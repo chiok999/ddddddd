@@ -196,9 +196,16 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
       if(job.stopped){await response.body?.cancel();throw Error('Transcode stopped');}
       if(response.status!==200 || !response.body){
         await response.body?.cancel().catch(()=>{});
+        // 427/429 are rate limits, not refusals: the request was valid and
+        // arrived too soon. The relay worker already waits these out, so one
+        // arriving here means even the wait was not enough.
         const detail=response.status===426
           ? 'Source returned 426 (the host refused this connection; this is a network path problem, not a bad file)'
-          : `Source returned ${response.status}`;
+          : response.status===427
+            ? 'Source returned 427 (the CDN is rate-limiting this connection; it is worth retrying in a minute)'
+            : response.status===429
+              ? 'Source returned 429 (the CDN is rate-limiting this connection; it is worth retrying in a minute)'
+              : `Source returned ${response.status}`;
         throw Error(detail);
       }
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';

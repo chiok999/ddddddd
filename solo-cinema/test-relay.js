@@ -25,7 +25,10 @@ async function loadWorker(options) {
 // A provider CDN that behaves like the one in production: 426 to a client that
 // does not look like a browser, real 206s to one that does, and a mid-body
 // disconnect so resume logic can be exercised.
-async function fixture({ drop = false } = {}) {
+async function fixture({ drop = false, rateLimit = 0 } = {}) {
+  // rateLimit: refuse this many requests with 427 before serving, the way an
+  // nginx `limit_req_status 427` does when the bucket is full.
+  let limited = 0;
   const requests = [];
   const server = http.createServer((req, res) => {
     requests.push({ path: req.url, headers: req.headers });
@@ -37,6 +40,12 @@ async function fixture({ drop = false } = {}) {
     if (url.pathname === '/redirect-other') {
       res.writeHead(302, { location: `${otherBase}/movie.mp4` });
       return res.end();
+    }
+    if (limited < rateLimit) {
+      limited++;
+      // No retry-after: the worker's own backoff is what must be measured here.
+      res.writeHead(427, { 'content-type': 'text/plain' });
+      return res.end('rate limited');
     }
     if (!/Mozilla\/5\.0/.test(req.headers['user-agent'] || '')) {
       res.writeHead(426, { 'content-type': 'text/plain' });
@@ -219,6 +228,83 @@ test('the worker reports its own health and refuses a missing key', async () => 
   const unsignedWorker = await loadWorker({ secret: undefined });
   const refused = await unsignedWorker(new Request(`https://w.dev/?url=${encodeURIComponent('https://cdn.example/a.mp4')}`));
   assert.equal(refused.status, 500);
+});
+
+test('a rate limit is waited out, not reported as a failure', async () => {
+  // Two 427s then bytes: this is the production symptom, and it must play.
+  const cdn = await fixture({ rateLimit: 2 });
+  otherBase = cdn.base;
+  try {
+    const handler = await loadWorker({ allowPrivate: true });
+    const remote = createRelayRemote({ config: { origin: 'http://worker', path: '', secret: SECRET }, send: (url) => handler(new Request(url)), direct: null });
+    const started = Date.now();
+    const response = await remote(`${cdn.base}/movie.mp4`, { 'accept-encoding': 'identity' }, undefined);
+    assert.equal(response.status, 200, 'two refusals, then the file');
+    assert.equal(response.retried, false, 'a successful retry is not marked as exhausted');
+    assert.deepEqual(await drain(response), BYTES);
+    assert.ok(Date.now() - started >= 400, 'it actually waited rather than hammering');
+    assert.equal(cdn.requests.filter((request) => request.headers.range === undefined).length, 3, 'one attempt per refusal plus the success');
+  } finally { await cdn.close(); }
+});
+
+test('a rate limit that never clears is reported as a rate limit', async () => {
+  const cdn = await fixture({ rateLimit: 99 });
+  otherBase = cdn.base;
+  try {
+    const handler = await loadWorker({ allowPrivate: true });
+    const remote = createRelayRemote({ config: { origin: 'http://worker', path: '', secret: SECRET }, send: (url) => handler(new Request(url)), direct: null });
+    const response = await remote(`${cdn.base}/movie.mp4`, { 'accept-encoding': 'identity' }, undefined);
+    assert.equal(response.status, 427, 'the status survives, not turned into 502');
+    assert.equal(response.retried, true, 'and it is marked as having been retried');
+    await response.body.cancel();
+    // Bounded: one original plus four waits, not an unbounded loop.
+    assert.equal(cdn.requests.length, 5, `attempts: ${cdn.requests.length}`);
+  } finally { await cdn.close(); }
+});
+
+test('429 is treated as the same answer as 427', async () => {
+  let seen = 0;
+  const server = http.createServer((req, res) => {
+    seen++;
+    if (seen === 1) {
+      res.writeHead(429, { 'retry-after': '0' });
+      return res.end();
+    }
+    res.writeHead(206, { 'content-type': 'video/mp4', 'content-range': `bytes 0-1/${BYTES.length}`, 'content-length': '2' });
+    res.end(BYTES.subarray(0, 2));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const handler = await loadWorker({ allowPrivate: true });
+    const remote = createRelayRemote({ config: { origin: 'http://worker', path: '', secret: SECRET }, send: (url) => handler(new Request(url)), direct: null });
+    const response = await remote(`http://127.0.0.1:${server.address().port}/movie.mp4`, { range: 'bytes=0-1' }, undefined);
+    assert.equal(response.status, 206);
+    assert.equal(seen, 2);
+    await response.body.cancel();
+  } finally { server.closeAllConnections?.(); await new Promise((resolve) => server.close(resolve)); }
+});
+
+test('the retry loop is bounded even when the CDN keeps asking for longer', async () => {
+  let seen = 0;
+  const server = http.createServer((req, res) => {
+    seen++;
+    // retry-after is clamped, so this must still give up quickly.
+    res.writeHead(427, { 'retry-after': '3600' });
+    res.end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const handler = await loadWorker({ allowPrivate: true });
+    const remote = createRelayRemote({ config: { origin: 'http://worker', path: '', secret: SECRET }, send: (url) => handler(new Request(url)), direct: null });
+    const started = Date.now();
+    const response = await remote(`http://127.0.0.1:${server.address().port}/movie.mp4`, {}, undefined);
+    assert.equal(response.status, 427);
+    assert.ok(Date.now() - started < 30000, 'honoured the retry-after clamp rather than an hour');
+    assert.ok(seen >= 1 && seen <= 5, `attempts: ${seen}`);
+    await response.body.cancel();
+  } finally { server.closeAllConnections?.(); await new Promise((resolve) => server.close(resolve)); }
 });
 
 test('the paste-ready worker is the tested worker with a different header', async () => {
