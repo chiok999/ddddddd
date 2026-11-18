@@ -830,3 +830,33 @@ test('a provider failure is reported as an upstream fault, not a bad request', a
     assert.equal(bad.status,400,'an empty query is a bad request');
   } finally { child.kill(); }
 });
+
+test('a stray rejection is reported and survived, not fatal',async()=>{
+ // The guard is the difference between a logged line and a dead server, so the
+ // test raises a real unhandled rejection in a child process and then checks
+ // that the child is still alive and still serving.
+ const net=require('node:net'),{spawn}=require('node:child_process');
+ const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));
+ const port=probe.address().port;await new Promise(r=>probe.close(r));
+ // Without the guard Node would be the one deciding, and it exits.
+ const script=`require(${JSON.stringify(__dirname+'/process-guard')}).installCrashGuard().install();
+   const http=require('node:http');
+   const server=http.createServer((req,res)=>res.end('alive')).listen(${port},'0.0.0.0',()=>{
+     Promise.reject(new Error('stray provider failure'));
+     setTimeout(()=>{ http.get('http://127.0.0.1:'+${port}+'/',r=>{r.resume();r.on('end',()=>process.exit(0))}).on('error',()=>process.exit(3)); },250);
+   });`;
+ const child=spawn(process.execPath,['-e',script],{stdio:['ignore','pipe','pipe']});
+ let out='';child.stdout.on('data',c=>out+=String(c));child.stderr.on('data',c=>out+=String(c));
+ const code=await new Promise(resolve=>child.once('exit',resolve));
+ assert.equal(code,0,`the process must still be able to finish its work; it exited ${code} with: ${out}`);
+ assert.match(out,/unhandled rejection: .*stray provider failure/,'and it says what happened');
+});
+
+test('without the guard that same rejection is fatal, so the test above can fail',async()=>{
+ // If this ever stops exiting non-zero, the guard test has lost its meaning and
+ // the two must be looked at together.
+ const {spawn}=require('node:child_process');
+ const child=spawn(process.execPath,['-e',"Promise.reject(new Error('unprotected'))"],{stdio:['ignore','pipe','pipe']});
+ const code=await new Promise(resolve=>child.once('exit',resolve));
+ assert.notEqual(code,0,'an unguarded unhandled rejection ends the process');
+});

@@ -160,7 +160,13 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://local');
   const sid = /(?:^|;\s*)cinema=([\w-]+)/.exec(req.headers.cookie || '')?.[1];
   const session = sessions.get(sid);
-  if (session && session < Date.now()) { sessions.delete(sid); void transcoder.stopSession(sid); }
+  if (session && session < Date.now()) {
+    sessions.delete(sid);
+    // The browser is already gone, so nothing is waiting for this. An unhandled
+    // rejection here would take the whole process down and end every other
+    // stream with it, so the cleanup reports its own failure.
+    transcoder.stopSession(sid).catch(error => console.warn(`expired session cleanup failed: ${error.message}`));
+  }
   const authorized = session && session >= Date.now();
   try {
     if (req.method === 'POST' && !sameOrigin(req)) return send(res, 403, { error: 'Origin rejected' });
@@ -372,6 +378,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 server.on('close',()=>{transcoder.close();});
+// This process is somebody's playback: a stray rejection must not end it.
+require('./process-guard').installCrashGuard().install();
+
 for(const signal of ['SIGTERM','SIGINT'])process.once(signal,()=>{server.close();transcoder.close().finally(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();});
 server.listen(config.port() ? Number(config.port()) : 3000, '0.0.0.0', () => {
   // Print the two facts that decide whether playback can work at all, so a
