@@ -562,3 +562,85 @@ test('leaving the watch page stops the encoder catch-up poll', async () => {
     assert.equal(statusCalls,before,'no status polling after leaving the watch page');
   } finally { w.close(); }
 });
+
+test('the frame takes the shape of the picture: 4:3 and 4:5 are not boxed inside 16:9',async()=>{
+ // A 4:3 feature inside a 16:9 frame is pillarboxed, and a 4:5 clip is boxed on
+ // all four sides with the controls stranded outside the picture. The frame now
+ // follows the decoded video, and portrait is driven by height so it cannot grow
+ // taller than the window.
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window,d=w.document;w.scrollTo=()=>{};w.Hls=class{static isSupported(){return false}};
+ const v=d.getElementById('video'),screen=d.getElementById('screen');
+ let width=640,height=480;
+ Object.defineProperties(v,{paused:{get:()=>true},duration:{get:()=>100},buffered:{get:()=>({length:0,start:()=>0,end:()=>0})},videoWidth:{get:()=>width},videoHeight:{get:()=>height}});
+ v.play=()=>Promise.resolve();v.pause=()=>{};v.load=()=>{};
+ w.eval(fs.readFileSync(path.join(__dirname,'public/player-ui.js'),'utf8'));
+ const frame=()=>screen.style.getPropertyValue('--player-ratio');
+ try{
+  // 4:3 -- a film shot before widescreen.
+  width=640;height=480;v.dispatchEvent(new w.Event('loadedmetadata'));
+  assert.equal(frame(),'640 / 480','a 4:3 source sizes its own frame');
+  assert.equal(screen.classList.contains('portrait'),false,'and it is not portrait');
+
+  // 4:5 -- a vertical clip.
+  width=1080;height=1350;v.dispatchEvent(new w.Event('loadedmetadata'));
+  assert.equal(frame(),'1080 / 1350','a 4:5 source sizes its own frame');
+  assert.equal(screen.classList.contains('portrait'),true,'and the layout switches to height-driven');
+
+  // 16:9 and 21:9 keep the default frame, so the common case does not resize.
+  width=1920;height=1080;v.dispatchEvent(new w.Event('loadedmetadata'));
+  assert.equal(frame(),'','16:9 falls back to the default frame');
+  assert.equal(screen.classList.contains('portrait'),false);
+
+  // A source switch back to 4:3 is picked up, not stuck on the previous shape.
+  width=1440;height=1080;v.dispatchEvent(new w.Event('loadedmetadata'));
+  assert.equal(frame(),'1440 / 1080','switching sources updates the frame');
+
+  // And a source going away returns the frame to the default.
+  v.dispatchEvent(new w.Event('emptied'));
+  assert.equal(frame(),'','emptying the video restores the default frame');
+  assert.equal(screen.classList.contains('portrait'),false);
+ }finally{w.close()}
+});
+
+test('a portrait frame still fills the screen in fullscreen',async()=>{
+ // The height cap on a portrait frame exists so a 4:5 clip fits in a window.
+ // Inside fullscreen the window is the screen, so the rule that wins for
+ // #screen.player.portrait while fullscreen must be the fullscreen one. This
+ // resolves the cascade rather than pattern-matching the stylesheet text,
+ // because the bug it guards against is purely one of specificity order.
+ const css=fs.readFileSync(path.join(__dirname,'public/player.css'),'utf8').replace(/\/\*[\s\S]*?\*\//g,'');
+ // Split on top-level braces so @media blocks keep their inner rules.
+ const rules=[...css.replace(/@media[^{]+\{/g,'').matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+   .map(m=>({selector:m[1].trim(),body:m[2]}))
+   .filter(r=>r.selector && !r.selector.startsWith('@'));
+ const specificity=sel=>{
+   const ids=(sel.match(/#[\w-]+/g)||[]).length;
+   const cls=(sel.match(/\.[\w-]+/g)||[]).length;
+   const pseudo=(sel.match(/:[\w-]+(?!\()/g)||[]).length;
+   const types=(sel.replace(/[#.:][\w-]+(\([^)]*\))?/g,' ').match(/\b[a-z][\w-]*\b/g)||[]).length;
+   return {score:ids*100+cls*10+pseudo+types};
+ };
+ // Does this selector describe #screen.player.portrait while fullscreen?
+ const applies=(sel,state)=>sel.split(',').map(x=>x.trim()).filter(x=>{
+   if(!/#screen/.test(x))return false;
+   if(/\.portrait/.test(x)!==state.portrait)return false;
+   if(/:fullscreen/.test(x)!==state.fullscreen)return false;
+   return true;
+ });
+ const winners=state=>{
+   let best=null;
+   for(const rule of rules){
+     const matched=applies(rule.selector,state);
+     if(!matched.length)continue;
+     const score=Math.max(...matched.map(m=>specificity(m).score));
+     if(/height\s*:/.test(rule.body)&&(!best||score>=best.score)) best={score,body:rule.body,selector:matched.join(',')};
+   }
+   return best;
+ };
+ const inWindow=winners({portrait:true,fullscreen:false});
+ assert.ok(inWindow,/height\s*:/.test(inWindow.body),'a windowed portrait frame is capped');
+ const inFullscreen=winners({portrait:true,fullscreen:true});
+ assert.match(inFullscreen.body,/aspect-ratio\s*:\s*auto/,'fullscreen frees the frame from the ratio');
+ assert.match(inFullscreen.body,/height\s*:\s*100%/,'and fullscreen fills the screen');
+ assert.ok(inFullscreen.score>=inWindow.score,`the fullscreen rule must not lose to .portrait (${inFullscreen.score} vs ${inWindow.score})`);
+});

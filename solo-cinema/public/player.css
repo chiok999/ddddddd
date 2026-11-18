@@ -1,7 +1,19 @@
 /* Troy player: layout adapted from the supplied player reference. */
-#screen.player{position:relative;display:block;width:100%;max-width:960px;margin:0 auto;aspect-ratio:16/9;background:var(--ink-000);overflow:hidden;user-select:none;-webkit-user-select:none;border:0;border-radius:0}
-#screen:fullscreen{max-width:none;width:100%;height:100%;aspect-ratio:auto}
+/* The frame follows the picture. A title is not always 16:9: a 4:3 feature or a
+   vertical 4:5 clip was being boxed inside a 16:9 screen with black bars on two
+   sides. player-ui.js sets --player-ratio from the decoded video, so the frame
+   takes the real shape and 16:9 is only what we fall back to before metadata. */
+#screen.player{position:relative;display:block;width:100%;max-width:960px;margin:0 auto;aspect-ratio:var(--player-ratio,16/9);background:var(--ink-000);overflow:hidden;user-select:none;-webkit-user-select:none;border:0;border-radius:0;transition:aspect-ratio .2s var(--ease-out)}
+/* A portrait frame is driven by height instead of width: at 960px wide a 4:5
+   clip would be 1200px tall and push the controls off-screen. With a definite
+   height and auto width, aspect-ratio derives the width, so nothing stretches. */
+#screen.player.portrait{height:min(calc(100dvh - var(--space-8)), 1200px);width:auto;max-width:100%}
+/* Fullscreen outranks .portrait on purpose: the height cap exists so a vertical
+   clip fits in a window, and inside fullscreen the window is the screen. */
+#screen.player.portrait:fullscreen,#screen.player:fullscreen{max-width:none;width:100%;height:100%;aspect-ratio:auto}
 #screen video{display:block;width:100%;height:100%;object-fit:contain;background:var(--ink-000)}
+/* In fullscreen the video keeps its own shape, centred, instead of being stretched. */
+#screen:fullscreen video{object-fit:contain;max-height:100%}
 #screen #placeholder{position:absolute;inset:0;display:grid;place-content:center;text-align:center}
 #screen #placeholder.hidden{display:none}
 .player-dim,.player-gesture,.player-ui{position:absolute;inset:0}

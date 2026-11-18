@@ -4,6 +4,31 @@
   const $=id=>document.getElementById(id), screen=$('screen'), video=$('video'), menu=$('playerMenu'), seek=$('playerSeek'), gesture=$('playerGesture');
   let hideTimer, toastTimer, adjustTimer, tapTimer, lastTap=0, pointer=null, seeking=false, locked=false, brightness=1, wakeLock=null, wakeGeneration=0;
   const clamp=(n,a,b)=>Math.max(a,Math.min(b,n));
+
+  // The frame follows the picture, the way a desktop player does. Telling
+  // portrait from landscape is what decides whether the width or the height
+  // drives the layout, so it is worked out here rather than in the stylesheet.
+  // A near-16:9 source is left alone: snapping it to the default avoids a
+  // visible resize for the common case and for odd anamorphic sizes.
+  const DEFAULT_RATIO = 16/9;
+  const RATIO_TOLERANCE = 0.02;
+  function resetFrameRatio() {
+    screen.style.removeProperty('--player-ratio');
+    screen.classList.remove('portrait');
+  }
+  function setFrameRatio(width, height) {
+    const ratio = width > 0 && height > 0 ? width / height : 0;
+    if (!Number.isFinite(ratio) || ratio <= 0) { resetFrameRatio(); return; }
+    if (Math.abs(ratio - DEFAULT_RATIO) < RATIO_TOLERANCE) { resetFrameRatio(); return; }
+    screen.style.setProperty('--player-ratio', `${width} / ${height}`);
+    screen.classList.toggle('portrait', ratio < 1);
+  }
+  const syncFrameRatio = () => setFrameRatio(video.videoWidth, video.videoHeight);
+  video.addEventListener('loadedmetadata', syncFrameRatio);
+  // A browser can learn the size after metadata, and a source switch can change
+  // it, so both are followed rather than only the first.
+  video.addEventListener('resize', syncFrameRatio);
+  video.addEventListener('emptied', resetFrameRatio);
   const fmt=n=>{if(!Number.isFinite(n)||n<0)return '0:00';n=Math.floor(n);const h=Math.floor(n/3600),m=Math.floor(n/60)%60,s=n%60;return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}`;};
   function toast(text){$('playerToast').textContent=text;$('playerToast').classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('playerToast').classList.remove('visible'),1800);}
   function poke(){screen.classList.remove('player-hide');clearTimeout(hideTimer);hideTimer=setTimeout(()=>{if(!video.paused && menu.classList.contains('hidden') && !seeking)screen.classList.add('player-hide');},3000);}
