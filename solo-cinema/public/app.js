@@ -23,8 +23,42 @@ async function conversionFailed(item,fail){
   } else fail();
 }
 // Keep finished EVENT output available while the player is open, including paused playback.
-setInterval(()=>{if(route==='watch' && current?.transcodeId)post('/api/transcode/status',{id:current.transcodeId}).catch(()=>{});},45000);
-function stopTranscode(){++transcodeSequence;const pending=pendingRequestId;pendingRequestId=null;if(pending)post('/api/transcode/cancel',{requestId:pending}).catch(()=>{});const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
+// The encoder paces itself against this number, so it is sent while playing, not
+// every 45 seconds. Two things come back: how much finished output exists, and
+// therefore whether the player should wait instead of running dry.
+let leadTimer=null, waitingForEncoder=false;
+function reportPosition(){
+  if(route!=='watch' || !current?.transcodeId) return;
+  const video=$('video');
+  const position=(current.seekBase||0)+Math.max(0,video.currentTime||0);
+  post('/api/transcode/status',{id:current.transcodeId,position}).then(status=>{
+    if(!status || typeof status.ahead!=='number') return;
+    const lead=Number.isFinite(status.ahead)?status.ahead:0;
+    // Under a second of finished output left means the next segment may not
+    // exist. Pausing here is a visible "buffering" rather than a stall that the
+    // player misreads as broken and restarts.
+    if(lead<1 && !video.paused && !waitingForEncoder){
+      waitingForEncoder=true;
+      video.pause();
+      $('playError').textContent='Catching up with the conversion…';
+      const resume=setInterval(async()=>{
+        if(current?.transcodeId!==status.id && current?.transcodeId) { clearInterval(resume); waitingForEncoder=false; return; }
+        const next=await post('/api/transcode/status',{id:current.transcodeId,position}).catch(()=>null);
+        if(route!=='watch' || !current?.transcodeId){clearInterval(resume);waitingForEncoder=false;return;}
+        if(next && Number(next.ahead)>=3){
+          clearInterval(resume); waitingForEncoder=false;
+          $('playError').textContent='';
+          video.play().catch(()=>{});
+        }
+      },1500);
+    }
+    if(lead>=1 && waitingForEncoder===false && /Catching up/.test($('playError').textContent||'')) $('playError').textContent='';
+  }).catch(()=>{});
+}
+function startLeadReporting(){stopLeadReporting();reportPosition();leadTimer=setInterval(reportPosition,4000);}
+function stopLeadReporting(){if(leadTimer){clearInterval(leadTimer);leadTimer=null;}waitingForEncoder=false;}
+setInterval(()=>{if(route==='watch' && current?.transcodeId && !leadTimer)reportPosition();},45000);
+function stopTranscode(){stopLeadReporting();++transcodeSequence;const pending=pendingRequestId;pendingRequestId=null;if(pending)post('/api/transcode/cancel',{requestId:pending}).catch(()=>{});const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
 
 let dataSaver = (()=>{try{const v=localStorage.getItem('solo-data-saver'); return v===null ? !!navigator.connection?.saveData : v==='true';}catch{return !!navigator.connection?.saveData;}})();
 let preferredHeight = (()=>{try{return Number(localStorage.getItem('solo-quality-height'))===360?360:240;}catch{return 240;}})();
@@ -172,13 +206,24 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     }
     // hls.js can detect a playlist whose URL itself is opaque.
     if (item.format === 'hls' && Hls.isSupported()) {
-      activeLevels=[]; hls=new Hls({startLevel:0,startPosition:0,liveDurationInfinity:false,maxBufferLength:60,maxMaxBufferLength:120,backBufferLength:30,fragLoadPolicy:loadPolicy(10,10000,120000),playlistLoadPolicy:loadPolicy(8,10000,20000),manifestLoadPolicy:loadPolicy(6,10000,20000),nudgeMaxRetry:30}); const player=hls; player.loadSource(outputUrl); player.attachMedia(video);
+      // The conversion is written faster than real time but not instantly, so the
+      // player must be willing to wait for the next segment instead of calling a
+      // missing one fatal. A fatal error here triggered a fresh conversion, and a
+      // fresh conversion starts a new timeline -- which is why playback appeared
+      // to jump back to where it already was.
+      activeLevels=[]; hls=new Hls({startLevel:0,startPosition:0,liveDurationInfinity:false,maxBufferLength:120,maxMaxBufferLength:240,backBufferLength:30,maxBufferHole:0.5,highBufferWatchdogPeriod:4,nudgeOffset:0.1,nudgeMaxRetry:60,appendErrorMaxRetry:10,fragLoadPolicy:loadPolicy(40,20000,180000),playlistLoadPolicy:loadPolicy(20,15000,60000),manifestLoadPolicy:loadPolicy(10,15000,60000)}); const player=hls; player.loadSource(outputUrl); player.attachMedia(video);
+      startLeadReporting();
       player.on(Hls.Events.MANIFEST_PARSED, (_event, data)=>{ if(current!==item || hls!==player) return; activeLevels=data.levels || []; const index=activeLevels.findIndex(level=>level.height===preferredHeight); if(index<0){lastTranscodeError='The converted quality is unavailable.';pendingFailure=null;fail();return;} player.currentLevel=index; $('quality').value=String(preferredHeight); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); });
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('subtitles').value; $('subtitles').replaceChildren(new Option('Off', '-1')); (data.subtitleTracks || []).forEach((track,i)=>$('subtitles').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if(externalTrack) $('subtitles').add(new Option('English (provider)','external')); if(uploadTrack) $('subtitles').add(new Option('Uploaded subtitles','upload')); if([...$('subtitles').options].some(o=>o.value===previous)) $('subtitles').value=previous; });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('audio').value; $('audio').replaceChildren(new Option('Default', '-1')); (data.audioTracks || []).forEach((track,i)=>$('audio').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if([...$('audio').options].some(o=>o.value===previous)) $('audio').value=previous; });
       let recoveredStall=false;
       hls.on(Hls.Events.ERROR, (_event,data)=>{ if(!data.fatal || current!==item || pendingFailure!==fail)return;
-        if(!recoveredStall && (data.details==='bufferStalledError' || (data.details==='bufferAppendError' && typeof player.recoverMediaError==='function'))){recoveredStall=true;if(data.details==='bufferAppendError')player.recoverMediaError();else player.startLoad?.();if(!video.paused)video.play().catch(()=>{});$('playError').textContent='Buffering…';return;}
+        // A segment that is not written yet is not a failure: it is the encoder
+        // being behind. Asking for it again shortly is correct, and it costs the
+        // viewer a pause rather than the last ten minutes of their position.
+        const waitable=(data.details||'').match(/bufferStalledError|bufferSeekOverHole|fragLoadError|fragLoadTimeOut|levelLoadError|levelLoadTimeOut|manifestLoadError|manifestLoadTimeOut|bufferNudgeOnStall|fragParsingError/);
+        if(waitable){$('playError').textContent='Buffering: the conversion is behind the player; it will resume on its own.';player.startLoad?.(-1);setTimeout(()=>{if(current===item && !video.paused)video.play().catch(()=>{});},1200);return;}
+        if(!recoveredStall && data.details==='bufferAppendError' && typeof player.recoverMediaError==='function'){recoveredStall=true;player.recoverMediaError();player.startLoad?.();return;}
         pendingFailure=null; void conversionFailed(item,fail);
       });
     } else { video.src=outputUrl.replace('master.m3u8',`${preferredHeight}/index.m3u8`); nativeSubtitleOptions(); nativeAudioOptions(); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); }
@@ -210,14 +255,46 @@ try {const speed=localStorage.getItem('solo-playback-speed');if([...$('speed').o
 // markup and track selection remain browser-controlled, including in fullscreen.
 const captionTracks=new WeakSet();
 // Subtitle timestamps refer to the original title, while restarted output starts at zero.
+//
+// Shifting the cues in place is what left a line stuck on screen: a cue that was
+// already showing keeps the times it had when the browser latched it, and no
+// later cuechange ever clears it because its end is now in the past forever.
+// So the shift happens once, tracked per track, and every cue that is live at the
+// moment of the shift is explicitly ended first.
+const shiftedTracks=new WeakMap();
+function cueText(cue){return String(cue?.text ?? '').trim();}
+function clearLiveCues(track){
+  try{
+    const live=track.activeCues;
+    for(let i=0;i<(live?.length||0);i++){
+      const cue=live[i];
+      if(!cue)continue;
+      // Ending a cue at its own start removes it without touching the track's
+      // timing, which is what a player's own caption renderer also observes.
+      try{cue.endTime=cue.startTime;}catch{}
+    }
+  }catch{}
+}
 function shiftCaptionCues(track,offset){
- if(!track || !offset || !track.cues)return;
- try{for(const cue of Array.from(track.cues)){if(cue.endTime<=offset){track.removeCue(cue);continue;}cue.startTime=Math.max(0,cue.startTime-offset);cue.endTime=Math.max(0,cue.endTime-offset);}}catch{$('playError').textContent='Subtitle timing may be inaccurate after seeking on this browser.';}
+ if(!track || !track.cues)return;
+ if(shiftedTracks.get(track)===offset)return;
+ shiftedTracks.set(track,offset);
+ // Anything visible right now belongs to the unshifted timeline; retire it first.
+ clearLiveCues(track);
+ if(!offset)return;
+ try{for(const cue of Array.from(track.cues)){if(cue.endTime<=offset){try{track.removeCue(cue);}catch{}continue;}cue.startTime=Math.max(0,cue.startTime-offset);cue.endTime=Math.max(0,cue.endTime-offset);}}catch{$('playError').textContent='Subtitle timing may be inaccurate after seeking on this browser.';}
+ // Removing cues is not guaranteed to fire cuechange, so nothing is left to the
+ // browser here.
+ clearLiveCues(track);
 }
 function positionActiveCues(track){
   try {
     if(!track || !['subtitles','captions'].includes(track.kind)) return;
     const cues=track.activeCues; if(!cues) return; const line=100-Number($('subtitlePosition').value);
+    // A cue that is still listed after its own end time is the stuck-line case;
+    // end it rather than leaving it painted over the picture.
+    const now=$('video').currentTime;
+    for(let i=0;i<cues.length;i++){const cue=cues[i];if(cue && Number.isFinite(cue.endTime) && cue.endTime<=now && cue.endTime>0){try{cue.endTime=cue.startTime;}catch{}}}
     for(let i=0;i<cues.length;i++){
       const cue=cues[i]; if(!cue || !('line' in cue) || cue.vertical)continue;
       try{if(cue.snapToLines!==false)cue.snapToLines=false;if(cue.line!==line)cue.line=line;if('lineAlign' in cue && cue.lineAlign!=='end')cue.lineAlign='end';}catch{/* Native/non-WebVTT cues may be read-only. */}
@@ -229,6 +306,9 @@ function syncCaptionPosition(){const tracks=$('video').textTracks;if(!tracks)ret
 $('video').textTracks?.addEventListener?.('addtrack',event=>{watchCaptionTrack(event.track);syncCaptionPosition();});
 $('video').textTracks?.addEventListener?.('change',syncCaptionPosition);
 $('video').addEventListener('timeupdate',syncCaptionPosition);
+// A seek is the other way a line outlives its moment: the renderer keeps the old
+// cue until the next cuechange, which may be seconds away.
+$('video').addEventListener('seeking',()=>{const tracks=$('video').textTracks;if(!tracks)return;for(let i=0;i<tracks.length;i++)clearLiveCues(tracks[i]);});
 function applyCaptionAppearance(){ const video=$('video'); for(const value of ['small','large','xlarge','yellow']) video.classList.remove(`caption-${value}`); const size=$('subtitleSize').value, color=$('subtitleColor').value, position=Number($('subtitlePosition').value); if(['small','large','xlarge'].includes(size)) video.classList.add(`caption-${size}`); if(color==='yellow') video.classList.add('caption-yellow'); syncCaptionPosition(); try {localStorage.setItem('solo-caption-style',JSON.stringify({size,color,position}));} catch {} }
 $('subtitleSize').onchange=applyCaptionAppearance; $('subtitleColor').onchange=applyCaptionAppearance; $('subtitlePosition').onchange=applyCaptionAppearance;
 try {const settings=JSON.parse(localStorage.getItem('solo-caption-style') || '{}'); if(['normal','small','large','xlarge'].includes(settings.size)) $('subtitleSize').value=settings.size; if(['white','yellow'].includes(settings.color)) $('subtitleColor').value=settings.color; if([...$('subtitlePosition').options].some(option=>option.value===String(settings.position))) $('subtitlePosition').value=String(settings.position);} catch {} applyCaptionAppearance();
