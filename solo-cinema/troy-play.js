@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 const guard = require('./tool-guard');
+const config=require('./config');
 if (guard.startServerIfPanelEntry('troy-play.js', '--url "https://..."')) return;
 // Server-side playback test. Runs the same provider calls the browser makes,
 // then tries to actually READ the winning source, and reports exactly where it
@@ -121,7 +122,7 @@ const target = urlIndex > 0 ? process.argv[urlIndex + 1] : null;
   say('Can the local FFmpeg decode it?');
   say('-'.repeat(60));
   let binary;
-  try { binary = await chooseFfmpeg(process.env.CINEMA_FFMPEG ? [{ label: 'Configured', path: process.env.CINEMA_FFMPEG }] : ffmpegCandidates()); }
+  try { binary = await chooseFfmpeg(config.ffmpegPath() ? [{ label: 'Configured', path: config.ffmpegPath() }] : ffmpegCandidates()); }
   catch (error) { say(`  no usable FFmpeg: ${error.message}`); return; }
   say(pad('  ffmpeg') + binary);
 

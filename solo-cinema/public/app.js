@@ -69,6 +69,26 @@ function posterUrl(input){
     const p=new URL('https://wsrv.nl/'); p.searchParams.set('url',u.href); p.searchParams.set('w',dataSaver?'140':'240'); p.searchParams.set('q',dataSaver?'45':'60'); p.searchParams.set('output','webp'); return p.href;
   }catch{return null;}
 }
+// A wide still for the billboard and the detail hero. Same host rules as a
+// poster: catalog metadata is the only source, so nothing here is guessed.
+function backdropUrl(input){
+  try {const u=new URL(input); if(u.protocol!=='https:' || u.username || u.password || u.port || !['images.metahub.space','live.metahub.space'].includes(u.hostname)) return null;
+    const p=new URL('https://wsrv.nl/'); p.searchParams.set('url',u.href); p.searchParams.set('w',dataSaver?'960':'1600'); p.searchParams.set('q','62'); p.searchParams.set('output','webp'); return p.href;
+  }catch{return null;}
+}
+// Cinemeta serves backdrops by IMDb id at a fixed shape. It is a convention of
+// that catalog, not a guess about the title: a title with no id gets no art.
+function backdropFor(item){ return /^tt\d{1,12}$/.test(String(item?.imdbId||'')) ? backdropUrl(`https://images.metahub.space/background/medium/${item.imdbId}/img`) : null; }
+function paintBackdrop(node, url){
+  if(!node) return;
+  if(!url){ node.style.removeProperty('--billboard-image'); node.classList.add('is-loading'); return; }
+  // Paint only once the image is actually decodable, so the layer never shows a
+  // half-loaded still behind the title.
+  const probe=new Image(); probe.onload=()=>{node.style.setProperty('--billboard-image',`url("${url}")`); node.classList.remove('is-loading');};
+  probe.onerror=()=>{node.style.removeProperty('--billboard-image'); node.classList.add('is-loading');};
+  probe.src=url;
+}
+
 function updatePoster(img){const url=posterUrl(img.dataset.poster);if(url && img.getAttribute('src')!==url) img.src=url;}
 function addPoster(art,url){if(!posterUrl(url)) return;const img=document.createElement('img'); img.dataset.poster=url;img.loading='lazy';img.decoding='async';img.width=125;img.height=187;img.alt='';img.referrerPolicy='no-referrer';img.onerror=()=>img.remove();art.append(img);}
 function refreshCards(){
@@ -179,7 +199,12 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
     if (!isActive()) return;
     if(!item.proxy) item.proxy=url;
     const saved=load('solo-progress').find(x=>x.url===(item.progressKey || item.url));
-    const offset=Number.isFinite(item.seekAt) ? item.seekAt : (Number.isFinite(saved?.time) && saved.time>0 ? saved.time : 0);
+    // Three ways to arrive mid-film, in order of authority: an explicit point
+    // (a resume card), a seek the player already made, then this device's own
+    // remembered position for this exact source.
+    const offset=Number.isFinite(item.resumeAt) ? item.resumeAt
+      : Number.isFinite(item.seekAt) ? item.seekAt
+      : (Number.isFinite(saved?.time) && saved.time>0 ? saved.time : 0);
     $('playError').textContent=offset ? 'Seeking: preparing conversion at the selected point…' : 'Preparing 240p / 360p conversion…';
     const result=await enqueueTranscode(async()=>{
       if(sequence!==transcodeSequence || !isActive()) return null;
@@ -330,11 +355,33 @@ $('video').ontimeupdate=()=>{ if(!current || Date.now()-lastSave<5000) return; c
 $('video').onerror=()=>{ if(current && pendingFailure && $('video').currentSrc) { const fail=pendingFailure, item=current; pendingFailure=null; void conversionFailed(item,fail); } };
 api('/api/session').then(x=>loggedIn(x.authenticated)).catch(()=>loggedIn(false));
 
+// Progress is a local fact, not a server one: it belongs to this device.
+function progressFor(item){
+  if(!item) return null;
+  const keys=[item.progressKey, item.title && `${item.source||''}:${item.title}`].filter(Boolean);
+  const list=load('solo-progress');
+  for(const key of keys){ const hit=list.find(x=>x.url===key); if(hit && hit.time>0) return hit; }
+  return null;
+}
+function percentWatched(entry){
+  if(!entry || !Number.isFinite(entry.time) || !Number.isFinite(entry.duration) || entry.duration<=0) return null;
+  return Math.min(100, Math.max(1, Math.round(entry.time/entry.duration*100)));
+}
+// How many titles have real progress, for the "Continue watching" row.
+function continueWatching(){
+  const list=load('solo-progress').filter(x=>x && x.url && x.time>15);
+  return list.slice(0,20);
+}
+
 function catalogMatches(a,b){return a.kind==='catalog' && a.title===b.title && a.type===b.type && (a.year||'')===(b.year||'') && (a.source||'')===(b.source||'');}
 function updateCatalogSave(){const saved=selected && load('solo-watchlist').some(x=>catalogMatches(x,selected));$('saveTitle').textContent=saved?'Remove from watchlist':'Add to watchlist';$('saveTitle').setAttribute('aria-pressed',String(!!saved));}
 $('saveTitle').onclick=()=>{if(!selected)return;const list=load('solo-watchlist'),index=list.findIndex(x=>catalogMatches(x,selected));if(index>=0)list.splice(index,1);else list.unshift({kind:'catalog',title:selected.title,type:selected.type,year:selected.year || '',source:selected.source || ''});save('solo-watchlist',list);updateCatalogSave();render();};
 async function selectTitle(item) {
   selected=item; updateCatalogSave(); episodes=[]; $('season').value='1'; $('episode').value='1'; updateNext(); $('selectedTitle').textContent=item.title; $('overview').textContent=item.overview;
+  const facts=$('selectionFacts');
+  if(facts){ facts.replaceChildren();
+    for(const fact of [item.year, item.type==='series'?'Series':'Film', item.source]){ if(!fact) continue; const span=document.createElement('span'); span.textContent=fact; facts.append(span); }
+  }
   $('episodeFields').classList.toggle('hidden', item.type!=='series'); $('episodeCatalog').classList.add('hidden'); $('selection').classList.remove('hidden'); $('streams').replaceChildren(); $('providersNotice').textContent=''; $('findStreams').textContent=item.type==='series'?'Play selected episode':'Play again';
   if(item.type==='series') {
     $('season').value='1'; $('episode').value='1';
@@ -369,6 +416,30 @@ async function searchTitles(query, saved = null) {
 }
 $('searchForm').onsubmit=e=>{ e.preventDefault(); showRoute('search'); searchTitles($('query').value.trim()); };
 function openTitle(item){ stopTranscode(); if(route!=='watch') watchReturn=route; fallback.cancel(); directControls(true);  ++resolveSequence; if(hls){hls.destroy();hls=null;} current=null; pendingFailure=null; $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('placeholder').querySelector('p').textContent='Looking for a stream…'; $('playError').textContent=''; showRoute('watch'); selectTitle(item); findStreams(true); }
+// Billboard actions. Play opens the same path a card does; My list toggles the
+// same record the watch page toggles, so the two never disagree.
+if($('billboardPlay')) $('billboardPlay').onclick=()=>{
+  if(!billboardItem) return;
+  const watched=progressFor(billboardItem);
+  openTitle(watched && watched.time>15 ? {...billboardItem, resumeAt:watched.time} : billboardItem);
+};
+if($('billboardSave')) $('billboardSave').onclick=()=>{
+  if(!billboardItem) return;
+  const list=load('solo-watchlist');
+  const record={kind:'catalog',title:billboardItem.title,type:billboardItem.type,year:billboardItem.year||'',source:billboardItem.source||''};
+  const index=list.findIndex(x=>catalogMatches(x,record));
+  if(index>=0) list.splice(index,1); else list.unshift(record);
+  save('solo-watchlist',list);
+  const saved=index<0;
+  $('billboardSave').textContent=saved?'✓ In my list':'+ My list';
+  $('billboardSave').setAttribute('aria-pressed',String(saved));
+  render(); updateCatalogSave();
+};
+// A sticky header that becomes solid once content is under it.
+const headerScroll=()=>document.body.classList.toggle('is-scrolled', window.scrollY>12);
+window.addEventListener('scroll',headerScroll,{passive:true});
+headerScroll();
+
 $('episodeSelect').onchange=()=>{ const [s,e]=$('episodeSelect').value.split(':').map(Number); if(s && e){ $('season').value=s; $('episode').value=e; } };
 async function findStreams(autoplay = false) {
   stopTranscode();
@@ -438,15 +509,110 @@ $('nextEpisode').onclick=async()=>{
   await findStreams(true);
 };
 
-function titleCard(item, animeSection=false){
-  const card=document.createElement('button'); card.type='button'; card.className='catalog-card'; card.dataset.type=item.type; card.dataset.anime=String(animeSection || !!item.anime);
+function titleCard(item, animeSection=false, options={}){
+  const card=document.createElement('button'); card.type='button'; card.className='catalog-card';
+  card.dataset.type=item.type; card.dataset.anime=String(animeSection || !!item.anime);
+  try { card.dataset.item=JSON.stringify(item); } catch {}
+  if(options.rank){ card.dataset.rank=String(options.rank); }
   const art=document.createElement('div'); art.className='catalog-art';
   if(item.poster) addPoster(art,item.poster);
-  const fallback=document.createElement('span'); fallback.className='art-fallback'; fallback.textContent=item.title; art.append(fallback);
+  const placeholder=document.createElement('span'); placeholder.className='art-fallback'; placeholder.textContent=item.title; art.append(placeholder);
+  // A resume meter appears only where the device actually has progress.
+  const watched=options.progress || progressFor(item);
+  const percent=percentWatched(watched);
+  if(percent!==null){
+    const meter=document.createElement('div'); meter.className='catalog-progress'; meter.setAttribute('aria-hidden','true');
+    const fill=document.createElement('i'); fill.style.width=`${percent}%`; meter.append(fill); art.append(meter);
+    card.title=`${item.title} — ${percent}% watched`;
+  }
+  if(options.rank){ const rank=document.createElement('span'); rank.className='catalog-rank'; rank.textContent=String(options.rank); rank.setAttribute('aria-hidden','true'); art.append(rank); }
   const name=document.createElement('strong'); name.textContent=item.title;
-  const meta=document.createElement('small'); meta.textContent=`${item.year || 'Year unknown'} · ${item.type==='series'?'Series':'Movie'}`;
-  card.append(art,name,meta); card.onclick=()=>openTitle(item); return card;
+  const meta=document.createElement('small');
+  const parts=[item.year || 'Year unknown', item.type==='series'?'Series':'Movie'];
+  if(percent!==null) parts.unshift(`${percent}%`);
+  parts.forEach((part,index)=>{ if(index) meta.append(Object.assign(document.createElement('span'),{className:'dot',textContent:'·'})); meta.append(document.createTextNode(part)); });
+  card.append(art,name,meta);
+  card.setAttribute('aria-label',`${item.title}${percent!==null?`, ${percent}% watched`:''}`);
+  card.onclick=()=>{ if(options.resume && watched) { openTitle({...item, resumeAt:watched.time}); } else openTitle(item); };
+  return card;
 }
+
+// The billboard: one real title from the loaded catalog, chosen once per
+// session so it does not shuffle under the viewer's cursor.
+let billboardItem=null;
+function pickBillboard(sections){
+  const withArt=[];
+  for(const section of sections){
+    for(const item of section.items || []){
+      if(!item.imdbId || !item.overview) continue;
+      if(item.type!=='movie' && item.type!=='series') continue;
+      withArt.push(item);
+    }
+  }
+  // A billboard is a headline slot: it needs artwork *and* a synopsis worth
+  // reading. A title with a two-word description is not a headline.
+  const eligible=withArt.filter(x=>x.overview.length>=80);
+  if(!eligible.length) return null;
+  const pool=eligible.filter(x=>x.type==='movie');
+  const list=pool.length?pool:eligible;
+  return list[Math.floor(Math.random()*Math.min(list.length,12))];
+}
+function renderBillboard(item){
+  billboardItem=item;
+  const node=$('billboard');
+  if(!item || !node){ if(node) node.classList.add('hidden'); return; }
+  node.classList.remove('hidden');
+  $('billboardEyebrow').textContent=item.type==='series'?'Featured series':'Featured film';
+  $('billboardTitle').textContent=item.title;
+  const meta=$('billboardMeta'); meta.replaceChildren();
+  const facts=[];
+  if(item.year) facts.push(item.year);
+  facts.push(item.type==='series'?'Series':'Film');
+  facts.push(item.source==='moviebox'?'MovieBox':'Cinemeta');
+  const watched=progressFor(item);
+  const percent=percentWatched(watched);
+  if(percent!==null && percent<95) facts.push(`${percent}% watched`);
+  for(const fact of facts){ const span=document.createElement('span'); span.textContent=fact; meta.append(span); }
+  if(percent!==null && percent<95){ const badge=document.createElement('span'); badge.className='match'; badge.textContent='Resume'; meta.prepend(badge); }
+  $('billboardOverview').textContent=item.overview || '';
+  paintBackdrop($('billboardArt'), backdropFor(item));
+  const play=$('billboardPlay'); play.textContent=percent!==null && percent<95 ? '▶  Resume' : '▶  Play';
+  const saveState=load('solo-watchlist').some(x=>catalogMatches(x,{...item,kind:'catalog'}));
+  const saveBtn=$('billboardSave'); saveBtn.textContent=saveState?'✓ In my list':'+ My list'; saveBtn.setAttribute('aria-pressed',String(!!saveState));
+}
+
+// "Continue watching" is built from this device's own progress list, then
+// joined to catalog metadata by title. A title with no catalog match is shown
+// with what the progress record knows, because a resume point is still real.
+function renderContinueRow(root){
+  const entries=continueWatching();
+  if(!entries.length) return;
+  const known=new Map();
+  document.querySelectorAll('#catalogRows .catalog-card').forEach(card=>{
+    const name=card.querySelector('strong')?.textContent;
+    if(name) known.set(name, card);
+  });
+  const row=document.createElement('section');
+  row.className='catalog-section rail-section'; row.id='continue-watching'; row.dataset.groups='movies,shows,anime';
+  const heading=document.createElement('div'); heading.className='row-head';
+  const title=document.createElement('h2'); title.textContent='Continue watching';
+  const note=document.createElement('span'); note.textContent='From this device';
+  heading.append(title,note); row.append(heading);
+  const rail=document.createElement('div'); rail.className='catalog-rail'; rail.setAttribute('role','group'); rail.setAttribute('aria-label','Continue watching'); rail.tabIndex=0;
+  for(const entry of entries){
+    const [source,movieTitle]=String(entry.url).split(':');
+    const match=[...known.values()].find(card=>card.querySelector('strong')?.textContent===movieTitle);
+    let item;
+    if(match){ item=JSON.parse(match.dataset.item || 'null'); }
+    if(!item) item={title:movieTitle || 'Saved stream', type:'movie', year:'', source, poster:null};
+    rail.append(titleCard(item, false, {progress:entry, resume:true}));
+  }
+  if(!rail.childElementCount) return;
+  row.append(rail);
+  // Newest progress first, above the catalog rails.
+  root.prepend(row);
+}
+
 let discoveryLoading=false, discoveryLoaded=false;
 async function loadDiscovery(){
   if(discoveryLoading || discoveryLoaded) return; discoveryLoading=true; const epoch=discoveryEpoch;
@@ -454,14 +620,37 @@ async function loadDiscovery(){
     const data=await api('/api/discover'); if(epoch!==discoveryEpoch) return; const root=$('catalogRows'); root.replaceChildren();
     for(const section of data.sections){ if(!/^[a-z0-9-]{1,60}$/.test(section.id||'') || !Array.isArray(section.items)) continue;
       const label=section.title || section.id; const groups=Array.isArray(section.groups)?section.groups:section.id==='anime'?['anime']:[...new Set(section.items.map(i=>i.type==='movie'?'movies':'shows'))];
-      const row=document.createElement('section'); row.className='catalog-section'; row.id=section.id; row.dataset.groups=groups.join(',');
-      const heading=document.createElement('div'); heading.className='row-head'; const title=document.createElement('h2'); title.textContent=label; const note=document.createElement('span'); note.textContent=section.source || 'Catalog'; heading.append(title,note); row.append(heading);
+      const row=document.createElement('section'); row.className='catalog-section rail-section'; row.id=section.id; row.dataset.groups=groups.join(',');
+      const heading=document.createElement('div'); heading.className='row-head';
+      const title=document.createElement('h2'); title.textContent=label;
+      const note=document.createElement('span'); note.textContent=section.error ? 'Unavailable' : (section.source || 'Catalog');
+      heading.append(title,note); row.append(heading);
       const rail=document.createElement('div'); rail.className='catalog-rail'; rail.setAttribute('role','group'); rail.setAttribute('aria-label',label); rail.tabIndex=0;
-      for(const item of section.items) rail.append(titleCard(item,section.id==='anime')); if(!section.items.length){ const empty=document.createElement('p'); empty.className='catalog-status'; empty.textContent=section.error || 'No titles available right now.'; rail.append(empty); }
-      row.append(rail); const more=document.createElement('button');more.type='button';more.className='more-cards secondary';more.hidden=true;more.onclick=()=>{row.dataset.expanded='true';refreshCards();};row.append(more);root.append(row);
+      // The first row is a "top ten" shape, so it earns rank numerals. The rank
+      // is the row's own order, not a claim about anything else.
+      const ranked=root.childElementCount===0;
+      section.items.forEach((item,index)=>rail.append(titleCard(item,section.id==='anime',{rank:ranked&&index<10?index+1:0})));
+      if(!section.items.length){ const empty=document.createElement('p'); empty.className='catalog-status'; empty.textContent=section.error || 'No titles available right now.'; rail.append(empty); }
+      row.append(rail);
+      const more=document.createElement('button'); more.type='button'; more.className='more-cards secondary'; more.hidden=true;
+      more.onclick=()=>{row.dataset.expanded='true';refreshCards();}; row.append(more); root.append(row);
     }
+    renderContinueRow(root);
+    renderBillboard(pickBillboard(data.sections));
     showRoute(route,false); discoveryLoaded=data.sections.every(section=>!section.error);
     if(!discoveryLoaded){ const retry=document.createElement('button'); retry.className='secondary'; retry.textContent='Retry unavailable catalogs'; retry.onclick=loadDiscovery; root.append(retry); }
-  } catch { if(epoch!==discoveryEpoch) return; $('catalogRows').replaceChildren(); for(const id of ['popular-movies','popular-series']) {const anchor=document.createElement('div'); anchor.id=id; $('catalogRows').append(anchor);} const note=document.createElement('p'); note.className='catalog-status'; note.textContent='Catalog unavailable. Search is still available.'; const retry=document.createElement('button'); retry.className='secondary'; retry.textContent='Retry unavailable catalogs'; retry.onclick=loadDiscovery; $('catalogRows').append(note,retry); }
+  } catch {
+    if(epoch!==discoveryEpoch) return;
+    // A whole-page failure is still a page: keep the two anchors the router
+    // expects, and show one honest panel with the only action that helps.
+    $('catalogRows').replaceChildren();
+    for(const id of ['popular-movies','popular-series']){const anchor=document.createElement('div'); anchor.id=id; $('catalogRows').append(anchor);}
+    const panel=document.createElement('div'); panel.className='panel';
+    const heading=document.createElement('h2'); heading.textContent='Catalog unreachable';
+    const note=document.createElement('p'); note.className='panel-note';
+    note.textContent='Troy could not reach the catalog from this server. Search still works and will try every provider directly.';
+    const retry=document.createElement('button'); retry.type='button'; retry.className='secondary'; retry.textContent='Try again'; retry.onclick=()=>{retry.disabled=true;loadDiscovery();};
+    panel.append(heading,note,retry); $('catalogRows').append(panel);
+  }
   finally {discoveryLoading=false; if(epoch!==discoveryEpoch && !$('app').classList.contains('hidden')) loadDiscovery();}
 }

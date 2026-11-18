@@ -381,3 +381,105 @@ test('non-JSON API errors show status instead of a parser error',async()=>{
  const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window,d=w.document;w.scrollTo=()=>{};w.Hls=class{static isSupported(){return false}};w.fetch=async url=>url==='/api/session'?{ok:true,json:async()=>({authenticated:true})}:url==='/api/search'?{ok:false,status:502,json:async()=>{throw SyntaxError('unexpected token')}}:{ok:true,json:async()=>({sections:[]})};
  try{for(const f of ['fallback.js','app.js'])w.eval(fs.readFileSync(path.join(__dirname,'public',f),'utf8'));await tick();d.getElementById('query').value='Film';d.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));await tick();assert.match(d.getElementById('searchError').textContent,/HTTP 502/);}finally{w.close()}
 });
+
+test('the billboard, ranked first row and resume meters are built from real catalog data', async () => {
+  const html=fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8');
+  const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'});
+  const w=dom.window,d=w.document; w.scrollTo=()=>{};
+  w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();};
+  const sections=[
+    {id:'popular-movies',title:'Popular movies',source:'Cinemeta',groups:['movies'],items:[
+      {id:'m1',title:'First Film',type:'movie',year:'2024',overview:'A drifter takes a job as a night watchman and slowly uncovers what the building is really for.',poster:null,imdbId:'tt0111161',source:'cinemeta'},
+      {id:'m2',title:'Second Film',type:'movie',year:'2023',overview:'Another.',poster:null,imdbId:'tt0068646',source:'cinemeta'}]},
+    {id:'popular-series',title:'Popular series',source:'Cinemeta',groups:['shows'],items:[
+      {id:'s1',title:'A Series',type:'series',year:'2022',overview:'',poster:null,imdbId:null,source:'cinemeta'}]},
+  ];
+  w.fetch=async url=>({ok:true,json:async()=>{
+    if(url==='/api/session') return {authenticated:true};
+    if(url==='/api/discover') return {sections};
+    throw Error('unexpected '+url);
+  }});
+  // This device has watched one of those titles part way through.
+  w.localStorage.setItem('solo-progress',JSON.stringify([{url:'cinemeta:Second Film',time:1800,duration:5400}]));
+  try {
+    w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));
+    w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));
+    await tick(); await tick(); await tick();
+
+    // Billboard: present, filled from a real item, with real actions.
+    const billboard=d.getElementById('billboard');
+    assert.equal(billboard.classList.contains('hidden'),false,'the billboard is shown once discovery lands');
+    assert.match(d.getElementById('billboardTitle').textContent,/First Film|Second Film/);
+    assert.match(d.getElementById('billboardOverview').textContent,/night watchman/);
+    assert.ok(d.querySelectorAll('#billboardMeta span').length>=2,'facts come from metadata');
+    assert.equal(d.getElementById('billboardArt').style.getPropertyValue('--billboard-image'),'','art is not painted before it decodes');
+
+    // First row is ranked, and only the first row.
+    const firstRail=d.querySelector('#popular-movies .catalog-rail');
+    assert.equal(firstRail.querySelectorAll('.catalog-rank').length,2,'the first row carries rank numerals');
+    assert.equal(d.querySelector('#popular-series .catalog-rank'),null,'later rows are not ranked');
+    assert.deepEqual([...firstRail.querySelectorAll('.catalog-rank')].map(n=>n.textContent),['1','2']);
+
+    // Continue watching exists because this device has progress, and shows a meter.
+    const cont=d.getElementById('continue-watching');
+    assert.ok(cont,'the row exists when there is progress');
+    assert.equal(d.getElementById('catalogRows').firstElementChild.id,'continue-watching','it sits above the catalog');
+    const meter=cont.querySelector('.catalog-progress i');
+    assert.ok(meter,'progress renders as a meter');
+    assert.equal(meter.style.width,'33%','1800 of 5400 seconds is a third');
+    assert.match(cont.querySelector('.catalog-card small').textContent,/33%/);
+    assert.match(cont.querySelector('.catalog-card strong').textContent,/Second Film/,'the row joins to catalog metadata by title');
+
+    // Adding from the billboard uses the same record as the watch page.
+    d.getElementById('billboardSave').click();
+    const saved=JSON.parse(w.localStorage.getItem('solo-watchlist'));
+    assert.equal(saved.length,1); assert.equal(saved[0].kind,'catalog');
+    assert.equal(d.getElementById('billboardSave').textContent,'✓ In my list');
+    d.getElementById('billboardSave').click();
+    assert.equal(JSON.parse(w.localStorage.getItem('solo-watchlist')).length,0,'the same button removes');
+  } finally { w.close(); }
+});
+
+test('a device with no progress shows no continue row and no meters', async () => {
+  const html=fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8');
+  const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'});
+  const w=dom.window,d=w.document; w.scrollTo=()=>{};
+  w.fetch=async url=>({ok:true,json:async()=>{
+    if(url==='/api/session') return {authenticated:true};
+    if(url==='/api/discover') return {sections:[{id:'popular-movies',title:'Popular movies',source:'Cinemeta',groups:['movies'],items:[{id:'m1',title:'Only Film',type:'movie',year:'2024',overview:'',poster:null,imdbId:null,source:'cinemeta'}]}]};
+    throw Error('unexpected '+url);
+  }});
+  try {
+    w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));
+    w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));
+    await tick(); await tick(); await tick();
+    assert.equal(d.getElementById('continue-watching'),null,'no progress means no row');
+    assert.equal(d.querySelector('.catalog-progress'),null,'no progress means no meter');
+    // An item with no IMDb id must not get invented artwork.
+    assert.equal(d.getElementById('billboard').classList.contains('hidden'),true,'a title without art and synopsis is not used as a billboard');
+  } finally { w.close(); }
+});
+
+test('a catalog that cannot be reached renders an honest panel, not a broken page', async () => {
+  const html=fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8');
+  const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'});
+  const w=dom.window,d=w.document; w.scrollTo=()=>{};
+  w.fetch=async url=>({ok:true,json:async()=>{
+    if(url==='/api/session') return {authenticated:true};
+    if(url==='/api/discover') throw Error('network down');
+    throw Error('unexpected '+url);
+  }});
+  try {
+    w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));
+    w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));
+    await tick(); await tick(); await tick();
+    const panel=d.querySelector('#catalogRows .panel');
+    assert.ok(panel,'a failure is a panel, not an empty hole');
+    assert.match(panel.textContent,/Catalog unreachable/);
+    assert.match(panel.textContent,/Search still works/,'the message says what still works');
+    assert.ok(panel.querySelector('button'),'there is one action');
+    // The router's anchors must survive, or movies/shows routing breaks.
+    assert.ok(d.getElementById('popular-movies')); assert.ok(d.getElementById('popular-series'));
+    assert.equal(d.querySelectorAll('#catalogRows .skeleton-card').length,0,'skeletons do not outlive the attempt');
+  } finally { w.close(); }
+});
