@@ -2,6 +2,44 @@
 // Standalone browser-streaming adapter. Injected request function must pin DNS,
 // reject redirects and limit response size; do not substitute the bot downloader.
 function alternativeYearConflict(a,b) { return !!a && !!b && String(a)!==String(b); }
+// One subject shape for everything that returns a subject list, so a title from
+// a home row, a search result and a paged category all behave identically
+// downstream. `perPage` is a cap, not a promise: the provider decides.
+const PER_PAGE = 20;
+function normalizeSubjects(json, limit = PER_PAGE) {
+  const data = json?.data || {};
+  const items = data.items || data.subjectList || data.list || [];
+  if (!Array.isArray(items)) return { items: [], hasMore: false };
+  const pager = data.pager || {};
+  const normalized = items.slice(0, limit).map(raw => {
+    const s = raw?.subject || raw;
+    const subjectId = String(s?.subjectId || ''), detailPath = String(s?.detailPath || '');
+    const title = String(s?.title || '').slice(0, 150), type = Number(s?.subjectType);
+    if (!title || !subjectId || !detailPath || ![1, 2, 4].includes(type)) return null;
+    if (subjectId.length > 128 || detailPath.length > 512 || s?.isPornographic === true) return null;
+    let poster = null;
+    try {
+      const u = new URL(s?.cover?.url || s?.image?.url);
+      if (u.protocol === 'https:' && ['pbcdn.aoneroom.com', 'pbcdnw.aoneroom.com'].includes(u.hostname) && !u.username && !u.password && !u.port && u.href.length < 2048) poster = u.href;
+    } catch { /* no usable artwork */ }
+    return {
+      source: 'moviebox',
+      subjectId,
+      detailPath,
+      title,
+      type: type === 1 ? 'movie' : 'series',
+      year: String(s?.releaseDate || '').slice(0, 4),
+      overview: String(s?.description || '').slice(0, 1000),
+      imdbId: /^tt\d{1,12}$/.test(String(s?.imdbId || '')) ? String(s.imdbId) : null,
+      tmdbId: /^\d{1,12}$/.test(String(s?.tmdbId || '')) ? String(s.tmdbId) : null,
+      poster,
+      anime: type === 4 || /\banime\b/i.test(String(s?.genre || '')),
+    };
+  }).filter(Boolean);
+  // `hasMore` is the only stop signal worth trusting: an empty page is not the
+  // same thing, and a page that returns fewer than asked is not either.
+  return { items: normalized, hasMore: pager.hasMore === true };
+}
 module.exports = function createMoviebox({ request, safeUrl }) {
   const base = 'https://h5-api.aoneroom.com/wefeed-h5api-bff';
   const headers = { 'user-agent': 'Mozilla/5.0', referer: 'https://moviebox.ph/', origin: 'https://moviebox.ph', accept: 'application/json', 'content-type': 'application/json', 'x-client-info': '{"timezone":"Africa/Blantyre"}', 'x-request-lang': 'en' };
@@ -29,6 +67,15 @@ module.exports = function createMoviebox({ request, safeUrl }) {
   async function home() {
     const response=await request(`${base}/home?host=moviebox.ph`,{headers,timeoutMs:7000});
     return require('./moviebox-home').normalizeHome(response.json);
+  }
+  // A home row is a curated list with a genreTopId behind it. The site's own
+  // "more" button asks this endpoint for the rest of that list, which is the
+  // only way to grow a row past the ~20 subjects it ships with.
+  async function ranking(genreTopId, page = 1) {
+    if (!/^\d{1,25}$/.test(String(genreTopId || ''))) throw Error('Invalid category');
+    if (!Number.isInteger(page) || page < 1 || page > 500) throw Error('Invalid page');
+    const result = await bff(`/ranking-list/content?${new URLSearchParams({ id: String(genreTopId), page: String(page), perPage: String(PER_PAGE) })}`);
+    return normalizeSubjects(result.json, PER_PAGE);
   }
   async function search(query) {
     if (typeof query !== 'string' || !query.trim() || query.length > 150) throw Error('Enter a title up to 150 characters');
@@ -123,5 +170,5 @@ module.exports = function createMoviebox({ request, safeUrl }) {
     }
     return null;
   }
-  return { search, resolve, subtitle, home, episodes };
+  return { search, resolve, subtitle, home, episodes, ranking };
 };

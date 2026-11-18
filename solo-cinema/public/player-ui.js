@@ -5,30 +5,62 @@
   let hideTimer, toastTimer, adjustTimer, tapTimer, lastTap=0, pointer=null, seeking=false, locked=false, brightness=1, wakeLock=null, wakeGeneration=0;
   const clamp=(n,a,b)=>Math.max(a,Math.min(b,n));
 
-  // The frame follows the picture, the way a desktop player does. Telling
-  // portrait from landscape is what decides whether the width or the height
-  // drives the layout, so it is worked out here rather than in the stylesheet.
-  // A near-16:9 source is left alone: snapping it to the default avoids a
-  // visible resize for the common case and for odd anamorphic sizes.
+  // The frame follows the picture unless the viewer says otherwise. Telling
+  // portrait from landscape decides whether the width or the height drives the
+  // layout, so it is worked out here rather than in the stylesheet.
   const DEFAULT_RATIO = 16/9;
   const RATIO_TOLERANCE = 0.02;
+  const RATIO_KEY = 'solo-aspect-ratio';
+  // "Fit picture" is the default because it is the only mode that is right for
+  // every source. The fixed shapes exist for when a viewer disagrees with the
+  // file, which is the whole reason the control is here.
+  const ASPECT_MODES = [
+    { id: 'auto', label: 'Fit picture', hint: 'Follows the video' },
+    { id: '16:9', label: 'Widescreen', hint: '16:9' },
+    { id: '4:3', label: 'Classic', hint: '4:3' },
+    { id: '4:5', label: 'Vertical', hint: '4:5' },
+  ];
+  const aspectFor = id => ASPECT_MODES.find(mode => mode.id === id) || ASPECT_MODES[0];
+  const readAspect = () => { try { return localStorage.getItem(RATIO_KEY) || 'auto'; } catch { return 'auto'; } };
+  let aspectId = aspectFor(readAspect()).id;
+
   function resetFrameRatio() {
     screen.style.removeProperty('--player-ratio');
-    screen.classList.remove('portrait');
+    screen.classList.remove('portrait', 'aspect-fixed');
   }
-  function setFrameRatio(width, height) {
+  function paintFrameRatio(width, height) {
+    const chosen = aspectFor(aspectId);
+    if (chosen.id !== 'auto') {
+      // A chosen shape is a statement about the box, not about the file, so it
+      // is applied even before any metadata has arrived.
+      screen.style.setProperty('--player-ratio', chosen.hint);
+      screen.classList.toggle('portrait', chosen.id === '4:5');
+      screen.classList.add('aspect-fixed');
+      return;
+    }
     const ratio = width > 0 && height > 0 ? width / height : 0;
+    screen.classList.remove('aspect-fixed');
     if (!Number.isFinite(ratio) || ratio <= 0) { resetFrameRatio(); return; }
     if (Math.abs(ratio - DEFAULT_RATIO) < RATIO_TOLERANCE) { resetFrameRatio(); return; }
     screen.style.setProperty('--player-ratio', `${width} / ${height}`);
     screen.classList.toggle('portrait', ratio < 1);
   }
-  const syncFrameRatio = () => setFrameRatio(video.videoWidth, video.videoHeight);
+  const syncFrameRatio = () => paintFrameRatio(video.videoWidth, video.videoHeight);
   video.addEventListener('loadedmetadata', syncFrameRatio);
   // A browser can learn the size after metadata, and a source switch can change
   // it, so both are followed rather than only the first.
   video.addEventListener('resize', syncFrameRatio);
-  video.addEventListener('emptied', resetFrameRatio);
+  // emptied means the source is gone, so a stale shape would be a lie about a
+  // picture that no longer exists. A pinned shape still stands, because the
+  // viewer chose the frame rather than describing the file.
+  video.addEventListener('emptied', () => { if (aspectFor(aspectId).id === 'auto') resetFrameRatio(); });
+  // A chosen shape survives a reload, the way the other player preferences do.
+  function setAspect(id) {
+    aspectId = aspectFor(id).id;
+    // Storage can be disabled; the choice still applies to this session.
+    try { localStorage.setItem(RATIO_KEY, aspectId); } catch { /* private mode */ }
+    syncFrameRatio();
+  }
   const fmt=n=>{if(!Number.isFinite(n)||n<0)return '0:00';n=Math.floor(n);const h=Math.floor(n/3600),m=Math.floor(n/60)%60,s=n%60;return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}`;};
   function toast(text){$('playerToast').textContent=text;$('playerToast').classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('playerToast').classList.remove('visible'),1800);}
   function poke(){screen.classList.remove('player-hide');clearTimeout(hideTimer);hideTimer=setTimeout(()=>{if(!video.paused && menu.classList.contains('hidden') && !seeking)screen.classList.add('player-hide');},3000);}
@@ -38,8 +70,18 @@
     const rows=$('playerMenuRows');rows.replaceChildren();$('playerSaver').classList.toggle('hidden',menuView!=='main');$('playerAdvanced').classList.toggle('hidden',menuView!=='advanced');
     const row=(label,value,action,selected=false)=>{const button=document.createElement('button');button.type='button';button.className='player-menu-row'+(selected?' selected':'');const name=document.createElement('span');name.textContent=label;const detail=document.createElement('span');detail.textContent=value||'';button.append(name,detail);button.onclick=()=>{action();poke();};rows.append(button);};
     if(menuView==='main'){
+      const aspect=aspectFor(aspectId);
+      row('Aspect ratio',`${aspect.label} ›`,()=>{menuView='aspect';renderMenu();});
       for(const [id,label] of [['quality','Quality'],['speed','Speed'],['subtitles','Subtitles'],['subtitlePosition','Subtitle height']]){const select=$(id);row(label,(select.selectedOptions[0]?.textContent||'Unavailable')+' ›',()=>{menuView=id;renderMenu();});}
       row('More settings','›',()=>{menuView='advanced';renderMenu();});
+    }else if(menuView==='aspect'){
+      row('‹ Aspect ratio','',()=>{menuView='main';renderMenu();});
+      // "Fit picture" is first and the shape it resolves to is shown next to it,
+      // so the auto choice is not an unexplained default.
+      for(const mode of ASPECT_MODES){
+        const value=mode.id==='auto'?'follows the video':mode.hint;
+        row(mode.label,value,()=>{setAspect(mode.id);menuView='main';renderMenu();},mode.id===aspectId);
+      }
     }else{
       row('‹ Back','',()=>{menuView='main';renderMenu();});
       if(menuView!=='advanced'){const select=$(menuView);for(const option of select.options){row(option.textContent,'',()=>{select.value=option.value;select.dispatchEvent(new Event('change'));menuView='main';renderMenu();},select.value===option.value);}}

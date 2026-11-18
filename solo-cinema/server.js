@@ -190,6 +190,18 @@ const server = http.createServer(async (req, res) => {
       const sections=require('./catalog-session').bindDiscovery(await discover(),catalog,sid);
       return send(res,200,{sections});
     }
+    if (url.pathname === '/api/category' && req.method === 'POST') {
+      if (!authorized) return send(res,401,{error:'Login required'});
+      const { genreTopId, page } = await readJsonBody(req);
+      // A paged category is the same list the home row showed, so an invalid
+      // identifier or page is the caller's mistake, not a provider failure.
+      if (typeof genreTopId !== 'string' || !/^\d{1,25}$/.test(genreTopId)) fail('Invalid category');
+      const wanted = page === undefined ? 1 : page;
+      if (!Number.isInteger(wanted) || wanted < 1 || wanted > 500) fail('Invalid page');
+      const result = await moviebox.ranking(genreTopId, wanted);
+      const items = require('./catalog-session').bindItems(result.items, catalog, sid);
+      return send(res,200,{items,hasMore:result.hasMore,page:wanted});
+    }
     if (url.pathname === '/api/search' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const { query } = await readJsonBody(req);

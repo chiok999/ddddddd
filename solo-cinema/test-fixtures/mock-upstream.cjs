@@ -9,6 +9,14 @@ Module._load=function(name,parent,isMain){
     const json=(data,extra={})=>new Response(JSON.stringify(data),{status:200,headers:{'content-type':'application/json',...extra}});
     if(url.includes('aoneroom.com/wefeed-h5api-bff/home?')) return json({}, {'x-user':JSON.stringify({token:'fixture'})});
     if(url.includes('aoneroom.com/wefeed-h5api-bff/subject/search')) return json({data:{items:[{subject:{subjectId:'42',detailPath:'fixture',title:'Fixture Movie',subjectType:1}}]}});
+    // A paged category: page 1 has more, page 2 ends. The subject shape is
+    // nested exactly as the provider returns it, so the normalizer is exercised.
+    if(url.includes('aoneroom.com/wefeed-h5api-bff/ranking-list/content')){
+      const query=new URL(url).searchParams, page=Number(query.get('page')||1), id=query.get('id');
+      if(id==='9999') return json({data:{items:[],pager:{hasMore:false,page:'1',perPage:20}}});
+      const items=(page===1?[1,2,3]:[4,5]).map(n=>({subject:{subjectId:`c${n}`,detailPath:`cat-${n}`,title:`Cat ${n}`,subjectType:n%2?1:2,releaseDate:'2024-01-01',cover:{url:`https://pbcdn.aoneroom.com/${n}.jpg`}}}));
+      return json({data:{items,pager:{hasMore:page===1,page:String(page),perPage:20,totalCount:5}}});
+    }
     if(url.includes('aoneroom.com/wefeed-h5api-bff/media-player/get-domain')) return json({data:'https://player.example'});
     if(url.includes('player.example/wefeed-h5api-bff/subject/play')) return json({data:{hls:[{url:'https://cdn.example/master.m3u8'}]}});
     if(url.includes('kisskh.is/api/DramaList/Search')) return json([]);

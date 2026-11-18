@@ -8,6 +8,10 @@
    clip would be 1200px tall and push the controls off-screen. With a definite
    height and auto width, aspect-ratio derives the width, so nothing stretches. */
 #screen.player.portrait{height:min(calc(100dvh - var(--space-8)), 1200px);width:auto;max-width:100%}
+/* A portrait shape is height-driven whether it came from the file or from the
+   viewer, so picking 4:5 for a landscape file is capped the same way. A picked
+   landscape shape needs no cap and simply sets the ratio. */
+#screen.player.portrait.aspect-fixed{height:min(calc(100dvh - var(--space-8)), 1200px);width:auto;max-width:100%}
 /* Fullscreen outranks .portrait on purpose: the height cap exists so a vertical
    clip fits in a window, and inside fullscreen the window is the screen. */
 #screen.player.portrait:fullscreen,#screen.player:fullscreen{max-width:none;width:100%;height:100%;aspect-ratio:auto}
