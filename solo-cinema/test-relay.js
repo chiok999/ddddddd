@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { once } = require('node:events');
-const { relayConfig, relayUrl, sign, createRelayRemote } = require('./relay');
+const { relayConfig, relayUrl, relayHeaders, sign, createRelayRemote } = require('./relay');
 const { resumableInput } = require('./resumable-input');
 
 const WORKER = path.join(__dirname, 'worker', 'troy-relay.mjs');
@@ -324,7 +324,9 @@ test('relay settings are validated instead of silently half-configured', () => {
   assert.equal(relayConfig({ CINEMA_RELAY_URL: '  ' }), null);
   assert.throws(() => relayConfig({ CINEMA_RELAY_URL: 'https://w.dev' }), /CINEMA_RELAY_KEY/);
   assert.throws(() => relayConfig({ CINEMA_RELAY_URL: 'https://w.dev', CINEMA_RELAY_KEY: 'short' }), /CINEMA_RELAY_KEY/);
-  assert.throws(() => relayConfig({ CINEMA_RELAY_URL: 'http://w.dev', CINEMA_RELAY_KEY: SECRET }), /https/);
+  assert.equal(relayConfig({ CINEMA_RELAY_URL: 'http://localhost:4180', CINEMA_RELAY_KEY: SECRET }).inQuery, false, 'plain http is allowed, with the signature in a header');
+  assert.equal(relayConfig({ CINEMA_RELAY_URL: 'http://192.168.1.50:4180', CINEMA_RELAY_KEY: SECRET }).inQuery, false, 'and for another box of your own');
+  assert.equal(relayConfig({ CINEMA_RELAY_URL: 'https://w.dev', CINEMA_RELAY_KEY: SECRET }).inQuery, true, 'https keeps the Worker-compatible query form');
   assert.throws(() => relayConfig({ CINEMA_RELAY_URL: 'https://u:p@w.dev', CINEMA_RELAY_KEY: SECRET }), /credentials/);
   const parsed = relayConfig({ CINEMA_RELAY_URL: 'https://w.dev/relay/', CINEMA_RELAY_KEY: SECRET });
   assert.equal(parsed.origin, 'https://w.dev');
@@ -351,4 +353,90 @@ test('a relay failure is one clear error, never a silent direct retry', async ()
   await assert.rejects(remote('https://cdn.example/movie.mp4', {}, undefined), /Relay unreachable/);
   const refused = createRelayRemote({ config: { origin: 'https://w.dev', path: '', secret: SECRET }, send: async () => new Response('{"error":"Bad signature"}', { status: 403 }), direct: null });
   await assert.rejects(refused('https://cdn.example/movie.mp4', {}, undefined), /Relay error 403/);
+});
+
+test('the bot-keep relay serves the same contract over real HTTP', async () => {
+  // This is the file that runs on the bot host: no dependencies, no disk, just
+  // bytes passing through. Driven over a real socket, not in-process.
+  const { createRelayServer } = require('./troy-relay-server');
+  const key = 'bot-keep-secret-'.padEnd(32, 'k');
+  const bytes = Buffer.alloc(12000);
+  for (let index = 0; index < bytes.length; index++) bytes[index] = index % 251;
+  let limited = 0;
+  const cdn = http.createServer((req, res) => {
+    if (!/Mozilla\/5\.0/.test(req.headers['user-agent'] || '')) {
+      res.writeHead(426, { 'content-type': 'text/plain' });
+      return res.end('upgrade');
+    }
+    if (limited < 1) {
+      limited++;
+      res.writeHead(427, { 'content-type': 'text/plain' });
+      return res.end('slow down');
+    }
+    const headers = { 'content-type': 'video/mp4', etag: '"bk"', 'accept-ranges': 'bytes', 'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT' };
+    const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
+    if (range) {
+      const start = Number(range[1]);
+      const end = range[2] === '' ? bytes.length - 1 : Math.min(Number(range[2]), bytes.length - 1);
+      res.writeHead(206, { ...headers, 'content-range': `bytes ${start}-${end}/${bytes.length}`, 'content-length': String(end - start + 1) });
+      return res.end(bytes.subarray(start, end + 1));
+    }
+    res.writeHead(200, { ...headers, 'content-length': String(bytes.length) });
+    res.end(bytes);
+  });
+  cdn.listen(0, '127.0.0.1');
+  await once(cdn, 'listening');
+  const relay = createRelayServer({ secret: key, allowPrivate: true });
+  relay.listen(0, '127.0.0.1');
+  await once(relay, 'listening');
+  const target = `http://127.0.0.1:${cdn.address().port}/movie.mp4`;
+  try {
+    // The client is the real one, configured exactly as the panel would be.
+    const config = relayConfig({ CINEMA_RELAY_URL: `http://127.0.0.1:${relay.address().port}`, CINEMA_RELAY_KEY: key });
+    assert.equal(config.inQuery, false, 'plain http puts the signature in a header, not the URL');
+    const remote = createRelayRemote({ config, send: (url, headers, signal) => fetch(url, { headers, signal }), direct: null });
+    const full = await remote(target, { 'accept-encoding': 'identity' }, undefined);
+    assert.equal(full.status, 200, 'the 427 was waited out and the file arrived');
+    assert.equal(full.headers.get('content-type'), 'video/mp4');
+    assert.equal(full.headers.get('etag'), '"bk"');
+    assert.deepEqual(await drain(full), bytes);
+    const part = await remote(target, { range: 'bytes=100-199', 'accept-encoding': 'identity' }, undefined);
+    assert.equal(part.status, 206);
+    assert.equal(part.headers.get('content-range'), `bytes 100-199/${bytes.length}`);
+    assert.deepEqual(await drain(part), bytes.subarray(100, 200));
+    // The secret never appears in a URL that could be logged.
+    const built = relayUrl(config, target, {});
+    assert.ok(!built.includes(sign(key, target)), 'no signature in the query');
+    assert.equal(relayHeaders(config, target)['x-troy-sig'], sign(key, target));
+  } finally {
+    relay.close();
+    cdn.closeAllConnections?.();
+    await new Promise((resolve) => cdn.close(resolve));
+  }
+});
+
+test('the bot-keep relay refuses what the Worker refuses', async () => {
+  const { createRelayServer, checkTarget } = require('./troy-relay-server');
+  const key = 'bot-keep-secret-'.padEnd(32, 'k');
+  const relay = createRelayServer({ secret: key });
+  relay.listen(0, '127.0.0.1');
+  await once(relay, 'listening');
+  const base = `http://127.0.0.1:${relay.address().port}`;
+  try {
+    const target = 'https://cdn.example/film.mp4';
+    assert.equal((await fetch(`${base}/?url=${encodeURIComponent(target)}`)).status, 403, 'unsigned');
+    assert.equal((await fetch(`${base}/?url=${encodeURIComponent(target)}&sig=${'0'.repeat(64)}`)).status, 403, 'wrongly signed');
+    const signed = (value) => `${base}/?url=${encodeURIComponent(value)}&sig=${sign(key, value)}`;
+    for (const value of ['http://cdn.example/f.mp4', 'https://127.0.0.1/f.mp4', 'https://localhost/f.mp4', 'https://box.local/f.mp4', 'https://cdn.example:8443/f.mp4']) {
+      assert.equal((await fetch(signed(value))).status, 400, value);
+    }
+    assert.throws(() => checkTarget('https://cdn.example:8443/f.mp4', false), /port/);
+    const health = await (await fetch(`${base}/health`)).json();
+    assert.equal(health.signed, true);
+    assert.equal(health.host, 'node');
+    assert.match(await (await fetch(base)).text(), /Troy relay/);
+  } finally {
+    relay.close();
+    await new Promise((resolve) => relay.close(resolve));
+  }
 });

@@ -122,6 +122,32 @@ The startup banner then shows one of:
             CINEMA_RELAY_KEY must be at least 16 characters when CINEMA_RELAY_URL is set
 ```
 
+### The relay can live on bot-keep, or on any box of yours
+
+`troy-relay-server.js` is the same contract as the Worker, with no dependencies
+at all -- no npm install, no database, no FFmpeg, no disk, no file kept in memory.
+It opens the CDN, streams the answer out and forgets it. That is why it fits on a
+container that cannot run Troy itself.
+
+```sh
+# on the relay host
+TROY_RELAY_KEY=<the same secret> PORT=4180 node troy-relay-server.js
+#   → health: http://<that host>:4180/health
+
+# on Troy
+CINEMA_RELAY_URL=http://<that host>:4180
+CINEMA_RELAY_KEY=<the same secret>
+```
+
+`CINEMA_RELAY_URL` now accepts `http:` as well as `https:`, because a relay can be
+another machine of your own. Over plain HTTP the signature travels in an
+`x-troy-sig` header instead of the query string, so the shared key never appears
+in a URL that a proxy or a log could keep. An `https:` relay keeps the query form,
+which is what the deployed Cloudflare Worker already understands -- no re-paste.
+
+The relay only needs to be reachable from Troy. If bot-keep is reachable only on a
+private network between the two, that is enough; nothing else has to be exposed.
+
 **Both routes are now tried, automatically.** The relay is asked first and this
 server's own address second, per fetch. A status that says something about the
 *path* -- `426`, `427`, `428`, `429`, `451`, `502`, `503`, `504` -- moves to the
