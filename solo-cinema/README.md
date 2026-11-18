@@ -4,6 +4,31 @@ A separate, small Node.js streaming application. Playback defaults to **direct r
 
 **Current scope and limits:** Search uses MovieBox, KissKh and Cinemeta metadata. MovieBox, VaPlayer, VidSrc, Movy and 7Movies/VidLink stream adapters are queried independently and report failures; after a fatal playback error the player tries the remaining returned streams for that selected title. The latter two require IMDb and TMDB IDs respectively, which are not always supplied by MovieBox or found by the exact-match Cinemeta lookup. Episode lists use exact IMDb IDs with Cinemeta details and TVMaze fallback; manual episode numbers remain available. Cinemeta details can also supply the TMDB ID missing from its search results. KissKh results include its episode list, streaming and optional English subtitles. KissKh token JavaScript is downloaded only from the fixed KissKh origin and evaluated in a resource-limited QuickJS WebAssembly runtime without Node APIs or host callbacks; this reduces exposure compared with the bot’s Node VM, but does not guarantee a malicious or changed provider script is harmless. Episode numbering follows KissKh and is shown as season 1. The QuickJS token execution can briefly block the Node event loop. The KissKh integration has only been exercised with offline fixtures, not the live service. Torrent providers from the bot are not supported because they are not direct browser streams. This does not use the bot downloader, which has an open SSRF issue. HLS quality, audio and subtitle choices depend on the source offering tracks and on browser/player support; direct files have one quality.
 
+## What made playback work
+
+Short version, so the reasoning is not lost: both networks Troy could reach were
+refused by the provider CDNs — this server's address with `426`, Cloudflare's with
+`427` — while **bot-keep's address is accepted**. So the relay moved there and Troy
+stopped fetching media itself.
+
+```
+browser → Troy (hiddencloud) → relay (bot-keep) → provider CDN
+                                  troy-relay-server.js
+```
+
+Three things had to be right, and each one cost a restart to find:
+
+1. **The relay must be started with node**, not as a program — `node troy-relay-server.js`.
+2. **It must listen on the port the panel assigned**, from the panel's own `PORT`
+   variable, because that is the only port routed to the outside world.
+3. **It must load the panel's `.env`**, because Botkeep writes `PORT`,
+   `TROY_RELAY_KEY` and `CINEMA_PASSWORD` into that file and exports nothing. It
+   now does this itself.
+
+Once the relay answered `/health` at `http://node17.botkeep.cloud:57395/health`,
+playback worked with no further changes: the same two `CINEMA_RELAY_*` variables
+on Troy were already correct.
+
 ## Playback modes
 
 **1. Direct relay (default).** `/media/<handle>` streams the provider file through the server to the browser. The server adds the provider's `Referer`/`Origin`/`User-Agent`, which a browser cannot add to cross-origin media, and because the response is same-origin there is no CORS problem. Byte ranges pass through unchanged, so the timeline is the real title length and seeking is instant. Playlists are rewritten so their segments and keys come back through Troy too. Memory use per stream is a buffer, not the file; no temporary files are written.
