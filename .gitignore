@@ -17,3 +17,6 @@
 *.bak
 *.migrated
 .DS_Store
+
+# scratch debug scripts
+*.tmp.js
