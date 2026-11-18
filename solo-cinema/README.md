@@ -122,6 +122,16 @@ The startup banner then shows one of:
             CINEMA_RELAY_KEY must be at least 16 characters when CINEMA_RELAY_URL is set
 ```
 
+**Both routes are now tried, automatically.** The relay is asked first and this
+server's own address second, per fetch. A status that says something about the
+*path* -- `426`, `427`, `428`, `429`, `451`, `502`, `503`, `504` -- moves to the
+other route instead of being reported; a `403` or `404` does not, because asking
+again cannot change a wrong link. The winning route is remembered per host for ten
+minutes, and each distinct host is asked once when a title is resolved, so the
+player does not pay a wait to find out which route is free. `CINEMA_ROUTE_MEMORY=0`
+turns the memory off. A panel that loses its environment and leaves the relay
+half-configured now starts in direct-only mode instead of refusing to start.
+
 Requests are signed with `CINEMA_RELAY_KEY`, so the Worker is not an open proxy
 and a leaked link is useless without the secret. `CINEMA_RELAY_FALLBACK=1` allows
 a fall back to the direct fetch when the *Worker itself* is unreachable; it never

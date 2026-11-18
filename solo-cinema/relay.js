@@ -28,8 +28,24 @@ const RESPONSE_HEADERS = {
 // Marks a response the worker retried and still saw rate-limited, so a slow
 // source can be told apart from a blocked one without reading the status.
 const RETRIED_HEADER = 'x-troy-retried';
+// Statuses the relay reports as errors rather than as a response, so the route
+// itself can be judged without waiting for a body.
+const HEALTH_STATUSES = new Set([426, 427, 428, 429, 451, 502, 503, 504]);
 
 /** Read the two settings that turn the relay on, or null when it is off. */
+/**
+ * Read the two settings. Unlike a strict config this does not throw: a panel
+ * that lost its environment between restarts must not turn "the relay is
+ * unconfigured" into "the server will not start".
+ */
+function relayStatus(env = process.env) {
+  try {
+    return { config: relayConfig(env), error: null };
+  } catch (error) {
+    return { config: null, error: String(error?.message || error) };
+  }
+}
+
 function relayConfig(env = process.env) {
   const base = String(env.CINEMA_RELAY_URL || '').trim();
   if (!base) return null;
@@ -148,8 +164,18 @@ function createRelayRemote({ config, send, direct, fallback = false }) {
       await response.body?.cancel().catch(() => {});
       throw Error('Relay returned no upstream status');
     }
+    // Health problems are thrown with the real status attached, so a caller can
+    // tell "this route is unhealthy, try another" from "this file is gone".
+    // The router decides which of those it is; nothing needs the body.
+    if (HEALTH_STATUSES.has(status)) {
+      await response.body?.cancel().catch(() => {});
+      const error = Error(`Relay upstream returned ${status}`);
+      error.status = status;
+      error.relayFailure = true;
+      throw error;
+    }
     return relayResponse(response, status);
   };
 }
 
-module.exports = { relayConfig, relayUrl, sign, createRelayRemote, relayResponse, MIN_SECRET_LENGTH, RETRIED_HEADER };
+module.exports = { relayConfig, relayStatus, relayUrl, sign, createRelayRemote, relayResponse, MIN_SECRET_LENGTH, RETRIED_HEADER, HEALTH_STATUSES };
