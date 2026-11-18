@@ -1,8 +1,8 @@
 {
   "name": "solo-cinema",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Troy \u2014 a private cinema: provider discovery, on-server transcoding, and one player.",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "test": "node --test test.js test-ui.js test-input.js test-relay.js test-route.js",

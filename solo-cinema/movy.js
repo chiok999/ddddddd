@@ -53,4 +53,6 @@ function createMovy({request,safeUrl,now=Date.now}){
   }
   return function resolve(item,season,episode,options={}){if(pending>=8) return Promise.reject(Error('Movy queue full')); pending++; const job=queue.then(()=>run(item,season,episode,options));queue=job.catch(()=>{});return job.finally(()=>pending--);};
 }
-module.exports={createMovy,decrypt,SERVERS};
+// `decrypt` is exported because the seed/keystream scheme is pinned by a test;
+// SERVERS is an internal protocol detail and is not part of the surface.
+module.exports={createMovy,decrypt};

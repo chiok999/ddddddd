@@ -30,7 +30,15 @@ const agent = new Agent({ connect: { lookup: publicLookup() } });
 // (upgrade required) to HTTP/1.1 for certain endpoints, which is why a series
 // can fail where a movie plays. Same pinned DNS lookup, same validation.
 const h2Agent = new Agent({ allowH2: true, connect: { lookup: publicLookup() } });
-const fail = msg => { throw new Error(msg); };
+/** A failure that already knows the status code the client should be told. */
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = 'HttpError';
+    this.status = status;
+  }
+}
+const fail = msg => { throw new HttpError(400, msg); };
 function remember(url, sid, referer = null, format = null, origin = null, userAgent = null, refresh = null, refreshAfterMs = null) {
   const id = crypto.randomBytes(24).toString('base64url');
   sources.set(id, { url: safeUrl(url).href, sid, referer, format, origin, userAgent, refresh, refreshAt:Number.isFinite(refreshAfterMs) && refreshAfterMs>0 ? Date.now()+refreshAfterMs : null, expires: Date.now() + 6 * 3600000 });
@@ -116,10 +124,24 @@ async function resolveTitle(selected, season, episode, onlyProvider=null) {
   }
   return resolveProviders({moviebox,providers,movy,vidlink,item:await enrichItem(selected),season,episode,onlyProvider});
 }
-async function body(req, max = 16384) {
-  const chunks = []; let size = 0;
-  for await (const chunk of req) { size += chunk.length; if (size > max) fail('Request too large'); chunks.push(chunk); }
-  return JSON.parse(Buffer.concat(chunks).toString() || '{}');
+// The read is bounded before anything is buffered, and the parser's own error
+// never reaches the client: a JSON syntax message describes the payload, not the
+// request, and reads like an internal fault to anyone who sees it.
+async function readJsonBody(req, maxBytes = 16 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) throw new HttpError(413, 'Request body is too large');
+    chunks.push(chunk);
+  }
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new HttpError(400, 'Request body is not valid JSON');
+  }
 }
 function send(res, status, message) { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(message)); }
 function sameOrigin(req) {
@@ -145,7 +167,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/login' && req.method === 'POST') {
       const peer=req.socket.remoteAddress || 'unknown';
       if (loginLimiter.blocked(peer)) return send(res, 429, { error: 'Too many attempts; wait a minute' });
-      const submitted = (await body(req)).password;
+      const submitted = (await readJsonBody(req)).password;
       const a = crypto.createHash('sha256').update(typeof submitted === 'string' ? submitted : '').digest();
       const b = crypto.createHash('sha256').update(password).digest();
       if (!crypto.timingSafeEqual(a, b)) { loginLimiter.failure(peer); return send(res, 401, { error: 'Incorrect password' }); }
@@ -164,7 +186,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/search' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
-      const { query } = await body(req);
+      const { query } = await readJsonBody(req);
       if (typeof query !== 'string' || !query.trim() || query.length > 150) fail('Enter a title up to 150 characters');
       const searches = await Promise.allSettled([moviebox.search(query), kisskh.search(query), catalogSearch(query)]);
       if (searches.every(s => s.status === 'rejected')) {
@@ -192,7 +214,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/episodes' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
-      const data = await body(req); const selected = catalog.get(data.id);
+      const data = await readJsonBody(req); const selected = catalog.get(data.id);
       if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
       if (selected.item.source === 'kisskh') {
         const list = await kisskh.details(selected.item.kissId);
@@ -205,7 +227,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/kiss-subtitle' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
-      const data = await body(req); const selected = catalog.get(data.id);
+      const data = await readJsonBody(req); const selected = catalog.get(data.id);
       if (!selected || selected.sid !== sid || selected.expires < Date.now() || selected.item.source !== 'kisskh') return send(res, 404, { error:'Search result expired; search again' });
       const text=await kisskh.subtitle(selected.item,Number(data.season),Number(data.episode));
       if (!text) return send(res,200,{ url:null });
@@ -216,7 +238,7 @@ const server = http.createServer(async (req, res) => {
     }
     if ((url.pathname === '/api/moviebox-subtitle' || url.pathname === '/api/movy-subtitle' || url.pathname === '/api/vidlink-subtitle') && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
-      const data=await body(req); const source=captionSources.get(data.id);
+      const data=await readJsonBody(req); const source=captionSources.get(data.id);
       if (!source || source.sid!==sid || source.expires<Date.now()) return send(res,404,{error:'Subtitle source expired'});
       const expected=url.pathname === '/api/movy-subtitle' ? 'movy' : url.pathname === '/api/vidlink-subtitle' ? '7movies' : 'moviebox';
       if(source.provider!==expected) return send(res,404,{error:'Subtitle source expired'});
@@ -240,7 +262,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/resolve' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
-      const data = await body(req); const selected = catalog.get(data.id);
+      const data = await readJsonBody(req); const selected = catalog.get(data.id);
       if (!selected || selected.sid !== sid || selected.expires < Date.now()) return send(res, 404, { error:'Search result expired; search again' });
       const season=Number(data.season),episode=Number(data.episode);
       const result=await resolveTitle(selected,season,episode);
@@ -264,12 +286,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/source' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
-      const data = await body(req);
+      const data = await readJsonBody(req);
       return send(res, 200, { url: remember(data.url, sid, null, data.format === 'hls' ? 'hls' : null) });
     }
     if (url.pathname === '/api/source/probe' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
-      const data=await body(req);
+      const data=await readJsonBody(req);
       if(typeof data.url!=='string' || !/^\/media\/[A-Za-z0-9_-]+$/.test(data.url)) return send(res,400,{error:'Invalid source handle'});
       const entry=sources.get(data.url.slice(7));
       if(!entry || entry.sid!==sid || entry.expires<Date.now())return send(res,404,{error:'Source expired'});
@@ -289,7 +311,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/transcode' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
-      const data=await body(req);if(typeof data.url!=='string' || !/^\/media\/[A-Za-z0-9_-]+$/.test(data.url)) return send(res,400,{error:'Select an existing direct source'});
+      const data=await readJsonBody(req);if(typeof data.url!=='string' || !/^\/media\/[A-Za-z0-9_-]+$/.test(data.url)) return send(res,400,{error:'Select an existing direct source'});
       const entry=sources.get(data.url.slice(7));if(!entry || entry.sid!==sid || entry.expires<Date.now())return send(res,404,{error:'Source expired'});
       if(entry.format==='hls')return send(res,400,{error:'Transcoding currently supports direct MP4 sources, not HLS playlists'});
       if(data.requestId!==undefined && (typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId)))return send(res,400,{error:'Invalid request ID'});
@@ -299,16 +321,16 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/transcode/cancel' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
-      const data=await body(req);if(typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId))return send(res,400,{error:'Invalid request ID'});
+      const data=await readJsonBody(req);if(typeof data.requestId!=='string' || !/^[a-f0-9]{32}$/.test(data.requestId))return send(res,400,{error:'Invalid request ID'});
       return send(res,200,{stopped:await transcoder.stopRequest(data.requestId,sid)});
     }
     if (url.pathname === '/api/transcode/reclaim' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
-      await body(req); return send(res,200,{stopped:await transcoder.stopAny()});
+      await readJsonBody(req); return send(res,200,{stopped:await transcoder.stopAny()});
     }
     if (url.pathname === '/api/transcode/status' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
-      const data=await body(req);if(typeof data.id!=='string' || !/^[A-Za-z0-9_-]{32}$/.test(data.id))return send(res,400,{error:'Invalid job ID'});
+      const data=await readJsonBody(req);if(typeof data.id!=='string' || !/^[A-Za-z0-9_-]{32}$/.test(data.id))return send(res,400,{error:'Invalid job ID'});
       // The client reports where playback is, so the reply can say how far ahead
       // the encoder really is instead of guessing.
       const position=Number(data.position);
@@ -317,7 +339,7 @@ const server = http.createServer(async (req, res) => {
       return send(res,200,status);
     }
     if (url.pathname === '/api/transcode/stop' && req.method === 'POST') {
-      if (!authorized) return send(res,401,{error:'Login required'});const data=await body(req);if(typeof data.id!=='string')return send(res,400,{error:'Missing job ID'});
+      if (!authorized) return send(res,401,{error:'Login required'});const data=await readJsonBody(req);if(typeof data.id!=='string')return send(res,400,{error:'Missing job ID'});
       return send(res,200,{stopped:await transcoder.stopFor(data.id,sid)});
     }
     if(url.pathname.startsWith('/transcode/') && req.method==='GET'){
@@ -331,7 +353,14 @@ const server = http.createServer(async (req, res) => {
       if (entry) return staticFiles.send(req, res, entry);
     }
     return send(res, 404, { error: 'Not found' });
-  } catch (e) { if (!res.headersSent) send(res, 400, { error: e.message || 'Request failed' }); else res.destroy(); }
+  } catch (error) {
+    // Once the response has started there is no status line left to correct.
+    // `req.destroyed` is NOT tested: on IncomingMessage it becomes true as soon
+    // as the body has been read, so it means "stream finished", not "gone".
+    if (res.headersSent) return res.destroy();
+    const status = error instanceof HttpError ? error.status : 502;
+    send(res, status, { error: error.message || 'Request failed' });
+  }
 });
 server.on('close',()=>{transcoder.close();});
 for(const signal of ['SIGTERM','SIGINT'])process.once(signal,()=>{server.close();transcoder.close().finally(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();});

@@ -20,10 +20,10 @@ function safeUrl(input) {
 // CINEMA_IPV4=1 forces IPv4 for all outbound source and provider traffic.
 // "auto" (the default) keeps both families, because a dual-stack host works
 // either way and IPv6-only networks must not be broken.
-// Decides the agent built a few lines below, so it is read once here.
-const preferIPv4 = (config.flag('CINEMA_IPV4_FORCE', false) ? '1' : (process.env.CINEMA_IPV4 || 'auto')).toLowerCase();
-const explicit = ['1','true','yes','ipv4'].includes(preferIPv4);
-const forcedOff = ['0','false','no','ipv6','off'].includes(preferIPv4);
+// Read once, at load, because it selects the agent built below.
+const ipv4Mode = config.ipv4Mode();
+const explicit = ipv4Mode === 'ipv4';
+const forcedOff = ipv4Mode === 'ipv6';
 // Detect the broken case ourselves instead of asking the operator to know it.
 // Node cannot report route reachability, so this is decided once at startup:
 // if the machine has no IPv6 route but DNS still hands out AAAA records, every

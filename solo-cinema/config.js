@@ -68,10 +68,19 @@ module.exports = {
   encoder: () => process.env.CINEMA_ENCODER || '',
   tmpdirOverride: () => process.env.CINEMA_TMPDIR || '',
   password: () => process.env.CINEMA_PASSWORD || '',
-  relayUrl: () => process.env.CINEMA_RELAY_URL || '',
-  relayKey: () => process.env.CINEMA_RELAY_KEY || '',
   port: () => process.env.PORT || '',
   routeMemory: () => flag('CINEMA_ROUTE_MEMORY', true),
+  /**
+   * Which address family outbound source traffic may use.
+   * 'auto' keeps both, because a dual-stack host works either way and an
+   * IPv6-only network must not be broken. Only an explicit setting narrows it.
+   */
+  ipv4Mode: () => {
+    const raw = String(process.env.CINEMA_IPV4 || 'auto').toLowerCase();
+    if (['1', 'true', 'yes', 'ipv4'].includes(raw)) return 'ipv4';
+    if (['0', 'false', 'no', 'ipv6', 'off'].includes(raw)) return 'ipv6';
+    return 'auto';
+  },
   // The client a browser presents when it plays a video. A default here rather
   // than inline, because an operator may need to change it per provider.
   playerUserAgent: () =>
