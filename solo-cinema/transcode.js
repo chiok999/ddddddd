@@ -9,6 +9,7 @@ const crypto=require('node:crypto');
 const {spawn,execFile}=require('node:child_process');
 const {Transform}=require('node:stream');
 const {resumableInput}=require('./resumable-input');
+const config=require('./config');
 
 // Extract only the bounded mvhd declared movie duration; fragmented/unknown
 // durations are not guessed. The gate has already buffered the complete moov.
@@ -63,7 +64,7 @@ function bundledFfmpeg(platform=process.platform,arch=process.arch,report=proces
 const staticFfmpeg = require('./static-ffmpeg');
 function staticFfmpegExpectedPath(){return path.join(__dirname,'.troy-ffmpeg','ffmpeg');}
 function ffmpegCandidates(){
-  if(process.env.CINEMA_FFMPEG)return [{label:'Configured FFmpeg',path:process.env.CINEMA_FFMPEG}];
+  if(config.ffmpegPath())return [{label:'Configured FFmpeg',path:config.ffmpegPath()}];
   // The bundled build links Rockchip MPP, which logs initializer errors on hosts
   // without that SoC. It is still worth trying, but a real system FFmpeg and an
   // explicitly downloaded static build are more portable, so try those first
@@ -135,11 +136,11 @@ async function chooseFfmpeg(candidates){
 }
 function videoEncoder(executable){
   // Software unless the operator explicitly opted into hardware encoding.
-  if(process.env.CINEMA_ENCODER==='rkmpp' && ffmpegEncoders.get(executable)==='h264_rkmpp') return 'h264_rkmpp';
+  if(config.encoder()==='rkmpp' && ffmpegEncoders.get(executable)==='h264_rkmpp') return 'h264_rkmpp';
   return 'libx264';
 }
 
-function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, startupMs=45000, authorize=()=>true}={}){
+function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.idleMs(), startupMs=config.startupMs(), authorize=()=>true}={}){
   let active=null;const failures=new Map();let admission=Promise.resolve(),binaryPromise=null;
   function getBinary(){if(!binaryPromise)binaryPromise=chooseFfmpeg(executable?[{label:'FFmpeg',path:executable}]:ffmpegCandidates()).catch(err=>{binaryPromise=null;throw err;});return binaryPromise;}
   // Reap abandoned private directories after a crash, without touching a live Troy process.
@@ -229,15 +230,15 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
       // -- how far ahead of the player playback is. That is a runtime decision,
       // so it is made here from the playback position the client reports, and it
       // needs no device-specific tuning.
-      const headroom=Math.max(2,Math.min(30,Math.round(Number(process.env.CINEMA_LEAD_SECONDS||12))));
-      const target=Math.min(1.2,Math.max(0.2,Number(process.env.CINEMA_PACE_TARGET||0.85)));
+      const headroom=config.leadSeconds();
+      const target=config.paceTarget();
       const lead=(seekOffset||0)+headroom;
       const pacing=['-readrate',String(target),'-readrate_initial_burst',String(Math.ceil(lead)),...(seekOffset>0?['-ss',String(seekOffset)]:[])];
       // Two rungs cost two encodes. On a small box the 240p one is enough to
       // start, and both are only worth encoding while the CPU has room.
-      const rungs=String(process.env.CINEMA_LADDER||'240,360').split(',').map(r=>r.trim()).filter(r=>['240','360'].includes(r));
+      const rungs=config.ladder();
       const outputs=[];
-      for(const rung of (rungs.length?rungs:['360'])) outputs.push(...output(rung==='240'?426:640,rung==='240'?240:360,rung==='240'?'250k':'600k',rung==='240'?'48k':'64k',rung));
+      for(const rung of rungs) outputs.push(...output(rung==='240'?426:640,rung==='240'?240:360,rung==='240'?'250k':'600k',rung==='240'?'48k':'64k',rung));
       const args=['-hide_banner','-loglevel','error','-nostdin','-filter_threads','1',...pacing,'-threads','2','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...outputs];
       job.proc=spawn(binary,args,{stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
@@ -249,11 +250,16 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
       // player show an error and restart -- and restarting is the "seek back to
       // where I was" the viewer sees. Two finished segments is the minimum a
       // player can start on without immediately stalling.
-      const rungDirs=rungs.length?rungs:['360'];
+      const rungDirs=rungs;
       async function finishedSegments(dir){
         try{
           const list=await fsp.readFile(path.join(job.dir,dir,'index.m3u8'),'utf8');
-          return (list.match(/^index\d+\.ts$/gm)||[]).length;
+          // The muxer writes the path it was given, so a line may be absolute.
+          const segments=(list.match(/^.*?index\d+\.ts\s*$/gm)||[]).length;
+          // A finished rung is ready with one segment. Requiring two would
+          // deadlock on any input shorter than two HLS segments, and an
+          // ENDLIST already says the whole timeline is on disk.
+          return list.includes('#EXT-X-ENDLIST') ? Math.max(segments,2) : segments;
         }catch{return 0;}
       }
       const deadline=Date.now()+(seekOffset ? Math.max(startupMs,180000+Math.ceil(seekOffset*1000)) : startupMs);
@@ -288,7 +294,7 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
     for(const rung of rungs){
       try{
         const list=await fsp.readFile(path.join(job.dir,rung,'index.m3u8'),'utf8');
-        const segments=(list.match(/^index\d+\.ts$/gm)||[]).length;
+        const segments=(list.match(/^.*?index\d+\.ts\s*$/gm)||[]).length;
         const duration=[...list.matchAll(/#EXTINF:([\d.]+)/g)].reduce((total,m)=>total+Number(m[1]),0);
         counts[rung]={segments,encoded:Number(duration.toFixed(2))};
       }catch{counts[rung]={segments:0,encoded:0};}

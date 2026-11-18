@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 const guard = require('./tool-guard');
+const config=require('./config');
 if (guard.startServerIfPanelEntry('troy-doctor.js')) return;
 // Troy network doctor -- ONE self-contained file. No npm install, no server, no
 // login, nothing to configure.
@@ -139,7 +140,7 @@ function tlsProbe(host) {
   say(pad('node') + process.version);
   say(pad('platform') + `${process.platform} ${process.arch}`);
   say(pad('hostname') + os.hostname());
-  say(pad('FFmpeg env') + (process.env.CINEMA_FFMPEG || 'not set'));
+  say(pad('FFmpeg env') + (config.ffmpegPath() || 'not set'));
 
   // 0. What is this box, and could it encode in hardware?
   say('');

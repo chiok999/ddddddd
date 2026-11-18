@@ -5,6 +5,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { Agent, fetch } = require('undici');
 const { safeUrl, publicLookup, getRemote } = require('./network');
+const config = require('./config');
+const { createStatic } = require('./static');
 const { describe } = require('./diagnostics');
 const {scope:providerScope}=require('./provider-timeout');
 
@@ -14,7 +16,7 @@ const {scope:providerScope}=require('./provider-timeout');
 try { process.loadEnvFile(path.resolve(process.cwd(), '.env')); }
 catch (err) { if (err.code !== 'ENOENT') { console.error('Unable to load .env file.'); process.exit(1); } }
 
-const password = process.env.CINEMA_PASSWORD || '';
+const password = config.password();
 if (password.length < 12) { console.error('Set CINEMA_PASSWORD to at least 12 characters.'); process.exit(1); }
 const sessions = new Map();
 const sources = require('./source-store').createSourceStore();
@@ -42,7 +44,7 @@ const TMPFS_MAGIC=0x01021994;
 function filesystemType(dir){try{return Number(fs.statfsSync(dir).type);}catch{return null;}}
 function freeBytes(dir){try{const s=fs.statfsSync(dir);return Number(s.bavail)*Number(s.bsize);}catch{return null;}}
 function resolveTranscodeTmp(){
-  if(process.env.CINEMA_TMPDIR) return {dir:process.env.CINEMA_TMPDIR,reason:'CINEMA_TMPDIR'};
+  if(config.tmpdirOverride()) return {dir:config.tmpdirOverride(),reason:'CINEMA_TMPDIR'};
   const systemTmp=require('node:os').tmpdir();
   if(process.platform!=='linux' || filesystemType(systemTmp)!==TMPFS_MAGIC) return {dir:systemTmp,reason:'system temp'};
   // System temp is RAM. Use a directory beside the application instead.
@@ -70,7 +72,7 @@ const routes=require('./route').createRouter({
   direct:directRemote,
   relay:relayRemote,
   order:relay ? ['relay','direct'] : ['direct'],
-  remember:['1','true','yes'].includes(String(process.env.CINEMA_ROUTE_MEMORY||'1').toLowerCase()),
+  remember:config.routeMemory(),
 });
 const remote=routes.remote;
 const openSource=require('./source-opener').createSourceOpener({safeUrl,remote});
@@ -124,11 +126,12 @@ function sameOrigin(req) {
   if (!req.headers.origin) return false;
   try { return new URL(req.headers.origin).host === req.headers.host && ['http:', 'https:'].includes(new URL(req.headers.origin).protocol); } catch { return false; }
 }
-const staticFiles = {
-  '/cinema-hero.jpg': ['public/cinema-hero.jpg', 'image/jpeg'],
-  '/': ['public/index.html', 'text/html; charset=utf-8'], '/fallback.js': ['public/fallback.js', 'text/javascript; charset=utf-8'], '/app.js': ['public/app.js', 'text/javascript; charset=utf-8'],
-  '/style.css': ['public/style.css', 'text/css; charset=utf-8'], '/player.css': ['public/player.css', 'text/css; charset=utf-8'], '/player-ui.js': ['public/player-ui.js', 'text/javascript; charset=utf-8'], '/hls.js': ['node_modules/hls.js/dist/hls.min.js', 'text/javascript; charset=utf-8']
-};
+// The shell is served from `public/` by name. The player library is the one
+// vendored file, so it gets a stable URL instead of a pinned version in markup.
+const staticFiles = createStatic({
+  root: __dirname,
+  vendored: new Map([['/hls.js', 'node_modules/hls.js/dist/hls.min.js']]),
+});
 const server = http.createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Content-Security-Policy', "default-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https://wsrv.nl; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src 'none'; frame-ancestors 'none'");
@@ -323,15 +326,16 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200,{'Content-Type':result.type,'Cache-Control':match[2].endsWith('.ts')?'private, max-age=3600, immutable':'no-store'});return res.end(result.data);
     }
     if (url.pathname.startsWith('/media/') && req.method === 'GET') return send(res, authorized ? 403 : 401, {error:authorized ? 'Direct playback is disabled; conversion is required' : 'Login required'});
-    if (req.method === 'GET' && staticFiles[url.pathname]) {
-      const [file, mime] = staticFiles[url.pathname]; res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-store' }); return fs.createReadStream(path.join(__dirname, file)).pipe(res);
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      const entry = staticFiles.lookup(url.pathname);
+      if (entry) return staticFiles.send(req, res, entry);
     }
     return send(res, 404, { error: 'Not found' });
   } catch (e) { if (!res.headersSent) send(res, 400, { error: e.message || 'Request failed' }); else res.destroy(); }
 });
 server.on('close',()=>{transcoder.close();});
 for(const signal of ['SIGTERM','SIGINT'])process.once(signal,()=>{server.close();transcoder.close().finally(()=>process.exit(0));setTimeout(()=>process.exit(1),5000).unref();});
-server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => {
+server.listen(config.port() ? Number(config.port()) : 3000, '0.0.0.0', () => {
   // Print the two facts that decide whether playback can work at all, so a
   // hosting panel's console log is enough to diagnose a dead deployment.
   const net = require('./network');
@@ -340,8 +344,8 @@ server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => {
   const { chooseFfmpeg, ffmpegCandidates, staticFfmpegExpectedPath } = require('./transcode');
   // Conversion is the only playback path, so verify by running the same probes
   // a real job needs rather than only checking that the binary exists.
-  chooseFfmpeg(process.env.CINEMA_FFMPEG
-    ? [{ label: 'Configured FFmpeg', path: process.env.CINEMA_FFMPEG }]
+  chooseFfmpeg(config.ffmpegPath()
+    ? [{ label: 'Configured FFmpeg', path: config.ffmpegPath() }]
     : ffmpegCandidates())
     .then(binary => console.log(`  ffmpeg:   ok  ${binary}`))
     .catch(error => {

@@ -1,0 +1,19 @@
+/* Troy — page-fit rules.
+   ---------------------------------------------------------------------------
+   Everything visual is in tokens.css. This file holds only the handful of
+   decisions that belong to a page's own layout rather than to the system:
+   the billboard backdrop, and how the wide views reflow on a phone. */
+
+/* The billboard uses the featured title's own backdrop. The URL is set by the
+   app at runtime from real catalog metadata; this only says how to paint it. */
+.billboard-art { background-image: var(--billboard-image, none); }
+
+/* Detail and billboard share a backdrop layer; the app writes the same custom
+   property to both. */
+.detail-hero .billboard-art { background-image: var(--billboard-image, none); }
+
+/* The player card is the one surface that goes edge to edge inside its column
+   on a phone, so the video is not inset inside a black page. */
+@media (max-width: 600px) {
+  #screen { margin-inline: calc(var(--gutter) * -1); border-radius: 0; }
+}

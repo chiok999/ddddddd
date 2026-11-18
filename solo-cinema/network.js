@@ -2,6 +2,7 @@
 const dns = require('node:dns').promises;
 const net = require('node:net');
 const ipaddr = require('ipaddr.js');
+const config = require('./config');
 
 function safeUrl(input) {
   const url = new URL(input);
@@ -19,7 +20,8 @@ function safeUrl(input) {
 // CINEMA_IPV4=1 forces IPv4 for all outbound source and provider traffic.
 // "auto" (the default) keeps both families, because a dual-stack host works
 // either way and IPv6-only networks must not be broken.
-const preferIPv4 = (process.env.CINEMA_IPV4 || 'auto').toLowerCase();
+// Decides the agent built a few lines below, so it is read once here.
+const preferIPv4 = (config.flag('CINEMA_IPV4_FORCE', false) ? '1' : (process.env.CINEMA_IPV4 || 'auto')).toLowerCase();
 const explicit = ['1','true','yes','ipv4'].includes(preferIPv4);
 const forcedOff = ['0','false','no','ipv6','off'].includes(preferIPv4);
 // Detect the broken case ourselves instead of asking the operator to know it.
@@ -71,7 +73,7 @@ function h2Requested(response,{allowMissing=false}={}){
 }
 // The client a browser presents when it plays a video. Only used to retry a
 // source that refused an honest request, never to disguise the first attempt.
-const PLAYER_USER_AGENT = process.env.CINEMA_PLAYER_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const PLAYER_USER_AGENT = config.playerUserAgent();
 async function getRemote(input, headers, signal, fetch, agent, h2Agent = null) {
   let url = safeUrl(input);
   let forwarded=new Headers(headers);
