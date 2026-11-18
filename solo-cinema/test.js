@@ -784,3 +784,79 @@ test('a panel that launches a diagnostic tool still starts the server', async ()
   }
  }
 });
+
+test('every POST with a body gets an answer: malformed JSON is 400, oversized is 413', async () => {
+  // Regression: testing `req.destroyed` in the error handler silently killed
+  // every POST whose body had been read, because on IncomingMessage that flag
+  // means "the stream is finished", not "the client left".
+  const net=require('node:net'),{spawn}=require('node:child_process');
+  const probe=net.createServer(); await new Promise(r=>probe.listen(0,'127.0.0.1',r));
+  const port=probe.address().port; await new Promise(r=>probe.close(r));
+  const child=spawn(process.execPath,['server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'a-strong-test-password'},stdio:['ignore','pipe','pipe']});
+  try {
+    await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject);});
+    const base=`http://127.0.0.1:${port}`;
+    const send=(body)=>fetch(base+'/api/login',{method:'POST',headers:{origin:base,'content-type':'application/json'},body});
+    const bad=await send('not json');
+    assert.equal(bad.status,400,'malformed JSON is a bad request, not a dropped connection');
+    assert.match((await bad.json()).error,/not valid JSON/,'the message describes the body, not a parser trace');
+    const huge=await send(JSON.stringify({password:'x'.repeat(20000)}));
+    assert.equal(huge.status,413,'an oversized body is refused, not buffered');
+    // And a well-formed request still works, which is the part that broke.
+    const ok=await send(JSON.stringify({password:'a-strong-test-password'}));
+    assert.equal(ok.status,200);
+  } finally { child.kill(); }
+});
+
+test('a provider failure is reported as an upstream fault, not a bad request', async () => {
+  // Regression: every thrown error became 400, so a provider outage looked like
+  // the caller had sent something wrong and the client showed the wrong advice.
+  const net=require('node:net'),{spawn}=require('node:child_process');
+  const probe=net.createServer(); await new Promise(r=>probe.listen(0,'127.0.0.1',r));
+  const port=probe.address().port; await new Promise(r=>probe.close(r));
+  const child=spawn(process.execPath,['server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'a-strong-test-password'},stdio:['ignore','pipe','pipe']});
+  try {
+    await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject);});
+    const base=`http://127.0.0.1:${port}`;
+    const post=(p,data,cookie)=>fetch(base+p,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});
+    const login=await post('/api/login',{password:'a-strong-test-password'});
+    const cookie=login.headers.get('set-cookie').split(';')[0];
+    // A search that reaches no provider cannot answer from cache: that is 502.
+    const res=await post('/api/search',{query:'no-such-title-anywhere'},cookie);
+    assert.ok([200,502].includes(res.status),`expected an answer, got ${res.status}`);
+    if(res.status===502) assert.match((await res.json()).error,/unavailable|failed|error/i);
+    // A genuinely invalid input is still the caller's fault.
+    const bad=await post('/api/search',{query:''},cookie);
+    assert.equal(bad.status,400,'an empty query is a bad request');
+  } finally { child.kill(); }
+});
+
+test('a stray rejection is reported and survived, not fatal',async()=>{
+ // The guard is the difference between a logged line and a dead server, so the
+ // test raises a real unhandled rejection in a child process and then checks
+ // that the child is still alive and still serving.
+ const net=require('node:net'),{spawn}=require('node:child_process');
+ const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));
+ const port=probe.address().port;await new Promise(r=>probe.close(r));
+ // Without the guard Node would be the one deciding, and it exits.
+ const script=`require(${JSON.stringify(__dirname+'/process-guard')}).installCrashGuard().install();
+   const http=require('node:http');
+   const server=http.createServer((req,res)=>res.end('alive')).listen(${port},'0.0.0.0',()=>{
+     Promise.reject(new Error('stray provider failure'));
+     setTimeout(()=>{ http.get('http://127.0.0.1:'+${port}+'/',r=>{r.resume();r.on('end',()=>process.exit(0))}).on('error',()=>process.exit(3)); },250);
+   });`;
+ const child=spawn(process.execPath,['-e',script],{stdio:['ignore','pipe','pipe']});
+ let out='';child.stdout.on('data',c=>out+=String(c));child.stderr.on('data',c=>out+=String(c));
+ const code=await new Promise(resolve=>child.once('exit',resolve));
+ assert.equal(code,0,`the process must still be able to finish its work; it exited ${code} with: ${out}`);
+ assert.match(out,/unhandled rejection: .*stray provider failure/,'and it says what happened');
+});
+
+test('without the guard that same rejection is fatal, so the test above can fail',async()=>{
+ // If this ever stops exiting non-zero, the guard test has lost its meaning and
+ // the two must be looked at together.
+ const {spawn}=require('node:child_process');
+ const child=spawn(process.execPath,['-e',"Promise.reject(new Error('unprotected'))"],{stdio:['ignore','pipe','pipe']});
+ const code=await new Promise(resolve=>child.once('exit',resolve));
+ assert.notEqual(code,0,'an unguarded unhandled rejection ends the process');
+});

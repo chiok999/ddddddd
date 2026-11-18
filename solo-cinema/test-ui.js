@@ -483,3 +483,82 @@ test('a catalog that cannot be reached renders an honest panel, not a broken pag
     assert.equal(d.querySelectorAll('#catalogRows .skeleton-card').length,0,'skeletons do not outlive the attempt');
   } finally { w.close(); }
 });
+
+test('a resume entry survives its title being filtered out of the current view', async () => {
+  // Regression: the continue row used to read each card's JSON copy of the item
+  // from the DOM, so a title hidden by the movies/shows filter lost its poster,
+  // type and episode context on the row that exists to resume it.
+  const html=fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8');
+  const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'});
+  const w=dom.window,d=w.document; w.scrollTo=()=>{};
+  const sections=[
+    {id:'popular-movies',title:'Popular movies',source:'Cinemeta',groups:['movies'],items:[
+      {id:'m1',title:'A Film',type:'movie',year:'2024',overview:'',poster:null,imdbId:'tt0111161',source:'cinemeta'}]},
+    {id:'popular-series',title:'Popular series',source:'Cinemeta',groups:['shows'],items:[
+      {id:'s1',title:'A Series',type:'series',year:'2021',overview:'',poster:null,imdbId:'tt0068646',source:'cinemeta'}]},
+  ];
+  w.fetch=async url=>({ok:true,json:async()=>{
+    if(url==='/api/session') return {authenticated:true};
+    if(url==='/api/discover') return {sections};
+    throw Error('unexpected '+url);
+  }});
+  w.localStorage.setItem('solo-progress',JSON.stringify([{url:'cinemeta:A Series',time:1200,duration:3600}]));
+  try {
+    w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));
+    w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));
+    await tick(); await tick(); await tick();
+    // Filter the page to movies only: the series rail is now hidden.
+    w.location.hash='#movies'; w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+    const card=d.querySelector('#continue-watching .catalog-card');
+    assert.ok(card,'the row still renders while the page is filtered');
+    assert.match(card.getAttribute('aria-label'),/A Series/,'the title survives the filter');
+    assert.match(card.querySelector('small').textContent,/33%/,'the progress percentage is real');
+    // The old code read the item back out of the card's dataset, which is gone
+    // once the filter hides it: the type collapsed to a guessed "Movie".
+    assert.match(card.querySelector('small').textContent,/Series/,'the type comes from catalog metadata, not a guess');
+    assert.doesNotMatch(card.querySelector('small').textContent,/Movie/,'a series must not be labelled a movie');
+  } finally { w.close(); }
+});
+
+test('leaving the watch page stops the encoder catch-up poll', async () => {
+  // Regression: the poll was a closure-scoped interval cleared only from inside
+  // its own callback, so leaving the page left it running forever.
+  const html=fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8');
+  const dom=new JSDOM(html,{url:'https://cinema.example/',runScripts:'outside-only'});
+  const w=dom.window,d=w.document; w.scrollTo=()=>{};
+  let live=0,cleared=0,statusCalls=0;
+  const realSet=w.setInterval,realClear=w.clearInterval;
+  w.setInterval=(fn,ms)=>{live++;return realSet(fn,ms);};
+  w.clearInterval=id=>{if(id!==null&&id!==undefined)cleared++;return realClear(id);};
+  w.HTMLMediaElement.prototype.pause=function(){}; w.HTMLMediaElement.prototype.load=function(){}; w.HTMLMediaElement.prototype.play=function(){return Promise.resolve();};
+  w.fetch=async(url,opts={})=>({ok:true,json:async()=>{
+    if(url==='/api/session') return {authenticated:true};
+    if(url==='/api/discover') return {sections:[]};
+    if(url==='/api/search') return {results:[{id:'a',title:'Film',type:'movie',source:'moviebox',year:'2024',overview:''}],providers:[]};
+    if(url==='/api/resolve') return {title:'Film',streams:[{provider:'moviebox',format:'file',quality:720,url:'/media/first'}]};
+    if(url==='/api/transcode') return {id:'job1',url:'/transcode/job1/master.m3u8'};
+    if(url==='/api/transcode/status'){statusCalls++;return {id:'job1',ahead:0,encoded:10,played:10};}
+    if(url==='/api/transcode/stop') return {stopped:true};
+    throw Error('unexpected '+url);
+  }});
+  try {
+    w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));
+    w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));
+    await tick();
+    d.getElementById('query').value='Film';
+    d.getElementById('searchForm').dispatchEvent(new w.Event('submit',{cancelable:true}));
+    await tick();
+    d.querySelector('.result').click();
+    await tick(); await tick();
+    // Report a stall so the catch-up poll starts.
+    const video=d.getElementById('video');
+    Object.defineProperty(video,'paused',{configurable:true,value:false});
+    w.troyReportPosition?w.troyReportPosition():null;
+    // Leave the page the way a viewer would.
+    d.getElementById('backToSearch').click();
+    await tick();
+    const before=statusCalls;
+    await new Promise(resolve=>setTimeout(resolve,1800));
+    assert.equal(statusCalls,before,'no status polling after leaving the watch page');
+  } finally { w.close(); }
+});

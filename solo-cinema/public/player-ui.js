@@ -44,7 +44,21 @@
   seek.addEventListener('input',()=>{const d=timelineDuration();if(!Number.isFinite(d)||d<=0)return;seeking=true;const p=Number(seek.value)/1000;$('playerProgress').style.width=`${p*100}%`;$('playerCurrent').textContent=fmt(p*d);poke();});
   seek.addEventListener('change',()=>{const d=timelineDuration();if(Number.isFinite(d)&&d>0){const t=Number(seek.value)/1000*d;if(window.troyTimeline)window.troyTimeline.seek(t);else video.currentTime=t;}seeking=false;updateTime();poke();});
   screen.addEventListener('mousemove',()=>{if(!locked)poke();});
-  function showAdjust(which){const el=$(which==='brightness'?'brightnessIndicator':'volumeIndicator');$('brightnessIndicator').classList.remove('visible');$('volumeIndicator').classList.remove('visible');el.classList.add('visible');screen.classList.remove('player-hide');clearTimeout(adjustTimer);adjustTimer=setTimeout(()=>{el.classList.remove('visible');poke();},700);}
+  // The brightness/volume pills are transient: they exist for the length of a
+  // gesture and must never outlive it. A stale `visible` class is what left a
+  // 100% brightness pill sitting over a video that had failed to start.
+  const adjustPills = ['brightnessIndicator','volumeIndicator'];
+  function hideAdjust(){for(const id of adjustPills) $(id).classList.remove('visible');}
+  function showAdjust(which){
+    hideAdjust();
+    $(which==='brightness'?'brightnessIndicator':'volumeIndicator').classList.add('visible');
+    screen.classList.remove('player-hide');
+    clearTimeout(adjustTimer);
+    adjustTimer=setTimeout(()=>{hideAdjust();poke();},700);
+  }
+  // Playback stopping is the end of any gesture in progress.
+  video.addEventListener('emptied',hideAdjust);
+  video.addEventListener('error',hideAdjust);
   function setBrightness(n){brightness=clamp(n,.15,1);$('playerDim').style.opacity=String(1-brightness);$('brightnessFill').style.height=`${(brightness-.15)/.85*100}%`;}
   function setVolume(n){video.volume=clamp(n,0,1);video.muted=false;$('volumeFill').style.height=`${video.volume*100}%`;}
   function ripple(id){const el=$(id);el.classList.remove('go');void el.offsetWidth;el.classList.add('go');}
