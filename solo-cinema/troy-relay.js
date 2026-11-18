@@ -189,7 +189,31 @@ async function runAssertions(workerBase, cdnBase) {
   }
   check('an unreachable relay produces one clear error', /Relay unreachable/.test(relayDown || ''), relayDown);
 
-  // 11. a bad signature fails closed through the client too
+  // 11. a rate limit is waited out by the deployed worker, not reported
+  let limited = 0;
+  const polite = http.createServer((req, res) => {
+    limited++;
+    if (limited <= 2) {
+      res.writeHead(427, { 'content-type': 'text/plain' });
+      return res.end('rate limited');
+    }
+    res.writeHead(206, { 'content-type': 'video/mp4', 'content-range': `bytes 0-1/${BODY.length}`, 'content-length': '2' });
+    res.end(BODY.slice(0, 2));
+  });
+  const politeBase = await listen(polite, 3313);
+  try {
+    const startWait = Date.now();
+    const response = await direct(`${politeBase}/movie.mp4`, { art: '1', range: 'bytes=0-1' });
+    const elapsed = Date.now() - startWait;
+    check('427 is retried inside the worker', response.headers.get('x-troy-status') === '206', response.headers.get('x-troy-status'));
+    check('the retry waited instead of hammering', elapsed >= 400, `${elapsed}ms`);
+    await response.body?.cancel();
+  } finally {
+    polite.closeAllConnections?.();
+    await new Promise((resolve) => polite.close(resolve));
+  }
+
+  // 12. a bad signature fails closed through the client too
   let badSignature = null;
   try {
     const wrong = createRelayRemote({ config: { origin: workerBase, path: '', secret: 'x'.repeat(32) }, send, direct: null });
@@ -199,7 +223,7 @@ async function runAssertions(workerBase, cdnBase) {
   }
   check('a wrong shared secret fails with 403', /403/.test(badSignature || ''), badSignature);
 
-  // 12. the deployed worker, if one was named
+  // 13. the deployed worker, if one was named
   if (DEPLOYED) {
     const health = await fetch(`${DEPLOYED.replace(/\/$/, '')}/health`);
     const healthBody = await health.json();

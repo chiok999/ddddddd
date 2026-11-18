@@ -103,6 +103,12 @@ signature, the provider headers a browser cannot set, and the range. The signatu
 is `HMAC-SHA256(RELAY_KEY, url)`; without it the worker refuses the request, so this
 is not an open proxy even if the URL leaks.
 
+`427`/`429` are waited out inside the worker (up to four attempts, twelve seconds,
+`Retry-After` honoured). A Worker's egress address is shared with every other
+Worker on Cloudflare, so these CDNs see it as an extremely busy client; the answer
+is to ask again shortly, not to give up. A status that survives every retry is
+marked `x-troy-retried: exhausted`.
+
 `art=1` is artifact mode. The worker answers `200` and puts the CDN's real status in
 `x-troy-status` (plus type, length, content-range, etag, last-modified,
 content-encoding). That matters because Troy's resume logic has to tell "the CDN

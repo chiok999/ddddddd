@@ -25,6 +25,9 @@ const RESPONSE_HEADERS = {
   'last-modified': 'x-troy-modified',
   'accept-ranges': 'x-troy-accept-ranges',
 };
+// Marks a response the worker retried and still saw rate-limited, so a slow
+// source can be told apart from a blocked one without reading the status.
+const RETRIED_HEADER = 'x-troy-retried';
 
 /** Read the two settings that turn the relay on, or null when it is off. */
 function relayConfig(env = process.env) {
@@ -96,6 +99,7 @@ function relayResponse(response, status) {
     body: response.body,
     url: response.url,
     relayed: true,
+    retried: response.headers.get(RETRIED_HEADER) === 'exhausted',
   };
 }
 
@@ -148,4 +152,4 @@ function createRelayRemote({ config, send, direct, fallback = false }) {
   };
 }
 
-module.exports = { relayConfig, relayUrl, sign, createRelayRemote, relayResponse, MIN_SECRET_LENGTH };
+module.exports = { relayConfig, relayUrl, sign, createRelayRemote, relayResponse, MIN_SECRET_LENGTH, RETRIED_HEADER };
