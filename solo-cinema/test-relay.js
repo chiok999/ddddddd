@@ -542,3 +542,70 @@ test('the relay listens on the port the panel assigned, never an invented one', 
   assert.match(result.stderr, /no port was assigned/);
   assert.match(result.stderr, /57395/, 'and points at the panel, using its own example');
 });
+
+// Ports are fixed so the assertions are exact. Parallel test files in this suite
+// run at once, so a busy port would be a flake rather than a bug in the relay.
+test('the relay reads the panel .env file, which is the only place the panel puts variables', async () => {
+  // Botkeep writes CINEMA_PASSWORD / PORT / TROY_RELAY_KEY to .env inside the
+  // container and exports nothing. A relay that only looked at process.env said
+  // "TROY_RELAY_KEY is not set" while the key was sitting in that file.
+  const fs = require('node:fs');
+  const { spawn } = require('node:child_process');
+  const dir = fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'troy-env-'));
+  const port = 4196;
+  fs.writeFileSync(require('node:path').join(dir, '.env'), [
+    '# written by the panel',
+    'CINEMA_PASSWORD=kunsauka123456789',
+    `PORT=${port}`,
+    `TROY_RELAY_KEY=${'panel-env-key-'.padEnd(32, 'e')}`,
+  ].join('\n'));
+  const child = spawn(process.execPath, [path.join(__dirname, 'troy-relay-server.js')], {
+    cwd: dir,
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !['PORT', 'TROY_RELAY_KEY', 'SERVER_PORT', 'TROY_RELAY_PORT'].includes(key))),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const output = await new Promise((resolve) => {
+      let text = '';
+      const timer = setTimeout(() => resolve(text), 8000);
+      child.stdout.on('data', (chunk) => {
+        text += String(chunk);
+        if (/listening/.test(text)) {
+          clearTimeout(timer);
+          resolve(text);
+        }
+      });
+      child.stderr.on('data', (chunk) => {
+        text += String(chunk);
+      });
+    });
+    assert.match(output, new RegExp(`listening: 0\\.0\\.0\\.0:${port}`), `output was:\n${output}`);
+    assert.match(output, /port from PORT/, 'and it says the value came from the file');
+    assert.match(output, /secret:    set/, 'the key was found without being exported');
+    const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+    assert.equal(health.signed, true);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => child.once('close', resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a real environment value still wins over the file', async () => {
+  const fs = require('node:fs');
+  const { spawnSync } = require('node:child_process');
+  const dir = fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'troy-env2-'));
+  fs.writeFileSync(require('node:path').join(dir, '.env'), 'TROY_RELAY_KEY=from-the-file-1234567890\nPORT=4195\n');
+  try {
+    // No port in the environment: the file's port is used, and the run fails for
+    // the port already being... nothing. Just check the parse, quickly.
+    const result = spawnSync(process.execPath, ['-e', `
+      require(${JSON.stringify(path.join(__dirname, 'troy-relay-server.js'))});
+      console.log(JSON.stringify({ key: process.env.TROY_RELAY_KEY, port: process.env.PORT }));
+    `], { cwd: dir, env: { ...process.env, TROY_RELAY_KEY: 'from-the-environment-123456', PORT: '' }, encoding: 'utf8', timeout: 15000 });
+    assert.match(result.stdout, /from-the-environment/, 'an exported value is not overwritten');
+    assert.doesNotMatch(result.stdout, /from-the-file/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

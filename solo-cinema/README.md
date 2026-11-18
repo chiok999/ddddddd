@@ -137,6 +137,12 @@ TROY_RELAY_KEY=<the same secret> PORT=57395 node troy-relay-server.js
 #   → listening: 0.0.0.0:57395   (port from PORT)
 #   → health:    http://localhost:57395/health
 
+**The panel does not export its variables.** Botkeep writes `CINEMA_PASSWORD`,
+`PORT` and `TROY_RELAY_KEY` to a `.env` file inside the container and says so on
+its Environment tab: *"Your application must load that file."* The relay loads
+`./.env` before it reads anything, so no shell wrapper and no `-r dotenv/config` is
+needed. A value that is really exported still wins over the file.
+
 The relay reads the port from `PORT`, `SERVER_PORT`, `TROY_RELAY_PORT`, or the port
 of `TROY_PUBLIC_URL`, in that order, and refuses to start (exit `78`) if none is
 set. It will not invent one: listening on a port nothing is routed to looks exactly
