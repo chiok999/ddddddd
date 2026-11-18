@@ -514,3 +514,31 @@ test('the relay says so when its port is already taken, instead of looping', asy
     await new Promise((resolve) => blocker.close(resolve));
   }
 });
+
+test('the relay listens on the port the panel assigned, never an invented one', async () => {
+  const { detectPort } = require('./troy-relay-server');
+  // Every name a panel might use. The value is what matters, not the spelling.
+  assert.deepEqual(detectPort({ PORT: '57395' }), { port: 57395, from: 'PORT' });
+  assert.deepEqual(detectPort({ SERVER_PORT: '57395' }), { port: 57395, from: 'SERVER_PORT' });
+  assert.deepEqual(detectPort({ TROY_RELAY_PORT: '57395' }), { port: 57395, from: 'TROY_RELAY_PORT' });
+  assert.deepEqual(detectPort({ TROY_PUBLIC_URL: 'http://node17.botkeep.cloud:57395' }), { port: 57395, from: 'TROY_PUBLIC_URL (its port)' });
+  // PORT wins over the others, because that is the one the panel routes.
+  assert.equal(detectPort({ PORT: '57395', TROY_RELAY_PORT: '4180' }).port, 57395);
+  // Nothing assigned is null, not a guess.
+  assert.equal(detectPort({}), null);
+  assert.equal(detectPort({ PORT: '', SERVER_PORT: 'x' }), null);
+  assert.equal(detectPort({ PORT: '70000' }), null, 'out of range');
+  assert.equal(detectPort({ TROY_PUBLIC_URL: 'http://node17.botkeep.cloud' }), null, 'no port in the URL');
+
+  // And the refusal is exit 78 with the panel's own example, not a silent 4180.
+  const { spawnSync } = require('node:child_process');
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'troy-relay-server.js')], {
+    cwd: __dirname,
+    env: { ...process.env, PORT: '', SERVER_PORT: '', TROY_RELAY_PORT: '', TROY_PUBLIC_URL: '', RELAY_URL: '', CINEMA_RELAY_URL: '', TROY_RELAY_KEY: 'port-check-key-'.padEnd(32, 'q') },
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+  assert.equal(result.status, 78);
+  assert.match(result.stderr, /no port was assigned/);
+  assert.match(result.stderr, /57395/, 'and points at the panel, using its own example');
+});

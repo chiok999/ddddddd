@@ -22,9 +22,21 @@
 //
 //   TROY_RELAY_KEY=<the same secret Troy uses> node troy-relay-server.js
 //
-// Options (all optional):
-//   PORT / TROY_RELAY_PORT=4180   listen port
-//   TROY_RELAY_HOST=0.0.0.0       listen address
+// THE PORT IS NOT YOURS TO CHOOSE. A panel assigns one and routes the outside
+// world to it, so the relay must listen on the assigned value. Every panel names
+// it differently, so all of the names below are read, in this order:
+//
+//   PORT                            Pterodactyl / Pelican, and most others
+//   SERVER_PORT                     Pterodactyl eggs that reserve PORT
+//   TROY_RELAY_PORT                 this project's own name
+//   TROY_PUBLIC_URL / RELAY_URL     a full URL; its port is used
+//
+// Nothing found means nothing is guessed: it refuses to start. Defaulting to
+// 4180 with no route to it looks like a working relay that never receives a
+// request, which is worse than a refusal.
+//
+// Other options:
+//   TROY_RELAY_HOST=0.0.0.0       listen address (must be 0.0.0.0 in a container)
 //   TROY_RELAY_ALLOW_PRIVATE=1    allow private/plain-http targets (tests only)
 //
 // The contract is ./worker/troy-relay.mjs. It is the same protocol, so a URL
@@ -286,7 +298,29 @@ function createRelayServer({ secret, allowPrivate = false, log = () => {} } = {}
  * That is the surest way around a panel that will only launch one file: no second
  * process, no second panel, no MAIN_FILE to change.
  */
-function start({ port = Number(process.env.PORT || process.env.TROY_RELAY_PORT || 4180), host = process.env.TROY_RELAY_HOST || '0.0.0.0', key = process.env.TROY_RELAY_KEY || '' } = {}) {
+
+/** Find the port the panel assigned, or null. Never invents one. */
+function detectPort(env = process.env) {
+  for (const name of ['PORT', 'SERVER_PORT', 'TROY_RELAY_PORT']) {
+    const value = String(env[name] || '').trim();
+    if (/^\d{1,5}$/.test(value)) {
+      const port = Number(value);
+      if (port >= 1 && port <= 65535) return { port, from: name };
+    }
+  }
+  for (const name of ['TROY_PUBLIC_URL', 'RELAY_URL', 'CINEMA_RELAY_URL']) {
+    const value = String(env[name] || '').trim();
+    if (!value) continue;
+    try {
+      const port = Number(new URL(value).port);
+      if (Number.isInteger(port) && port >= 1 && port <= 65535) return { port, from: `${name} (its port)` };
+    } catch { /* not a URL; keep looking */ }
+  }
+  return null;
+}
+
+function start({ port, host = process.env.TROY_RELAY_HOST || '0.0.0.0', key = process.env.TROY_RELAY_KEY || '' } = {}) {
+  const detected = port ? { port, from: 'argument' } : detectPort();
   const allowPrivate = ['1', 'true', 'yes'].includes(String(process.env.TROY_RELAY_ALLOW_PRIVATE || '').toLowerCase());
   const log = (line) => console.log(`[relay] ${line}`);
   if (typeof key !== 'string' || key.length < MIN_SECRET_LENGTH) {
@@ -297,25 +331,41 @@ function start({ port = Number(process.env.PORT || process.env.TROY_RELAY_PORT |
     process.exitCode = 78;
     return null;
   }
+  if (!detected) {
+    console.error('Troy relay will not start: no port was assigned.');
+    console.error('  The panel gives a container its port and routes the world to it. Look in');
+    console.error('  the panel for the allocated port (it is shown next to the server, as in');
+    console.error('  node17.botkeep.cloud:57395) and set it:');
+    console.error('    PORT=<that number> TROY_RELAY_KEY=<secret> node troy-relay-server.js');
+    console.error('  Guessing a port would listen somewhere nothing is routed to, which looks');
+    console.error('  like a working relay that never receives a request.');
+    process.exitCode = 78;
+    return null;
+  }
+  const assigned = detected.port;
   const server = createRelayServer({ secret: key, allowPrivate, log });
   server.on('error', (error) => {
     if (error.code === 'EADDRINUSE') {
-      console.error(`Troy relay cannot start: port ${port} is already in use on this container.`);
+      console.error(`Troy relay cannot start: port ${assigned} is already in use on this container.`);
       console.error('  Another copy is probably already running. Check:');
-      console.error(`    node -e "fetch('http://127.0.0.1:${port}/health').then(r=>r.text()).then(console.log)"`);
+      console.error(`    node -e "fetch('http://127.0.0.1:${assigned}/health').then(r=>r.text()).then(console.log)"`);
       console.error('  If that answers, this relay is already up and nothing is wrong.');
+    } else if (error.code === 'EACCES') {
+      console.error(`Troy relay cannot listen on port ${assigned}: permission denied.`);
+      console.error('  Ports below 1024 need root. Use the port the panel assigned.');
     } else console.error(`Troy relay failed to listen: ${error.message}`);
     process.exitCode = 1;
   });
-  server.listen(port, host, () => {
+  server.listen(assigned, host, () => {
     const shown = host === '0.0.0.0' || host === '::' ? 'localhost' : host;
     console.log('Troy relay is running');
-    console.log(`  listening: ${host}:${port}`);
+    console.log(`  listening: ${host}:${assigned}   (port from ${detected.from})`);
     console.log(`  secret:    set (${key.length} characters)`);
-    console.log(`  health:    http://${shown}:${port}/health`);
+    console.log(`  health:    http://${shown}:${assigned}/health`);
     console.log('');
-    console.log('  In Troy, on the other server:');
-    console.log(`    CINEMA_RELAY_URL=${process.env.TROY_PUBLIC_URL || `http://<this host>:${port}`}`);
+    console.log('  In Troy, on the other server, use the address the panel publishes,');
+    console.log('  which is NOT localhost -- it carries the assigned port:');
+    console.log(`    CINEMA_RELAY_URL=${process.env.TROY_PUBLIC_URL || `http://<this host>:${assigned}`}`);
     console.log('    CINEMA_RELAY_KEY=<the same secret>');
   });
   for (const signal of ['SIGTERM', 'SIGINT']) {
@@ -327,6 +377,6 @@ function start({ port = Number(process.env.PORT || process.env.TROY_RELAY_PORT |
   return server;
 }
 
-module.exports = { createRelayServer, checkTarget, sign, upstream, start };
+module.exports = { createRelayServer, checkTarget, sign, upstream, start, detectPort };
 
 if (require.main === module) start();
