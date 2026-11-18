@@ -48,6 +48,31 @@
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+
+// BOTKEEP DOES NOT EXPORT ITS VARIABLES TO THE PROCESS. The panel writes them to
+// a .env file inside the container and says so on the Environment tab: "your
+// application must load that file". Troy loads it; the relay did not, so the key
+// and the port were both invisible and it refused to start.
+//
+// Loaded first, before anything reads process.env. Real environment values keep
+// precedence, so a shell export still wins over the file.
+try {
+  process.loadEnvFile(path.join(process.cwd(), '.env'));
+} catch {
+  // Node before 20.12 has no loadEnvFile. Parse it the same way: KEY=VALUE, one
+  // per line, optional quotes, # comments. Never a shell, never evaluated.
+  try {
+    const text = fs.readFileSync(path.join(process.cwd(), '.env'), 'utf8');
+    for (const line of text.split(/\r?\n/)) {
+      const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+      if (!match) continue;
+      const value = match[2].trim().replace(/^(['"])([\s\S]*)\1$/, '$2');
+      if (process.env[match[1]] === undefined) process.env[match[1]] = value;
+    }
+  } catch { /* no .env file: the environment must supply everything */ }
+}
 
 const VERSION = '1';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
