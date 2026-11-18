@@ -172,9 +172,10 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
       if(active && active.sid!==sid)throw Object.assign(Error('Another session is watching; stop it first'),{status:409});
       if(active)await stop(active);
       if(!authorize(sid))throw Object.assign(Error('Session expired'),{status:401});
-      const next={sid,requestId,id:crypto.randomBytes(24).toString('base64url'),controller:new AbortController(),lastAccess:Date.now(),stopped:false,error:null,proc:null,dir:null,ready:false,readers:0,drainWaiters:[]};active=next;return next;
+      const next={sid,requestId,id:crypto.randomBytes(24).toString('base64url'),controller:new AbortController(),lastAccess:Date.now(),stopped:false,error:null,proc:null,dir:null,ready:false,readers:0,drainWaiters:[],offset:0,position:null,rungs:null};active=next;return next;
     });
     admission=claim.then(()=>{},()=>{});const job=await claim;
+    job.offset=seekOffset;
     const onDisconnect=()=>{void stop(job);};requestSignal?.addEventListener('abort',onDisconnect,{once:true});if(requestSignal?.aborted)onDisconnect();
     try{
       if(job.stopped)throw Error('Transcode stopped');
@@ -216,22 +217,98 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
       const videoOptions=encoder==='h264_rkmpp'
         ? ['-c:v','h264_rkmpp','-rc_mode','CBR']
         : ['-c:v','libx264','-preset','veryfast','-threads','1'];
-      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,...videoOptions,'-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames','expr:gte(t,n_forced*4)','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
-      const pacing=seekOffset>0?['-readrate','3','-readrate_initial_burst',String(Math.ceil(seekOffset+12)),'-ss',String(seekOffset)]:['-readrate','3'];
-      const args=['-hide_banner','-loglevel','error','-nostdin','-filter_threads','1',...pacing,'-threads','2','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...output(426,240,'250k','48k','240'),...output(640,360,'600k','64k','360')];
+      // Two rungs, and FFmpeg must never write a segment before it is complete:
+      // a half-written playlist is what makes a player re-request and jump back.
+      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,...videoOptions,'-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-g','48','-keyint_min','48','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
+      // Pacing was the lag. `-readrate 3` reads the source at three times real
+      // time and never faster, so on a title that only needs 1.4x to keep up the
+      // encoder is deliberately starved and the player outruns it. With two HLS
+      // rungs that starvation is guaranteed.
+      //
+      // Instead: read as fast as the encoder can, and hold the line that matters
+      // -- how far ahead of the player playback is. That is a runtime decision,
+      // so it is made here from the playback position the client reports, and it
+      // needs no device-specific tuning.
+      const headroom=Math.max(2,Math.min(30,Math.round(Number(process.env.CINEMA_LEAD_SECONDS||12))));
+      const target=Math.min(1.2,Math.max(0.2,Number(process.env.CINEMA_PACE_TARGET||0.85)));
+      const lead=(seekOffset||0)+headroom;
+      const pacing=['-readrate',String(target),'-readrate_initial_burst',String(Math.ceil(lead)),...(seekOffset>0?['-ss',String(seekOffset)]:[])];
+      // Two rungs cost two encodes. On a small box the 240p one is enough to
+      // start, and both are only worth encoding while the CPU has room.
+      const rungs=String(process.env.CINEMA_LADDER||'240,360').split(',').map(r=>r.trim()).filter(r=>['240','360'].includes(r));
+      const outputs=[];
+      for(const rung of (rungs.length?rungs:['360'])) outputs.push(...output(rung==='240'?426:640,rung==='240'?240:360,rung==='240'?'250k':'600k',rung==='240'?'48k':'64k',rung));
+      const args=['-hide_banner','-loglevel','error','-nostdin','-filter_threads','1',...pacing,'-threads','2','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...outputs];
       job.proc=spawn(binary,args,{stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
       job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
       job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);
       job.monitor=setInterval(()=>{if(!job.stopped && job.ready && job.proc?.exitCode!==null && Date.now()-job.lastAccess>idleMs){job.error='Conversion expired after inactivity';void stop(job);}},2000);job.monitor.unref();
+      // Ready means "there is something complete to play", not "a playlist
+      // exists". Starting on a playlist with no finished segment is what makes a
+      // player show an error and restart -- and restarting is the "seek back to
+      // where I was" the viewer sees. Two finished segments is the minimum a
+      // player can start on without immediately stalling.
+      const rungDirs=rungs.length?rungs:['360'];
+      async function finishedSegments(dir){
+        try{
+          const list=await fsp.readFile(path.join(job.dir,dir,'index.m3u8'),'utf8');
+          return (list.match(/^index\d+\.ts$/gm)||[]).length;
+        }catch{return 0;}
+      }
       const deadline=Date.now()+(seekOffset ? Math.max(startupMs,180000+Math.ceil(seekOffset*1000)) : startupMs);
-      while(Date.now()<deadline && !job.stopped){if(job.error)throw Error(job.error);const ready=await Promise.all(['240','360'].map(d=>fsp.stat(path.join(job.dir,d,'index.m3u8')).then(s=>s.size>0,()=>false)));if(ready.every(Boolean)){job.ready=true;job.lastAccess=Date.now();return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate.duration || null,offset:seekOffset};}await interval(250);}
+      while(Date.now()<deadline && !job.stopped){
+        if(job.error)throw Error(job.error);
+        const counts=await Promise.all(rungDirs.map(finishedSegments));
+        if(counts.every(n=>n>=2)){job.ready=true;job.lastAccess=Date.now();job.rungs=rungDirs;return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate.duration || null,offset:seekOffset,rungs:rungDirs};}
+        await interval(200);
+      }
       throw Error(job.error || 'Transcode did not start in time');
     }catch(err){await stop(job);if(job.dir)await fsp.rm(job.dir,{recursive:true,force:true}).catch(()=>{});if(err.code==='ENOSPC'||err.code==='EDQUOT')throw Error('Temporary filesystem is full or its quota has been exceeded');throw err;}finally{requestSignal?.removeEventListener('abort',onDisconnect);}
   }
   function get(id,sid){if(!active || active.id!==id || active.sid!==sid || active.stopped)return null;active.lastAccess=Date.now();return active;}
+  // How far playback has got, per job, in source seconds since the job's start.
+  // The client owns this number; the server only remembers it, because pacing is
+  // the one decision that needs both ends.
+  function reportPosition(id,sid,position){
+    const job=get(id,sid);if(!job)return null;
+    if(typeof position==='number' && Number.isFinite(position) && position>=0 && position<86400) job.position={seconds:position,at:Date.now()};
+    return job.position || null;
+  }
+  /**
+   * The honest answer to "is the encoder ahead of the player": how many seconds
+   * of finished output exist, measured from the playlist itself, against where
+   * the player is. If this is negative, playback is outrunning the encoder and
+   * the player should wait rather than stall, error, and restart.
+   */
+  async function status(id,sid){
+    const job=get(id,sid);if(!job)return null;
+    const rungs=job.rungs || ['240','360'];
+    const counts={};
+    for(const rung of rungs){
+      try{
+        const list=await fsp.readFile(path.join(job.dir,rung,'index.m3u8'),'utf8');
+        const segments=(list.match(/^index\d+\.ts$/gm)||[]).length;
+        const duration=[...list.matchAll(/#EXTINF:([\d.]+)/g)].reduce((total,m)=>total+Number(m[1]),0);
+        counts[rung]={segments,encoded:Number(duration.toFixed(2))};
+      }catch{counts[rung]={segments:0,encoded:0};}
+    }
+    const encoded=Math.min(...Object.values(counts).map(rung=>rung.encoded));
+    const offset=job.offset || 0;
+    const played=job.position ? Math.max(0,Number(job.position.seconds)||0) : 0;
+    const ahead=Number((offset+encoded-(offset+played)).toFixed(2));
+    return {encoded,ahead,playing:played,position:offset+played,rungs:counts,finished:job.proc?.exitCode===0};
+  }
   async function read(id,sid,part){const job=get(id,sid);if(!job)return null;
-    if(part==='master.m3u8')return {type:'application/vnd.apple.mpegurl',data:Buffer.from('#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=350000,RESOLUTION=426x240\n240/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=750000,RESOLUTION=640x360\n360/index.m3u8\n')};
+    if(part==='master.m3u8'){
+      const rows=job.rungs || ['240','360'];
+      const lines=['#EXTM3U','#EXT-X-VERSION:3'];
+      for(const rung of rows){
+        lines.push(rung==='240'?'#EXT-X-STREAM-INF:BANDWIDTH=350000,RESOLUTION=426x240':'#EXT-X-STREAM-INF:BANDWIDTH=750000,RESOLUTION=640x360');
+        lines.push(`${rung}/index.m3u8`);
+      }
+      return {type:'application/vnd.apple.mpegurl',data:Buffer.from(`${lines.join('\n')}\n`)};
+    }
     if(!/^(240|360)\/(?:index\.m3u8|index\d+\.ts)$/.test(part))return null;
     job.readers++;
     try{const file=path.join(job.dir,part),stat=await fsp.stat(file);if(!stat.isFile() || stat.size>(part.endsWith('.m3u8')?1024*1024:16*1024*1024))throw Error('Transcode output is too large');return {type:part.endsWith('.m3u8')?'application/vnd.apple.mpegurl':'video/mp2t',data:await fsp.readFile(file)};}catch(e){if(e.code==='ENOENT')return null;throw e;}
@@ -242,6 +319,6 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=600000, 
   async function stopAny(){const action=admission.then(async()=>{if(!active)return false;await stop(active);return true;});admission=action.then(()=>{},()=>{});return action;}
   async function stopSession(sid){if(active?.sid===sid)await stop(active);for(const [id,failure] of failures)if(failure.sid===sid)failures.delete(id);}
   function status(id,sid){if(active && active.id===id && active.sid===sid && !active.stopped){active.lastAccess=Date.now();return {active:true,error:null};}const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
-  return {start,read,stopFor,stopRequest,stopSession,stopAny,status,close:()=>stop(active)};
+  return {start,read,stopFor,stopRequest,stopSession,stopAny,status,reportPosition,close:()=>stop(active)};
 }
 module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg,staticFfmpegExpectedPath,hardwareAvailable,probeCapabilities,videoEncoder};

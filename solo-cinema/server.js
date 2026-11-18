@@ -306,7 +306,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/transcode/status' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});
       const data=await body(req);if(typeof data.id!=='string' || !/^[A-Za-z0-9_-]{32}$/.test(data.id))return send(res,400,{error:'Invalid job ID'});
-      const status=transcoder.status(data.id,sid);if(!status)return send(res,404,{error:'Conversion unavailable'});return send(res,200,status);
+      // The client reports where playback is, so the reply can say how far ahead
+      // the encoder really is instead of guessing.
+      const position=Number(data.position);
+      const status=await transcoder.status(data.id,sid);if(!status)return send(res,404,{error:'Conversion unavailable'});
+      if(Number.isFinite(position) && position>=0) transcoder.reportPosition(data.id,sid,position);
+      return send(res,200,status);
     }
     if (url.pathname === '/api/transcode/stop' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});const data=await body(req);if(typeof data.id!=='string')return send(res,400,{error:'Missing job ID'});
