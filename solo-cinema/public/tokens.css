@@ -724,6 +724,31 @@ main {
 .catalog-status { color: var(--text-400); font-size: var(--text-xs); padding: var(--space-3) 0; }
 .more-cards { align-self: flex-start; margin-left: var(--space-1); font-size: var(--text-2xs); }
 
+/* --- One row, opened as a page -------------------------------------------- */
+
+/* The rail becomes a grid: the same card, wrapping, at a density that suits a
+   full page rather than a horizontal strip. */
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--card-w), 1fr));
+  gap: var(--space-5) var(--card-gap);
+  padding: var(--space-4) var(--space-1);
+}
+/* The header puts the way back beside the title, not above it. */
+#view-catalog .page-heading { flex-direction: row; align-items: center; gap: var(--space-4); flex-wrap: wrap; }
+#view-catalog .page-heading > div { display: flex; flex-direction: column; gap: var(--space-1); }
+#view-catalog .page-heading h2 { font-size: var(--text-2xl); font-weight: 700; letter-spacing: -0.01em; }
+#view-catalog .page-heading #catalogNote:empty { display: none; }
+/* A card in the grid must not keep the rail's fixed width, or the grid tracks
+   fight the card and leave ragged gaps. */
+.catalog-grid .catalog-card { width: auto; flex: initial; }
+.catalog-footer { display: flex; justify-content: center; padding: var(--space-6) 0 var(--space-8); }
+.catalog-footer:empty { display: none; }
+/* "See more" is the only way to reach the rest of a row, so it must not depend
+   on a hover that a touch screen cannot perform. */
+.row-more { opacity: 1; }
+.row-head:hover .row-more { color: var(--text-100); }
+
 /* The row container: spacing and grouping only, the rail inside it scrolls. */
 .catalog-section { display: flex; flex-direction: column; gap: var(--space-2); }
 

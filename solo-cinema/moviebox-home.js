@@ -18,7 +18,10 @@ function normalizeHome(json) {
     }
     if(!items.length) continue;
     const groups=[...new Set(items.map(i=>i.type==='movie'?'movies':'shows'))]; if(items.some(i=>i.anime)) groups.push('anime');
-    result.push({id:`moviebox-${result.length}`,title,source:'MovieBox',groups,items,error:null});
+    // The row's identifier is what expands it into the full list; rows without
+    // one already ship their complete set, so the client shows no "see more".
+    const genreTopId=/^\d{1,25}$/.test(String(row.genreTopId||''))?String(row.genreTopId):null;
+    result.push({id:`moviebox-${result.length}`,title,source:'MovieBox',groups,items,error:null,genreTopId});
     if(result.length>=18) break;
   }
   return result;

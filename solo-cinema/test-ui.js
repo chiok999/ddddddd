@@ -639,8 +639,133 @@ test('a portrait frame still fills the screen in fullscreen',async()=>{
  };
  const inWindow=winners({portrait:true,fullscreen:false});
  assert.ok(inWindow,/height\s*:/.test(inWindow.body),'a windowed portrait frame is capped');
+ // Whatever chain of portrait rules exists, a pinned shape included, the height
+ // that wins while fullscreen must be the fullscreen one. Comparing the winning
+ // rule is exactly the bug: a portrait rule with more classes used to win.
  const inFullscreen=winners({portrait:true,fullscreen:true});
+ assert.match(inFullscreen.selector,/:fullscreen/,`fullscreen must win the height, not ${inFullscreen.selector}`);
  assert.match(inFullscreen.body,/aspect-ratio\s*:\s*auto/,'fullscreen frees the frame from the ratio');
  assert.match(inFullscreen.body,/height\s*:\s*100%/,'and fullscreen fills the screen');
- assert.ok(inFullscreen.score>=inWindow.score,`the fullscreen rule must not lose to .portrait (${inFullscreen.score} vs ${inWindow.score})`);
+});
+
+test('every home row offers a way to see the rest of it, and the list it opens pages',async()=>{
+ // A rail shows ~20 titles with no way past them. Each row now has "See more",
+ // which opens the same row as a full page and asks for the next page.
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window,d=w.document;w.scrollTo=()=>{};
+ w.Hls=class{static isSupported(){return false}};
+ const sections=[
+  {id:'moviebox-0',title:'Trending now',source:'MovieBox',groups:['movies'],genreTopId:'1234',items:[{id:'a1',title:'One',type:'movie',year:'2024',source:'moviebox',poster:null}]},
+  {id:'moviebox-1',title:'Coming soon',source:'MovieBox',groups:['movies'],genreTopId:null,items:[{id:'b1',title:'Two',type:'movie',year:'2024',source:'moviebox',poster:null}]},
+ ];
+ const pages={};
+ // Wait for the promise chain behind a click to drain, without a fixed sleep.
+ const settle=async()=>{ for(const _ of [0,1,2,3,4,5,6,7,8,9]) await tick(); };
+ w.fetch=async(url,init)=>{
+  if(url==='/api/session') return {ok:true,json:async()=>({authenticated:true})};
+  if(url==='/api/discover') return {ok:true,json:async()=>({sections})};
+  if(url==='/api/category'){
+   // post() already stringifies, so the body arrives as text.
+   // The body must be JSON text by the time it reaches fetch.
+   assert.equal(typeof init.body,'string','the request body is serialised, not a raw object');
+   const {genreTopId,page}=JSON.parse(init.body); pages[page]=(pages[page]||0)+1;
+   const items=page===1?[{id:'p1',title:'Page one',type:'movie',year:'2024',source:'moviebox',poster:null}]:[{id:'p2',title:'Page two',type:'movie',year:'2024',source:'moviebox',poster:null}];
+   return {ok:true,json:async()=>({items,hasMore:page===1,page})};
+  }
+  return {ok:true,json:async()=>({})};
+ };
+ try{
+  w.eval(fs.readFileSync(path.join(__dirname,'public/fallback.js'),'utf8'));
+  w.eval(fs.readFileSync(path.join(__dirname,'public/app.js'),'utf8'));
+  await tick(); await tick();
+
+  const rows=[...d.querySelectorAll('#catalogRows .catalog-section')];
+  const more=rows.map(row=>row.querySelector('.row-more'));
+  assert.equal(more.filter(Boolean).length,rows.length,'every row has the control, not some of them');
+  // A row that cannot page has nothing honest to offer, so it is hidden rather
+  // than opening a page that would only repeat what the rail already showed.
+  assert.equal(more[0].hidden,false,'a pageable row shows it');
+  assert.equal(more[0].getAttribute('aria-label'),'See more in Trending now');
+  assert.equal(more[1].hidden,true,'a row with no identifier does not');
+
+  more[0].click(); await settle();
+  assert.ok(!d.getElementById('view-catalog').classList.contains('hidden'),'the list opens');
+  assert.ok(d.getElementById('view-home').classList.contains('hidden'));
+  assert.equal(d.getElementById('catalogTitle').textContent,'Trending now');
+  assert.deepEqual([...d.getElementById('catalogGrid').querySelectorAll('.catalog-card strong')].map(n=>n.textContent),['Page one']);
+  assert.equal(d.getElementById('catalogMore').hidden,false,'there is more to load');
+  assert.equal(pages[1],1);
+
+  d.getElementById('catalogMore').click(); await settle();
+  assert.deepEqual([...d.getElementById('catalogGrid').querySelectorAll('.catalog-card strong')].map(n=>n.textContent),['Page one','Page two'],'the second page is appended, not replacing');
+  assert.equal(d.getElementById('catalogMore').hidden,true,'the end of the list hides the button');
+  assert.match(d.getElementById('catalogFooter').textContent,/everything/i,'and says so');
+  assert.equal(d.getElementById('catalogNote').textContent,'2 titles');
+
+  d.getElementById('catalogBack').click(); await settle();
+  assert.ok(!d.getElementById('view-home').classList.contains('hidden'),'back returns to home');
+ }finally{w.close()}
+});
+
+test('the viewer can override the aspect ratio, and the choice survives a reload',async()=>{
+ // Fitting the picture is the right default, but it is not what a viewer always
+ // wants, so the shapes are also selectable. 4:3 and 4:5 are the two the boxes
+ // are built around; 16:9 forces the frame back to widescreen for a letterboxed
+ // file that reports a taller shape.
+ const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'}),w=dom.window,d=w.document;w.scrollTo=()=>{};w.Hls=class{static isSupported(){return false}};
+ const v=d.getElementById('video'),screen=d.getElementById('screen');
+ Object.defineProperties(v,{paused:{get:()=>true},duration:{get:()=>100},buffered:{get:()=>({length:0,start:()=>0,end:()=>0})},videoWidth:{get:()=>640},videoHeight:{get:()=>480}});
+ v.play=()=>Promise.resolve();v.pause=()=>{};v.load=()=>{};
+ w.eval(fs.readFileSync(path.join(__dirname,'public/player-ui.js'),'utf8'));
+ const frame=()=>screen.style.getPropertyValue('--player-ratio');
+ const openMenu=()=>{d.getElementById('playerSettings').click();};
+ const rows=()=>[...d.getElementById('playerMenuRows').querySelectorAll('.player-menu-row')];
+ const pick=(label)=>{const row=rows().find(r=>r.firstChild.textContent===label);assert.ok(row,`a "${label}" row`);row.click();};
+ try{
+  // The control is reachable from the main menu, not buried in advanced settings.
+  openMenu();
+  const aspectRow=rows().find(r=>r.firstChild.textContent==='Aspect ratio');
+  assert.ok(aspectRow,'the main menu offers it');
+  assert.match(aspectRow.textContent,/Fit picture/,'and shows what is currently selected');
+  aspectRow.click();
+  assert.deepEqual(rows().slice(1).map(r=>r.firstChild.textContent),['Fit picture','Widescreen','Classic','Vertical']);
+
+  // 4:3 for a 4:3 file: pinned even though it matches the file.
+  pick('Classic');
+  assert.equal(frame(),'4:3');
+  assert.equal(screen.classList.contains('aspect-fixed'),true);
+  assert.equal(screen.classList.contains('portrait'),false);
+
+  // 4:5 is portrait, so the height cap must apply with the pinned shape too.
+  openMenu(); pick('Aspect ratio'); pick('Vertical');
+  assert.equal(frame(),'4:5');
+  assert.equal(screen.classList.contains('portrait'),true,'a pinned vertical shape still caps its height');
+
+  // 16:9 overrides a 4:3 file that reports itself as 4:3.
+  openMenu(); pick('Aspect ratio'); pick('Widescreen');
+  assert.equal(frame(),'16:9');
+  assert.equal(screen.classList.contains('portrait'),false);
+
+  // Back to following the file: choosing it applies the source shape at once
+  // rather than waiting for the next metadata event.
+  openMenu(); pick('Aspect ratio'); pick('Fit picture');
+  assert.equal(frame(),'640 / 480','auto follows the source again immediately');
+  assert.equal(screen.classList.contains('aspect-fixed'),false,'and is no longer pinned');
+  // A source going away while following the file clears the frame.
+  v.dispatchEvent(new w.Event('emptied'));
+  assert.equal(frame(),'','an empty player has no shape to claim');
+
+  // The choice is remembered, so it is not re-picked every session.
+  openMenu(); pick('Aspect ratio'); pick('Classic');
+  assert.equal(w.localStorage.getItem('solo-aspect-ratio'),'4:3');
+
+  // A second load reads it back before any metadata arrives.
+  const dom2=new JSDOM(fs.readFileSync(path.join(__dirname,'public/index.html'),'utf8'),{url:'https://cinema.example/',runScripts:'outside-only'});
+  const w2=dom2.window; w2.scrollTo=()=>{}; w2.Hls=class{static isSupported(){return false}};
+  w2.localStorage.setItem('solo-aspect-ratio','4:5');
+  w2.eval(fs.readFileSync(path.join(__dirname,'public/player-ui.js'),'utf8'));
+  const screen2=w2.document.getElementById('screen');
+  w2.document.getElementById('video').dispatchEvent(new w2.Event('loadedmetadata'));
+  assert.equal(screen2.style.getPropertyValue('--player-ratio'),'4:5','a reload keeps the chosen shape');
+  dom2.window.close();
+ }finally{w.close()}
 });

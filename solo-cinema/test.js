@@ -860,3 +860,39 @@ test('without the guard that same rejection is fatal, so the test above can fail
  const code=await new Promise(resolve=>child.once('exit',resolve));
  assert.notEqual(code,0,'an unguarded unhandled rejection ends the process');
 });
+
+test('a category page returns the provider order, signals more, and stops at the end',async()=>{
+ // "See more" is worthless if it cannot actually go past the ~20 titles a home
+ // row ships with, so this drives the real route against the fixture twice.
+ const net=require('node:net'),{spawn}=require('node:child_process');
+ const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));
+ const port=probe.address().port;await new Promise(r=>probe.close(r));
+ const child=spawn(process.execPath,['--require',require('node:path').join(__dirname,'test-fixtures/mock-upstream.cjs'),'server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),CINEMA_PASSWORD:'fixture-password-123'},stdio:['ignore','pipe','pipe']});
+ try{
+  await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('exit',reject);});
+  const base=`http://127.0.0.1:${port}`;
+  const post=(path,data,cookie)=>fetch(base+path,{method:'POST',headers:{origin:base,'content-type':'application/json',...(cookie?{cookie}:{})},body:JSON.stringify(data)});
+  const login=await post('/api/login',{password:'fixture-password-123'});
+  const cookie=login.headers.get('set-cookie').split(';')[0];
+
+  const first=await (await post('/api/category',{genreTopId:'1234',page:1},cookie)).json();
+  assert.deepEqual(first.items.map(i=>i.title),['Cat 1','Cat 2','Cat 3'],'the provider order is preserved');
+  assert.equal(first.hasMore,true,'a full page that is not the last says there is more');
+  assert.ok(first.items.every(i=>typeof i.id==='string' && i.id.length>10),'each title is bound to this session');
+  assert.equal(first.items[0].genreTopId,undefined,'provider bookkeeping does not leak to the client');
+
+  const second=await (await post('/api/category',{genreTopId:'1234',page:2},cookie)).json();
+  assert.deepEqual(second.items.map(i=>i.title),['Cat 4','Cat 5']);
+  assert.equal(second.hasMore,false,'the last page says so');
+
+  const empty=await (await post('/api/category',{genreTopId:'9999',page:1},cookie)).json();
+  assert.deepEqual(empty.items,[],'an empty list is answered, not thrown');
+  assert.equal(empty.hasMore,false);
+
+  // Invalid input is the caller's mistake, not a provider failure.
+  assert.equal((await post('/api/category',{genreTopId:'../../etc/passwd'},cookie)).status,400);
+  assert.equal((await post('/api/category',{genreTopId:'1234',page:0},cookie)).status,400);
+  assert.equal((await post('/api/category',{genreTopId:'1234',page:'2'},cookie)).status,400);
+  assert.equal((await post('/api/category',{genreTopId:'1234'},{})).status,401);
+ }finally{child.kill();}
+});

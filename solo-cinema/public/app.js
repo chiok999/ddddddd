@@ -105,10 +105,10 @@ $('dataSaver').onclick=()=>{dataSaver=!dataSaver;try{localStorage.setItem('solo-
 
 function directControls(show){for(const id of ['directTransport','directPlayerbar','directHint']) $(id).classList.toggle('hidden',!show);}
 function showRoute(name, updateHash=true) {
-  if(!['home','movies','shows','anime','search','watch','list'].includes(name)) name='home';
+  if(!['home','movies','shows','anime','search','watch','list','catalog'].includes(name)) name='home';
   const previous=route; route=name;
   const view=['movies','shows','anime'].includes(name)?'home':name;
-  for(const id of ['home','search','watch','list']) $('view-'+id).classList.toggle('hidden',id!==view);
+  for(const id of ['home','search','watch','list','catalog']) $('view-'+id).classList.toggle('hidden',id!==view);
   document.querySelectorAll('[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===name));
   document.querySelectorAll('#catalogRows .catalog-section').forEach(el=>{
     const filtered=['movies','shows','anime'].includes(name);
@@ -120,9 +120,13 @@ function showRoute(name, updateHash=true) {
   if(updateHash && location.hash!=='#'+name) location.hash=name;
   if(typeof window.scrollTo==='function') window.scrollTo(0,0);
 }
-window.addEventListener('hashchange',()=>showRoute(location.hash.slice(1),false));
+window.addEventListener('hashchange',()=>{
+  const catalog=parseCatalogHash(location.hash.slice(1));
+  if(catalog){ showRoute('catalog',false); if(!catalogState || catalogState.genreTopId!==catalog.genreTopId) loadCatalog(catalog.genreTopId,catalog.title); return; }
+  showRoute(location.hash.slice(1),false);
+});
 $('backToSearch').onclick=()=>showRoute(watchReturn);
-function loggedIn(on) { $('login').classList.toggle('hidden', on); $('app').classList.toggle('hidden', !on); $('logout').classList.toggle('hidden', !on); $('dataSaver').classList.toggle('hidden', !on); $('mainNav').classList.toggle('hidden', !on); if (on) { render(); showRoute(location.hash.slice(1)||'home',false); loadDiscovery(); } }
+function loggedIn(on) { $('login').classList.toggle('hidden', on); $('app').classList.toggle('hidden', !on); $('logout').classList.toggle('hidden', !on); $('dataSaver').classList.toggle('hidden', !on); $('mainNav').classList.toggle('hidden', !on); if (on) { render(); const catalog=parseCatalogHash(location.hash.slice(1)); if(catalog){ showRoute('catalog',false); loadCatalog(catalog.genreTopId,catalog.title); } else showRoute(location.hash.slice(1)||'home',false); loadDiscovery(); } }
 $('loginForm').onsubmit = async e => { e.preventDefault(); $('loginError').textContent = ''; try { await post('/api/login', {password:$('password').value}); $('password').value=''; loggedIn(true); } catch (err) { $('loginError').textContent=err.message; } };
 $('logout').onclick = async () => { try { await post('/api/logout', {}); } catch(err) { $('playError').textContent='Sign out failed: '+err.message; return; } stopTranscode(); ++searchSequence; ++resolveSequence; ++discoveryEpoch; discoveryLoaded=false; selected=null; episodes=[]; fallback.cancel(); directControls(true); current=null; pendingFailure=null; if(uploadUrl){ URL.revokeObjectURL(uploadUrl); uploadUrl=null; uploadTrack=null; } $('server').replaceChildren(new Option('No sources yet','')); $('server').disabled=true; $('back10').disabled=true; $('forward10').disabled=true; updateNext(); if (hls) hls.destroy(); $('video').pause(); $('video').removeAttribute('src'); $('video').load(); $('video').classList.add('hidden'); $('placeholder').classList.remove('hidden'); $('playing').textContent='Nothing playing yet'; $('selection').classList.add('hidden'); $('results').replaceChildren(); $('streams').replaceChildren(); $('playError').textContent=''; loggedIn(false); };
 function render() {
@@ -613,6 +617,76 @@ function renderContinueRow(root){
   root.prepend(row);
 }
 
+// ── One home row, opened as a page ──────────────────────────────────────────
+// The row on home is a window onto a longer list the provider keeps behind its
+// own identifier. "See more" asks for that list a page at a time; nothing here
+// re-sorts or filters it, because the provider's order is the row's order.
+let catalogState=null, catalogRequest=0;
+function catalogPath(genreTopId,title){ return genreTopId ? `catalog:${genreTopId}:${encodeURIComponent(title||'')}` : 'home'; }
+function parseCatalogHash(hash){
+  const match=/^catalog:([^:]+)(?::(.*))?$/.exec(hash||'');
+  if(!match || !/^\d{1,25}$/.test(match[1])) return null;
+  let title='Category';
+  try { title=decodeURIComponent(match[2]||'') || title; } catch {}
+  return { genreTopId:match[1], title };
+}
+function openCatalog(genreTopId,title){
+  if(!genreTopId) return;
+  showRoute('catalog');
+  location.hash=catalogPath(genreTopId,title);
+  loadCatalog(genreTopId,title);
+}
+function renderCatalogPage(state,page){
+  const grid=$('catalogGrid');
+  for(const item of page.items) grid.append(titleCard(item,!!item.anime));
+  state.page=page.page; state.hasMore=page.hasMore; state.loaded+=page.items.length;
+  $('catalogNote').textContent=state.loaded?`${state.loaded} title${state.loaded===1?'':'s'}`:'';
+  if(!state.loaded){ const empty=document.createElement('p'); empty.className='catalog-status'; empty.textContent='This list is empty right now.'; grid.append(empty); }
+  $('catalogMore').disabled=false;
+  $('catalogMore').hidden=!page.hasMore;
+  if(!page.hasMore){ const end=document.createElement('span'); end.id='catalogEnd'; end.className='catalog-status'; end.textContent=state.loaded?'That is everything in this list.':'Nothing to load.'; $('catalogFooter').append(end); }
+}
+async function fetchCatalogPage(genreTopId,page){
+  // post(), not api() with a bare body: fetch would serialise an object to the
+  // string "[object Object]" and the server would answer 400.
+  const result=await post('/api/category',{genreTopId,page});
+  if(!Array.isArray(result.items)) throw Error('The catalog returned an unexpected answer');
+  return {items:result.items.filter(item=>item && typeof item.title==='string' && item.id),hasMore:result.hasMore===true,page:Number(result.page)||page};
+}
+async function loadCatalog(genreTopId,title,{page=1,append=false}={}){
+  if(!/^\d{1,25}$/.test(String(genreTopId||''))) return;
+  const request=++catalogRequest;
+  if(!append){
+    catalogState={genreTopId,title:title||'Category',page:0,hasMore:true,loaded:0};
+    $('catalogTitle').textContent=catalogState.title;
+    $('catalogNote').textContent='';
+    $('catalogGrid').replaceChildren();
+    $('catalogFooter').replaceChildren($('catalogMore'));
+    $('catalogMore').hidden=false;
+    $('catalogMore').disabled=true;
+  }
+  if(!catalogState || catalogState.genreTopId!==genreTopId) return;
+  try{
+    const result=await fetchCatalogPage(genreTopId,page);
+    // A slow first page must not paint over a category the viewer already left.
+    if(request!==catalogRequest) return;
+    renderCatalogPage(catalogState,result);
+  }catch(error){
+    if(request!==catalogRequest) return;
+    $('catalogMore').disabled=false;
+    if(append){ const note=document.createElement('p'); note.className='catalog-status'; note.textContent=error.message; $('catalogFooter').append(note); return; }
+    $('catalogGrid').replaceChildren();
+    const panel=document.createElement('div'); panel.className='panel';
+    const heading=document.createElement('h2'); heading.textContent='Could not load this list';
+    const note=document.createElement('p'); note.className='panel-note'; note.textContent=error.message;
+    const retry=document.createElement('button'); retry.type='button'; retry.className='secondary'; retry.textContent='Try again';
+    retry.onclick=()=>{retry.disabled=true;loadCatalog(genreTopId,title);};
+    panel.append(heading,note,retry); $('catalogGrid').append(panel);
+  }
+}
+$('catalogMore').onclick=()=>{ if(!catalogState || !catalogState.hasMore) return; $('catalogMore').disabled=true; loadCatalog(catalogState.genreTopId,catalogState.title,{page:catalogState.page+1,append:true}); };
+$('catalogBack').onclick=()=>showRoute('home');
+
 let discoveryLoading=false, discoveryLoaded=false;
 async function loadDiscovery(){
   if(discoveryLoading || discoveryLoaded) return; discoveryLoading=true; const epoch=discoveryEpoch;
@@ -633,7 +707,18 @@ async function loadDiscovery(){
       if(!section.items.length){ const empty=document.createElement('p'); empty.className='catalog-status'; empty.textContent=section.error || 'No titles available right now.'; rail.append(empty); }
       row.append(rail);
       const more=document.createElement('button'); more.type='button'; more.className='more-cards secondary'; more.hidden=true;
-      more.onclick=()=>{row.dataset.expanded='true';refreshCards();}; row.append(more); root.append(row);
+      more.onclick=()=>{row.dataset.expanded='true';refreshCards();}; row.append(more);
+      // Every row gets a way out of the rail. Rows the provider can page get the
+      // full list; the rest open the same list showing what the rail holds, so
+      // the control is in the same place on every row instead of appearing on
+      // some and not others.
+      const seeMore=document.createElement('button'); seeMore.type='button'; seeMore.className='row-more'; seeMore.textContent='See more ›';
+      seeMore.setAttribute('aria-label',`See more in ${label}`);
+      seeMore.disabled=!section.genreTopId;
+      if(!section.genreTopId) seeMore.hidden=true;
+      seeMore.onclick=()=>openCatalog(section.genreTopId,label);
+      heading.append(seeMore);
+      root.append(row);
     }
     renderContinueRow(root);
     renderBillboard(pickBillboard(data.sections));
