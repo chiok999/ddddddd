@@ -130,9 +130,17 @@ It opens the CDN, streams the answer out and forgets it. That is why it fits on 
 container that cannot run Troy itself.
 
 ```sh
-# on the relay host
-TROY_RELAY_KEY=<the same secret> PORT=4180 node troy-relay-server.js
-#   → health: http://<that host>:4180/health
+# on the relay host. The port is the one YOUR panel assigned -- a panel routes the
+# outside world to that port and to nothing else. It is shown beside the server,
+# as in node17.botkeep.cloud:57395.
+TROY_RELAY_KEY=<the same secret> PORT=57395 node troy-relay-server.js
+#   → listening: 0.0.0.0:57395   (port from PORT)
+#   → health:    http://localhost:57395/health
+
+The relay reads the port from `PORT`, `SERVER_PORT`, `TROY_RELAY_PORT`, or the port
+of `TROY_PUBLIC_URL`, in that order, and refuses to start (exit `78`) if none is
+set. It will not invent one: listening on a port nothing is routed to looks exactly
+like a working relay that never receives a request.
 
 **`troy-relay-server.js: not found` (exit code 127)** means the file was run as a
 program rather than with node, or it is not in the directory the panel starts in.
@@ -157,7 +165,7 @@ run unsigned, and says so. If its port is taken it says that too, instead of
 restarting in a loop.
 
 # on Troy
-CINEMA_RELAY_URL=http://<that host>:4180
+CINEMA_RELAY_URL=http://node17.botkeep.cloud:57395
 CINEMA_RELAY_KEY=<the same secret>
 ```
 
