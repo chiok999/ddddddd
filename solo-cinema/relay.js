@@ -46,6 +46,13 @@ function relayStatus(env = process.env) {
   }
 }
 
+// A relay can legitimately live on the same machine (bot-keep, or a plain node
+// process beside the app), so a loopback host is allowed when it is asked for by
+// name. Every other private address stays refused, because those values come
+// from an environment an operator pasted into and a typo should not become an
+// open door into the LAN.
+const RELAY_PRIVATE_ALLOWED = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+
 function relayConfig(env = process.env) {
   const base = String(env.CINEMA_RELAY_URL || '').trim();
   if (!base) return null;
@@ -59,10 +66,16 @@ function relayConfig(env = process.env) {
   } catch {
     throw Error('CINEMA_RELAY_URL is not a valid URL');
   }
-  if (parsed.protocol !== 'https:') throw Error('CINEMA_RELAY_URL must use https');
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw Error('CINEMA_RELAY_URL must be http or https');
   if (parsed.username || parsed.password) throw Error('CINEMA_RELAY_URL must not contain credentials');
+  // Plain HTTP is allowed because a relay can sit on another machine of your own
+  // (a second panel, a box on your LAN, this one). The secret is then never put
+  // in the URL: the same signature travels in a header instead, so the shared
+  // key cannot leak into a log or a referrer. The https path keeps the query
+  // form, which is what the deployed Worker understands and needs no re-paste.
+  const inQuery = parsed.protocol === 'https:';
   const path = parsed.pathname.replace(/\/+$/, '');
-  return { origin: parsed.origin, path, secret };
+  return { origin: parsed.origin, path, secret, inQuery };
 }
 
 function sign(secret, target) {
@@ -76,7 +89,7 @@ function sign(secret, target) {
 function relayUrl(config, target, context = {}) {
   const params = new URLSearchParams();
   params.set('url', target);
-  params.set('sig', sign(config.secret, target));
+  if (config.inQuery !== false) params.set('sig', sign(config.secret, target));
   // Artifact mode: the worker answers 200 and reports the CDN's real status in
   // a header, so a CDN 426 stays distinguishable from a relay fault.
   params.set('art', '1');
@@ -87,6 +100,11 @@ function relayUrl(config, target, context = {}) {
   if (context.range) params.set('range', context.range);
   if (context.ifRange) params.set('ifrange', context.ifRange);
   return `${config.origin}${config.path}/?${params}`;
+}
+
+/** The signature as a header, for relays reached over plain HTTP. */
+function relayHeaders(config, target) {
+  return config.inQuery === false ? { 'x-troy-sig': sign(config.secret, target) } : {};
 }
 
 function headerValue(headers, name) {
@@ -142,7 +160,7 @@ function createRelayRemote({ config, send, direct, fallback = false }) {
     });
     let response;
     try {
-      response = await send(request, { accept: 'application/octet-stream' }, signal);
+      response = await send(request, { accept: 'application/octet-stream', ...relayHeaders(config, target) }, signal);
     } catch (error) {
       if (signal?.aborted) throw error;
       if (fallback && direct) return direct(url, headers, signal);
@@ -178,4 +196,4 @@ function createRelayRemote({ config, send, direct, fallback = false }) {
   };
 }
 
-module.exports = { relayConfig, relayStatus, relayUrl, sign, createRelayRemote, relayResponse, MIN_SECRET_LENGTH, RETRIED_HEADER, HEALTH_STATUSES };
+module.exports = { relayConfig, relayStatus, relayUrl, relayHeaders, sign, createRelayRemote, relayResponse, MIN_SECRET_LENGTH, RETRIED_HEADER, HEALTH_STATUSES };
