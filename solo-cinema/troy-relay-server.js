@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 'use strict';
 // Troy relay for bot-keep.
 //
@@ -6,20 +7,32 @@
 // no media kept in memory. Each request opens the CDN, streams the response out
 // and forgets it. Memory use is one chunk at a time.
 //
+// RUN IT WITH NODE. A panel that says `troy-relay-server.js: not found` (exit
+// code 127) ran the file as if it were a program: either the file is not in the
+// directory the panel runs from, or the panel used `./troy-relay-server.js`
+// instead of an interpreter. Use:
+//
+//   node troy-relay-server.js
+//
+// Exit codes on purpose:
+//   0    stopped on a signal
+//   1    an exception
+//   78   no TROY_RELAY_KEY, or too short. Refusing to start is the point: an
+//        unsigned relay is an open proxy. (EX_CONFIG)
+//
 //   TROY_RELAY_KEY=<the same secret Troy uses> node troy-relay-server.js
 //
 // Options (all optional):
-//   PORT=4180                 listen port
-//   TROY_RELAY_HOST=0.0.0.0   listen address
-//   TROY_RELAY_ALLOW_PRIVATE=1   let it fetch private/plain-http targets (tests)
+//   PORT / TROY_RELAY_PORT=4180   listen port
+//   TROY_RELAY_HOST=0.0.0.0       listen address
+//   TROY_RELAY_ALLOW_PRIVATE=1    allow private/plain-http targets (tests only)
 //
-// Contract with Troy: ./worker/troy-relay.mjs. It is the same program, so a URL
-// signed for the Cloudflare Worker works here unchanged, and the same
-// CINEMA_RELAY_KEY works for both. Nothing in the Worker was weakened to make
-// this possible: only the transport is different.
+// The contract is ./worker/troy-relay.mjs. It is the same protocol, so a URL
+// signed for the Cloudflare Worker works here unchanged and the same
+// CINEMA_RELAY_KEY works for both.
 //
-// This file is the whole relay. It has no dependencies -- not undici, not axios,
-// nothing from npm -- so it runs on any Node 18+ the bot host already has.
+// No dependencies -- not undici, not axios, nothing from npm -- so it runs on any
+// Node 18+ the bot host already has.
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
@@ -32,6 +45,7 @@ const RATE_LIMITED = new Set([427, 429]);
 const RETRY_DELAYS_MS = [400, 900, 1800, 3000];
 const RETRY_BUDGET_MS = 12000;
 const PASS_THROUGH_HEADERS = ['content-type', 'content-length', 'content-range', 'content-encoding', 'etag', 'last-modified', 'accept-ranges'];
+const MIN_SECRET_LENGTH = 16;
 
 const PRIVATE_SUFFIXES = ['.localhost', '.local', '.internal', '.home.arpa', '.lan', '.intranet'];
 const isIpLiteral = (host) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.startsWith('[') || host.includes(':');
@@ -154,13 +168,19 @@ const json = (status, message, extra = {}) => ({
   body: JSON.stringify(message),
 });
 
+/**
+ * @param {{secret?: string, allowPrivate?: boolean, log?: Function}} options
+ */
 function createRelayServer({ secret, allowPrivate = false, log = () => {} } = {}) {
   return http.createServer(async (request, response) => {
     const reply = (result) => {
       response.writeHead(result.status, result.headers);
       if (result.stream) {
+        // A CDN that hangs up mid-body must close this response too, not leave a
+        // half-sent body that the player reads as corruption.
         result.stream.on('error', () => response.destroy());
         result.stream.on('aborted', () => response.destroy());
+        response.on('close', () => result.stream.destroy());
         result.stream.pipe(response);
       } else response.end(result.body ?? '');
     };
@@ -169,7 +189,7 @@ function createRelayServer({ secret, allowPrivate = false, log = () => {} } = {}
       if (request.method === 'OPTIONS') {
         response.writeHead(204, {
           'access-control-allow-origin': '*',
-          'access-control-allow-headers': 'range, if-range, accept',
+          'access-control-allow-headers': 'range, if-range, accept, x-troy-sig',
           'access-control-allow-methods': 'GET, OPTIONS',
           'access-control-max-age': '86400',
         });
@@ -247,7 +267,7 @@ function createRelayServer({ secret, allowPrivate = false, log = () => {} } = {}
         if (value) artifact[to] = String(value).replace(/[\r\n]+/g, ' ');
       }
       if (RATE_LIMITED.has(result.status)) artifact['x-troy-retried'] = 'exhausted';
-      log(`${result.status} ${contentType} ${result.headers['content-length'] || '-'}`);
+      log(`${result.status} ${contentType} ${result.headers['content-length'] || '-'}${range ? ` range=${range}` : ''}`);
       return reply({ status: 200, headers: artifact, stream: result.status === 204 || result.status === 304 ? null : result.stream });
     } catch (error) {
       log(`relay error: ${String(error?.message || error).slice(0, 160)}`);
@@ -257,21 +277,45 @@ function createRelayServer({ secret, allowPrivate = false, log = () => {} } = {}
   });
 }
 
-const PORT = Number(process.env.PORT || process.env.TROY_RELAY_PORT || 4180);
-const HOST = process.env.TROY_RELAY_HOST || '0.0.0.0';
-const allowPrivate = ['1', 'true', 'yes'].includes(String(process.env.TROY_RELAY_ALLOW_PRIVATE || '').toLowerCase());
-const log = (line) => console.log(`[relay] ${line}`);
-
-function start() {
-  const server = createRelayServer({ secret: process.env.TROY_RELAY_KEY || '', allowPrivate, log });
-  server.listen(PORT, HOST, () => {
+/**
+ * Start the relay. Exported and callable so a host that already has a process can
+ * start it from its own entry file:
+ *
+ *   require('./troy-relay-server').start();
+ *
+ * That is the surest way around a panel that will only launch one file: no second
+ * process, no second panel, no MAIN_FILE to change.
+ */
+function start({ port = Number(process.env.PORT || process.env.TROY_RELAY_PORT || 4180), host = process.env.TROY_RELAY_HOST || '0.0.0.0', key = process.env.TROY_RELAY_KEY || '' } = {}) {
+  const allowPrivate = ['1', 'true', 'yes'].includes(String(process.env.TROY_RELAY_ALLOW_PRIVATE || '').toLowerCase());
+  const log = (line) => console.log(`[relay] ${line}`);
+  if (typeof key !== 'string' || key.length < MIN_SECRET_LENGTH) {
+    console.error('Troy relay will not start.');
+    console.error(`  TROY_RELAY_KEY is ${key ? `too short (${key.length} characters)` : 'not set'}.`);
+    console.error(`  Set it to at least ${MIN_SECRET_LENGTH} characters -- the same value as Troy's CINEMA_RELAY_KEY.`);
+    console.error('  An unsigned relay is an open proxy, so refusing to start is deliberate.');
+    process.exitCode = 78;
+    return null;
+  }
+  const server = createRelayServer({ secret: key, allowPrivate, log });
+  server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE') {
+      console.error(`Troy relay cannot start: port ${port} is already in use on this container.`);
+      console.error('  Another copy is probably already running. Check:');
+      console.error(`    node -e "fetch('http://127.0.0.1:${port}/health').then(r=>r.text()).then(console.log)"`);
+      console.error('  If that answers, this relay is already up and nothing is wrong.');
+    } else console.error(`Troy relay failed to listen: ${error.message}`);
+    process.exitCode = 1;
+  });
+  server.listen(port, host, () => {
+    const shown = host === '0.0.0.0' || host === '::' ? 'localhost' : host;
     console.log('Troy relay is running');
-    console.log(`  listening: ${HOST}:${PORT}`);
-    console.log(`  secret:    ${process.env.TROY_RELAY_KEY ? 'set' : 'MISSING -- every request will be refused'}`);
-    console.log(`  health:    http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/health`);
+    console.log(`  listening: ${host}:${port}`);
+    console.log(`  secret:    set (${key.length} characters)`);
+    console.log(`  health:    http://${shown}:${port}/health`);
     console.log('');
-    console.log('  Give Troy this:');
-    console.log(`    CINEMA_RELAY_URL=${process.env.TROY_PUBLIC_URL || `http://localhost:${PORT}`}`);
+    console.log('  In Troy, on the other server:');
+    console.log(`    CINEMA_RELAY_URL=${process.env.TROY_PUBLIC_URL || `http://<this host>:${port}`}`);
     console.log('    CINEMA_RELAY_KEY=<the same secret>');
   });
   for (const signal of ['SIGTERM', 'SIGINT']) {

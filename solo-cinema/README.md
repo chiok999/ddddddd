@@ -134,6 +134,28 @@ container that cannot run Troy itself.
 TROY_RELAY_KEY=<the same secret> PORT=4180 node troy-relay-server.js
 #   → health: http://<that host>:4180/health
 
+**`troy-relay-server.js: not found` (exit code 127)** means the file was run as a
+program rather than with node, or it is not in the directory the panel starts in.
+Check both:
+
+```sh
+ls -l troy-relay-server.js     # must exist here; otherwise cd to solo-cinema/
+node troy-relay-server.js      # always run it with node
+```
+
+If two servers cannot be started at all, use the other form. It runs the relay
+inside a process that is already starting, so the panel needs no second app:
+
+```js
+require('./troy-relay-server').start();   // in the bot's entry file
+```
+
+That needs nothing but `TROY_RELAY_KEY` in that process's environment.
+
+The relay refuses to start without a usable key (exit `78`, EX_CONFIG) rather than
+run unsigned, and says so. If its port is taken it says that too, instead of
+restarting in a loop.
+
 # on Troy
 CINEMA_RELAY_URL=http://<that host>:4180
 CINEMA_RELAY_KEY=<the same secret>
