@@ -287,7 +287,16 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/source' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });
       const data = await readJsonBody(req);
-      return send(res, 200, { url: remember(data.url, sid, null, data.format === 'hls' ? 'hls' : null) });
+      // A rejected URL is the caller's mistake, not an upstream failure, so it
+      // must answer 400. safeUrl throws a plain Error, and the generic handler
+      // would otherwise classify it as a provider fault.
+      let handle;
+      try {
+        handle = remember(data.url, sid, null, data.format === 'hls' ? 'hls' : null);
+      } catch (error) {
+        throw new HttpError(400, error.message || 'Only public HTTPS URLs are allowed');
+      }
+      return send(res, 200, { url: handle });
     }
     if (url.pathname === '/api/source/probe' && req.method === 'POST') {
       if (!authorized) return send(res,401,{error:'Login required'});

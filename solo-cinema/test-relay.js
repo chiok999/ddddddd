@@ -10,6 +10,19 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { once } = require('node:events');
 const { relayConfig, relayUrl, relayHeaders, sign, createRelayRemote } = require('./relay');
+
+// Fixed port numbers made these tests collide with a relay left over from the
+// previous run (or with a parallel file). Ask the OS for a free one instead; a
+// fixed number is a claim about the machine, not about the code.
+const freePort = async () => {
+  const net = require('node:net');
+  const server = net.createServer();
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+};
 const { resumableInput } = require('./resumable-input');
 
 const WORKER = path.join(__dirname, 'worker', 'troy-relay.mjs');
@@ -461,10 +474,10 @@ test('the relay refuses to start without a usable secret, and says why', async (
 });
 
 test('the relay can be started from a host entry file that already runs', async () => {
+  const port = await freePort();
   // A panel that launches one file is the reason this exists: no second process,
   // no MAIN_FILE change. require(...).start() must come up and answer /health.
   const { spawn, spawnSync } = require('node:child_process');
-  const port = 4198;
   const entry = path.join(__dirname, 'tmp-entry-check.js');
   require('node:fs').writeFileSync(entry, "require('./troy-relay-server').start();\n");
   const child = spawn(process.execPath, [entry], {
@@ -494,9 +507,9 @@ test('the relay can be started from a host entry file that already runs', async 
 });
 
 test('the relay says so when its port is already taken, instead of looping', async () => {
+  const port = await freePort();
   const { spawn, spawnSync } = require('node:child_process');
   const net = require('node:net');
-  const port = 4197;
   const blocker = net.createServer(() => {});
   blocker.listen(port, '127.0.0.1');
   await once(blocker, 'listening');
@@ -546,13 +559,13 @@ test('the relay listens on the port the panel assigned, never an invented one', 
 // Ports are fixed so the assertions are exact. Parallel test files in this suite
 // run at once, so a busy port would be a flake rather than a bug in the relay.
 test('the relay reads the panel .env file, which is the only place the panel puts variables', async () => {
+  const port = await freePort();
   // Botkeep writes CINEMA_PASSWORD / PORT / TROY_RELAY_KEY to .env inside the
   // container and exports nothing. A relay that only looked at process.env said
   // "TROY_RELAY_KEY is not set" while the key was sitting in that file.
   const fs = require('node:fs');
   const { spawn } = require('node:child_process');
   const dir = fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'troy-env-'));
-  const port = 4196;
   fs.writeFileSync(require('node:path').join(dir, '.env'), [
     '# written by the panel',
     'CINEMA_PASSWORD=kunsauka123456789',
