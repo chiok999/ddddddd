@@ -25,7 +25,7 @@ async function loadWorker(options) {
 // A provider CDN that behaves like the one in production: 426 to a client that
 // does not look like a browser, real 206s to one that does, and a mid-body
 // disconnect so resume logic can be exercised.
-async function fixture({ drop = false, rateLimit = 0 } = {}) {
+async function fixture({ drop = false, rateLimit = 0, requireBrowser = true } = {}) {
   // rateLimit: refuse this many requests with 427 before serving, the way an
   // nginx `limit_req_status 427` does when the bucket is full.
   let limited = 0;
@@ -47,7 +47,7 @@ async function fixture({ drop = false, rateLimit = 0 } = {}) {
       res.writeHead(427, { 'content-type': 'text/plain' });
       return res.end('rate limited');
     }
-    if (!/Mozilla\/5\.0/.test(req.headers['user-agent'] || '')) {
+    if (requireBrowser && !/Mozilla\/5\.0/.test(req.headers['user-agent'] || '')) {
       res.writeHead(426, { 'content-type': 'text/plain' });
       return res.end('upgrade');
     }
@@ -119,7 +119,8 @@ test('the relay keeps range semantics, which is what seeking and resume need', a
 });
 
 test('provider headers reach the CDN through the relay and nothing else leaks', async () => {
-  const cdn = await fixture();
+  // The browser gate is off here so the provider's own User-Agent can be checked.
+  const cdn = await fixture({ requireBrowser: false });
   otherBase = cdn.base;
   try {
     const handler = await loadWorker({ allowPrivate: true });
@@ -253,10 +254,13 @@ test('a rate limit that never clears is reported as a rate limit', async () => {
   try {
     const handler = await loadWorker({ allowPrivate: true });
     const remote = createRelayRemote({ config: { origin: 'http://worker', path: '', secret: SECRET }, send: (url) => handler(new Request(url)), direct: null });
-    const response = await remote(`${cdn.base}/movie.mp4`, { 'accept-encoding': 'identity' }, undefined);
-    assert.equal(response.status, 427, 'the status survives, not turned into 502');
-    assert.equal(response.retried, true, 'and it is marked as having been retried');
-    await response.body.cancel();
+    // A health problem is thrown with the real status, so the router can decide
+    // to use another route instead of showing a failure.
+    await assert.rejects(remote(`${cdn.base}/movie.mp4`, { 'accept-encoding': 'identity' }, undefined), (error) => {
+      assert.equal(error.status, 427, 'the status survives, not turned into 502');
+      assert.equal(error.relayFailure, true);
+      return true;
+    });
     // Bounded: one original plus four waits, not an unbounded loop.
     assert.equal(cdn.requests.length, 5, `attempts: ${cdn.requests.length}`);
   } finally { await cdn.close(); }
@@ -299,11 +303,9 @@ test('the retry loop is bounded even when the CDN keeps asking for longer', asyn
     const handler = await loadWorker({ allowPrivate: true });
     const remote = createRelayRemote({ config: { origin: 'http://worker', path: '', secret: SECRET }, send: (url) => handler(new Request(url)), direct: null });
     const started = Date.now();
-    const response = await remote(`http://127.0.0.1:${server.address().port}/movie.mp4`, {}, undefined);
-    assert.equal(response.status, 427);
+    await assert.rejects(remote(`http://127.0.0.1:${server.address().port}/movie.mp4`, {}, undefined), (error) => error.status === 427);
     assert.ok(Date.now() - started < 30000, 'honoured the retry-after clamp rather than an hour');
     assert.ok(seen >= 1 && seen <= 5, `attempts: ${seen}`);
-    await response.body.cancel();
   } finally { server.closeAllConnections?.(); await new Promise((resolve) => server.close(resolve)); }
 });
 

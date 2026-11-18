@@ -55,19 +55,24 @@ const {dir:transcodeTmp,reason:transcodeTmpReason}=resolveTranscodeTmp();
 // The direct path: this machine's address, pinned to public DNS answers.
 const directRemote=async(url,headers,signal)=>(await getRemote(url,headers,signal,fetch,agent,h2Agent)).response;
 // Some CDNs refuse this machine's address outright (426 for every protocol and
-// header combination), so the bytes are read through a Cloudflare Worker whose
-// address is not refused. Off unless CINEMA_RELAY_URL and CINEMA_RELAY_KEY are
-// both set; see relay.js and worker/troy-relay.mjs. CINEMA_RELAY_FALLBACK=1
-// additionally lets a dead relay fall back to the direct path rather than
-// failing the source.
-let relay=null,relayError=null;
-try{relay=require('./relay').relayConfig();}catch(error){relayError=error.message;}
-const remote=relay ? require('./relay').createRelayRemote({
+// header combination); others accept it but rate-limit it, or rate-limit the
+// Worker's shared egress instead. Which of the two is currently healthy is a
+// property of the CDN and the minute, not of the code, so both routes are kept
+// and the one that answers is chosen per fetch. See route.js.
+const {relayStatus}=require('./relay');
+const {config:relay,error:relayError}=relayStatus();
+const relayRemote=relay ? require('./relay').createRelayRemote({
   config:relay,
   send:(url,headers,signal)=>fetch(url,{dispatcher:agent,headers,redirect:'manual',signal}),
   direct:directRemote,
-  fallback:['1','true','yes'].includes(String(process.env.CINEMA_RELAY_FALLBACK||'').toLowerCase()),
-}) : directRemote;
+}) : null;
+const routes=require('./route').createRouter({
+  direct:directRemote,
+  relay:relayRemote,
+  order:relay ? ['relay','direct'] : ['direct'],
+  remember:['1','true','yes'].includes(String(process.env.CINEMA_ROUTE_MEMORY||'1').toLowerCase()),
+});
+const remote=routes.remote;
 const openSource=require('./source-opener').createSourceOpener({safeUrl,remote});
 const transcoder=require('./transcode').createTranscoder({open:openSource,tmpdir:transcodeTmp,authorize:sid=>(sessions.get(sid)||0)>=Date.now()});
 // Provider API responses are bounded, redirects are forbidden, and credentials
@@ -147,7 +152,7 @@ const server = http.createServer(async (req, res) => {
       res.setHeader('Set-Cookie', `cinema=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : ''}`);
       return send(res, 200, { ok: true });
     }
-    if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized });
+    if (url.pathname === '/api/session' && req.method === 'GET') return send(res, 200, { authenticated: !!authorized, routes: routes.status() });
     if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(sid); await transcoder.stopSession(sid); res.setHeader('Set-Cookie', 'cinema=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'); return send(res, 200, { ok: true }); }
     if (url.pathname === '/api/discover' && req.method === 'GET') {
       if (!authorized) return send(res,401,{error:'Login required'});
@@ -237,6 +242,11 @@ const server = http.createServer(async (req, res) => {
       const season=Number(data.season),episode=Number(data.episode);
       const result=await resolveTitle(selected,season,episode);
       for (const [id, entry] of captionSources) if (entry.expires<Date.now()) captionSources.delete(id);
+      // The player has to know which route is being used before it commits to a
+      // conversion, or it pays a full 12-second rate-limit wait to learn that the
+      // other route was free. One bounded request per distinct host establishes
+      // that, and the router remembers the answer for ten minutes.
+      if (result.streams.length) await routes.prefetch(result.streams.map(stream => stream.url));
       const streams = result.streams.map(stream => {
         let captionId=null;
         if(stream.captionInfo && captionSources.size<1000){ captionId=crypto.randomBytes(20).toString('base64url'); captionSources.set(captionId,{sid,info:stream.captionInfo,provider:stream.provider.startsWith('movy:')?'movy':stream.provider==='7movies'?'7movies':'moviebox',expires:Date.now()+6*3600000}); }
@@ -341,9 +351,9 @@ server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => {
         console.warn('            Point CINEMA_FFMPEG at it.');
       }
     });
-  if (relay) console.log(`  relay:    on  ${relay.origin}${relay.path}/  (source bytes fetched by Cloudflare)`);
-  else if (relayError) console.warn(`  relay:    NOT USABLE\n            ${relayError}`);
-  else console.log('  relay:    off (direct fetch from this address)');
+  if (relay) console.log(`  routes:   relay first  ${relay.origin}${relay.path}/  then this address if it fails`);
+  else if (relayError) console.warn(`  routes:   direct only (relay unusable: ${relayError})`);
+  else console.log('  routes:   direct only (no relay configured)');
   const free = freeBytes(transcodeTmp);
   console.log(`  temp:     ${transcodeTmp}  [${transcodeTmpReason}]` + (free === null ? '' : `  ${(free / 1073741824).toFixed(1)} GB free`));
   if (filesystemType(transcodeTmp) === TMPFS_MAGIC) {

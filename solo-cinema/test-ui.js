@@ -52,8 +52,9 @@ test('UI searches, lists sources, and switches after fatal playback errors', asy
     instances[3].emit('error',{fatal:true,details:'failed'}); await tick(); // The final message must name each provider that was tried, and count them.
     const finalText=w.document.getElementById('playError').textContent;
     assert.match(finalText,/No source could be played/);
-    assert.match(finalText,/Tried 2 sources: moviebox/);
-    assert.match(finalText,/vaplayer/);
+    assert.match(finalText,/Tried 2 sources from moviebox \(file\), vaplayer \(file\)/);
+    // A reason that names a cause rather than repeating a bare status code.
+    assert.match(finalText,/Converted playback failed/,finalText);
   } finally {w.close();}
 });
 

@@ -88,14 +88,36 @@ function recordProvider(name,success){if(!name)return;const stat=providerStats.g
 // resolve through different provider mixes, which is why one can fail and the
 // other not -- the list makes that visible.
 let attemptErrors=[];
+// A status code alone tells the viewer nothing. Name the cause, and say whether
+// it is worth pressing play again -- retrying a 404 forever is what makes a bug
+// look like a hang.
+const STATUS_MEANING={
+  404:'the link has expired, the provider no longer has this file',
+  403:'the provider refused the request (wrong or missing Referer, or a stale link)',
+  410:'the provider removed this file',
+  426:'the provider refused this server, and the relay too',
+  427:'the CDN is rate-limiting this connection',
+  429:'the CDN is rate-limiting this connection',
+  451:'the provider blocks requests from this network or country',
+  502:'the CDN did not answer',
+  503:'the CDN did not answer',
+  504:'the CDN did not answer in time',
+};
+function explainFailure(reason){
+  const text=String(reason||'failed');
+  const code=Number(/(?:^|\D)(4\d\d|5\d\d)(?![\d])/.exec(text)?.[1]);
+  const meaning=code && STATUS_MEANING[code];
+  const transient=[426,427,429,502,503,504].includes(code);
+  return {text:meaning?`${meaning} (${code})`:text, transient, code};
+}
 const fallback = createFallback((item, index, total, fail, isActive) => {
   if(index===0) attemptErrors=[];
   $('playError').textContent=index ? `Trying another source (${index+1}/${total})…` : '';
   playItem(item, ()=>{
     if(isActive()){
       recordProvider(item.provider,false);
-      const reason=String(lastTranscodeError||'failed').replace(/https?:\/\/\S+/g,'[source]');
-      attemptErrors.push(`${item.provider||'Direct'}${item.format?' ('+item.format+')':''}: ${reason}`);
+      const reason=explainFailure(String(lastTranscodeError||'failed').replace(/https?:\/\/\S+/g,'[source]'));
+      attemptErrors.push({provider:`${item.provider||'Direct'}${item.format?' ('+item.format+')':''}`,...reason});
       fail();
     }
   }, index>0, isActive);
@@ -104,8 +126,15 @@ const fallback = createFallback((item, index, total, fail, isActive) => {
   const video=$('video');video.pause();video.removeAttribute('src');video.load();
   // Name every provider that was tried: episodes and movies resolve through
   // different provider mixes, so the list is what shows which engine failed.
-  const summary=attemptErrors.length>1 ? ` Tried ${attemptErrors.length} sources: ${attemptErrors.join(' · ')}` : '';
-  $('playError').textContent='No source could be played. '+lastTranscodeError+summary;
+  const providers=[...new Set(attemptErrors.map(error=>error.provider))];
+  const unique=[...new Map(attemptErrors.map(error=>[error.text,error])).values()];
+  const transient=attemptErrors.length>0 && attemptErrors.every(error=>error.transient);
+  const head=transient
+    ? 'Every source is rate-limited right now. Press play again in a minute; nothing is broken.'
+    : 'No source could be played.';
+  const detail=unique.length?` ${unique.map(error=>error.text).join('; ')}.`:'';
+  const tried=attemptErrors.length>1?` Tried ${attemptErrors.length} sources from ${providers.join(', ')}.`:'';
+  $('playError').textContent=head+detail+tried;
 });
 async function playItem(item, fail, isFallback = false, isActive = () => true) {
   stopTranscode(); const sequence=transcodeSequence; const oldVideo=$('video'); if(hls){hls.destroy();hls=null;} oldVideo.pause();oldVideo.removeAttribute('src');oldVideo.load();
