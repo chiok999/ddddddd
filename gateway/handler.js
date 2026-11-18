@@ -131,25 +131,48 @@ async function runCommand(sock, msg, name, args, { from, sender, senderIds, isGu
         timer = setTimeout(() => reject(Object.assign(new Error(`.${command.name || invoked} timed out`), { code: 'COMMAND_TIMEOUT' })), timeoutMs);
       }),
     ]);
-  } catch (err) {
-    if (err?.code === 'COMMAND_TIMEOUT') { try { running?.cancel?.(); } catch { /* best effort */ } }
-    log.warn(`${label} ✗ ${took()} (${String(err?.code || err?.message || 'failed').slice(0, 120)})`);
+  } catch (error) {
+    if (error?.code === 'COMMAND_TIMEOUT') { try { running?.cancel?.(); } catch { /* best effort */ } }
+    log.warn(`${label} ✗ ${took()} (${String(error?.code || error?.message || 'failed').slice(0, 120)})`);
     telemetry.recordFailure('command');
     // Crash isolation: only this command's folder is counted and, after
     // repeated failures, switched off. Everything else keeps running.
-    try {
-      if (registry.recordFailure(command.name || invoked)) {
-        log.warn(`.${command.name || invoked} switched off after repeated failures`);
-        await sock.sendMessage(from, { text: `⛔ .${command.name || invoked} keeps failing and was switched off. Owner can re-enable with .on ${command.name || invoked}` }, selections.quoteOpts(msg));
-      }
-    } catch { /* breaker notices are best effort */ }
-    throw err;
+    await announceBreakerTrip(sock, msg, command, from);
+    // Reported here, once. Rethrowing let handleMessage's catch report the same
+    // failure a second time, so a failing command sent two messages.
+    await replyWithError(sock, msg, from, senderIds, error);
+    return true;
   } finally {
     clearTimeout(timer);
   }
   registry.recordSuccess(command.name || invoked);
   log.info(`${label} ✓ ${took()}`);
   return true;
+}
+
+/** One chat reply for a failure: safe for a guest, detailed for the owner. */
+async function replyWithError(sock, msg, from, senderIds, error) {
+  try {
+    await sock.sendMessage(from, {
+      text: safeErrorMessage(error, { isOwner: isOwner(senderIds, sock.__sessionDir) }),
+    }, selections.quoteOpts(msg));
+  } catch (sendError) {
+    if (!sendError?.message?.includes('rate-overlimit')) {
+      console.error('Error sending error message:', sendError);
+    }
+  }
+}
+
+/** Tell the chat when the breaker has just switched a command off. */
+async function announceBreakerTrip(sock, msg, command, from) {
+  try {
+    const name = command.name;
+    if (!registry.recordFailure(name)) return;
+    log.warn(`.${name} switched off after repeated failures`);
+    await sock.sendMessage(from, {
+      text: `⛔ .${name} keeps failing and was switched off. Owner can re-enable with .on ${name}`,
+    }, selections.quoteOpts(msg));
+  } catch { /* breaker notices are best effort */ }
 }
 
 // Tap-selector & "reply with a number" answers are resolved here.
@@ -259,18 +282,10 @@ const handleMessage = async (sock, msg) => {
       return;
     }
 
-    try {
-      // Never leak stack traces, paths, or internal error text into the chat.
-      const sender = sock.__accountNumber ? `${sock.__accountNumber}@s.whatsapp.net` : sock.user?.id;
-      const senderIds = guestIds || [sender, sock.user?.id, sock.user?.lid].filter(Boolean);
-      await sock.sendMessage(msg.key.remoteJid, {
-        text: safeErrorMessage(error, { isOwner: isOwner(senderIds, sock.__sessionDir) }),
-      }, { quoted: msg });
-    } catch (e) {
-      if (!e?.message?.includes('rate-overlimit')) {
-        console.error('Error sending error message:', e);
-      }
-    }
+    // Never leak stack traces, paths, or internal error text into the chat.
+    const sender = sock.__accountNumber ? `${sock.__accountNumber}@s.whatsapp.net` : sock.user?.id;
+    const senderIds = guestIds || [sender, sock.user?.id, sock.user?.lid].filter(Boolean);
+    await replyWithError(sock, msg, msg.key.remoteJid, senderIds, error);
   }
 };
 

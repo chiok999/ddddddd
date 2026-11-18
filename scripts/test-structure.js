@@ -68,17 +68,34 @@ test('layout: gateway, commands and lib exist; old utils/ and engine/ roots are 
   for (const gone of ['utils', 'engine', 'handler.js', 'database.js']) assert.equal(fs.existsSync(path.join(ROOT, gone)), false, `${gone} should have moved`);
 });
 
-test('file budget: the project stays under 200 source files', () => {
+// The budget is for the bot. `solo-cinema/` is a separate deployable with its
+// own package.json, entry point and suite (the panel runs it via MAIN_FILE), so
+// counting it here measured two projects against one number and forced either a
+// pointless deletion or a silently-raised limit. It is counted on its own.
+const BOT_FILE_BUDGET = 200;
+const SEPARATE_PROJECTS = new Set(['solo-cinema']);
+const countSourceFiles = (dir, { stopAt = null } = {}) => {
   const skip = new Set(['node_modules', 'database', 'temp', 'tmp', 'bin', '.git', 'session', 'sessions', 'logs', 'secrets', 'assets']);
   let count = 0;
-  (function walk(dir) {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (skip.has(entry.name)) continue;
-      const full = path.join(dir, entry.name);
+  (function walk(current) {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (skip.has(entry.name) || (stopAt && stopAt.has(entry.name))) continue;
+      const full = path.join(current, entry.name);
       entry.isDirectory() ? walk(full) : count++;
     }
-  })(ROOT);
-  assert.ok(count < 200, `${count} files`);
+  })(dir);
+  return count;
+};
+
+test('file budget: the bot stays under 200 source files of its own', () => {
+  const count = countSourceFiles(ROOT, { stopAt: SEPARATE_PROJECTS });
+  assert.ok(count < BOT_FILE_BUDGET, `${count} files`);
+});
+
+test('the separate app is counted too, so neither can grow unnoticed', () => {
+  const app = countSourceFiles(path.join(ROOT, 'solo-cinema'));
+  assert.ok(app > 0, 'solo-cinema must still exist to be counted');
+  assert.ok(app < BOT_FILE_BUDGET, `solo-cinema has ${app} files`);
 });
 
 // ─── command isolation (static) ──────────────────────────────────────────────
