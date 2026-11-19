@@ -8,6 +8,7 @@ import {
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
 import { Compass, Flame, House, User } from 'lucide-react';
 import styles from '../styles.css?url';
+import { AuthGate } from '../components/AuthGate';
 
 const items = [
   { to: '/', label: 'Home', icon: House, exact: true },
@@ -17,6 +18,9 @@ const items = [
 ] as const;
 
 function BottomNav() {
+  // The player owns the whole screen on phones; a tab bar over the transport
+  // would cover the seek bar, so it is hidden there.
+  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/watch/')) return null;
   return (
     <nav className="glass fixed inset-x-0 bottom-0 z-50 mx-auto grid max-w-[480px] grid-cols-4 border-t border-border pb-[env(safe-area-inset-bottom)]">
       {items.map(({ to, label, icon: Icon, exact }) => (
@@ -131,10 +135,12 @@ function RootComponent() {
   const { queryClient } = Route.useRouteContext();
   return (
     <QueryClientProvider client={queryClient}>
-      <div className="app-shell">
-        <Outlet />
-      </div>
-      <BottomNav />
+      <AuthGate>
+        <div className="app-shell">
+          <Outlet />
+        </div>
+        <BottomNav />
+      </AuthGate>
     </QueryClientProvider>
   );
 }

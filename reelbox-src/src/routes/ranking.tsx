@@ -1,88 +1,121 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, createFileRoute } from '@tanstack/react-router';
-import { Star } from 'lucide-react';
 import { Header } from '../components/Header';
-import { titles } from '../lib/movies';
+import { api, type Item, type Section } from '../lib/api';
+import { posterUrl } from '../lib/art';
+import { itemStore } from '../lib/item-store';
 
 export const Route = createFileRoute('/ranking')({
   head: () => ({
     meta: [
-      { title: 'Top Charts — ReelBox' },
-      {
-        name: 'description',
-        content: 'The highest rated movies, series and anime on ReelBox right now.',
-      },
-      { property: 'og:title', content: 'Top Charts — ReelBox' },
-      {
-        property: 'og:description',
-        content: 'The highest rated movies, series and anime on ReelBox right now.',
-      },
+      { title: 'Top — ReelBox' },
+      { name: 'description', content: 'The most rated movies, series and anime on ReelBox right now.' },
+      { property: 'og:title', content: 'Top — ReelBox' },
+      { property: 'og:description', content: 'The most rated movies, series and anime on ReelBox right now.' },
     ],
   }),
   component: Ranking,
 });
 
-const kinds = ['All', 'Movie', 'TV Series', 'Anime'] as const;
+const LIMIT = 20;
 
 function Ranking() {
-  const [k, setK] = useState<(typeof kinds)[number]>('All');
-  const list = titles
-    .filter((t) => k === 'All' || t.type === k)
-    .sort((a, b) => b.rating - a.rating);
+  const [sections, setSections] = useState<Section[] | null>(null);
+  const [error, setError] = useState('');
+  const [tab, setTab] = useState<'movies' | 'shows' | 'anime'>('movies');
+
+  useEffect(() => {
+    api
+      .discover()
+      .then(setSections)
+      .catch((e) => setError(e.message));
+  }, []);
+
+  useEffect(() => {
+    if (sections) itemStore.putAll(sections.flatMap((s) => s.items));
+  }, [sections]);
+
+  /**
+   * The rank is this list's own order, not a claim about the wider catalog, so
+   * the number is shown and nothing more is inferred from it.
+   */
+  const ranked = (sections || [])
+    .filter((s) => (s.groups || []).includes(tab) || (tab === 'anime' && s.id === 'anime'))
+    .flatMap((s) => s.items)
+    .filter((item, index, all) => all.findIndex((x) => x.id === item.id) === index)
+    .slice(0, LIMIT);
 
   return (
     <div>
       <Header />
-      <h1 className="px-3 pt-4 font-display text-xl font-bold">Top Charts</h1>
-
-      <div className="no-scrollbar flex gap-2 overflow-x-auto px-3 py-3">
-        {kinds.map((x) => (
-          <button
-            key={x}
-            onClick={() => setK(x)}
-            className={`shrink-0 rounded-full px-3 py-1 text-xs ${
-              k === x ? 'bg-primary text-primary-foreground' : 'bg-secondary'
-            }`}
-          >
-            {x}
-          </button>
-        ))}
-      </div>
-
-      <ol className="space-y-3 px-3">
-        {list.map((t, n) => (
-          <li key={t.id}>
-            <Link
-              to="/title/$id"
-              params={{ id: t.id }}
-              className="grid grid-cols-[1.75rem_4rem_minmax(0,1fr)] items-center gap-3"
+      <div className="px-3 py-4">
+        <h1 className="font-display text-xl font-bold">Top</h1>
+        <p className="mt-1 text-xs text-muted-foreground">
+          This list's own order from today's catalog — not a rating.
+        </p>
+        <div className="no-scrollbar mt-3 flex gap-2 overflow-x-auto">
+          {(
+            [
+              ['movies', 'Movies'],
+              ['shows', 'Series'],
+              ['anime', 'Anime'],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setTab(key)}
+              aria-pressed={tab === key}
+              className={`shrink-0 rounded-full px-4 py-1.5 text-sm ${
+                tab === key ? 'bg-primary text-primary-foreground' : 'bg-secondary'
+              }`}
             >
-              <span
-                className={`text-center font-display text-lg font-black ${
-                  n < 3 ? 'text-primary' : 'text-muted-foreground'
-                }`}
-              >
-                {n + 1}
-              </span>
-              <img
-                src={t.poster}
-                alt={t.title}
-                className="aspect-[2/3] w-16 rounded-md object-cover"
-              />
-              <div className="min-w-0">
-                <p className="truncate text-sm font-semibold">{t.title}</p>
-                <p className="truncate text-xs text-muted-foreground">
-                  {t.year} · {t.genres.join(', ')}
-                </p>
-                <p className="mt-1 flex items-center gap-1 text-xs">
-                  <Star className="h-3 w-3 fill-primary text-primary" />
-                  {t.rating}
-                </p>
-              </div>
-            </Link>
-          </li>
-        ))}
-      </ol>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {error ? (
+          <p className="py-16 text-center text-sm">{error}</p>
+        ) : sections === null ? (
+          <p className="py-16 text-center text-sm text-muted-foreground">Loading…</p>
+        ) : ranked.length === 0 ? (
+          <p className="py-16 text-center text-sm text-muted-foreground">Nothing ranked in this group yet.</p>
+        ) : (
+          <ol className="mt-4 space-y-2">
+            {ranked.map((item: Item, index) => (
+              <li key={item.id}>
+                <Link
+                  to="/title/$id"
+                  params={{ id: item.id }}
+                  className="flex items-center gap-3 rounded-lg p-1 hover:bg-secondary"
+                >
+                  <span className="rank-num w-8 shrink-0 text-center font-display text-2xl font-bold">
+                    {index + 1}
+                  </span>
+                  {posterUrl(item.poster, true) ? (
+                    <img
+                      src={posterUrl(item.poster, true)!}
+                      alt=""
+                      className="h-[4.5rem] w-12 rounded object-cover"
+                      loading="lazy"
+                    />
+                  ) : (
+                    <span className="h-[4.5rem] w-12 rounded bg-secondary" />
+                  )}
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm">{item.title}</span>
+                    <span className="block truncate text-[11px] text-muted-foreground">
+                      {[item.year, item.anime ? 'Anime' : item.type === 'series' ? 'Series' : 'Film']
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </span>
+                  </span>
+                </Link>
+              </li>
+            ))}
+          </ol>
+        )}
+      </div>
     </div>
   );
 }

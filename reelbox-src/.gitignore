@@ -5,3 +5,4 @@ dist
 .tanstack
 *.local
 .DS_Store
+dist-test

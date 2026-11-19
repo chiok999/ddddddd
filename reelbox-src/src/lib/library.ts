@@ -1,9 +1,14 @@
 /**
- * My List and watch history.
+ * My List, watch history and progress.
  *
- * Reconstructed verbatim from the build, including the custom event: the
- * original used one event so every mounted consumer re-reads storage instead of
- * holding a stale copy.
+ * The keys are unchanged from the original ReelBox (`rb:*`) so a browser that
+ * already holds a list keeps it after this rewrite, and the history cap stays at
+ * 20. `solo-progress`, `solo-watchlist` and `solo-quality-height` are Troy's
+ * existing keys and are reused rather than duplicated, so the classic UI and
+ * this one agree about what has been watched.
+ *
+ * One event (`rb:lib`) drives every subscriber: a stale copy in one mounted
+ * component was the bug this shape exists to prevent.
  */
 
 import { useEffect, useState } from 'react';
@@ -11,40 +16,99 @@ import { useEffect, useState } from 'react';
 const KEY = {
   list: 'rb:list',
   history: 'rb:history',
+  progress: 'solo-progress',
+  height: 'solo-quality-height',
+  saver: 'solo-data-saver',
 } as const;
 
-type KeyName = keyof typeof KEY;
+type KeyName = 'list' | 'history';
 
-const read = (k: KeyName): string[] => {
+const read = (name: string): string[] => {
   try {
-    return JSON.parse(localStorage.getItem(KEY[k]) || '[]');
+    const parsed = JSON.parse(localStorage.getItem(name) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
 };
 
-const write = (k: KeyName, v: string[]) => {
-  localStorage.setItem(KEY[k], JSON.stringify(v));
+const write = (name: string, value: unknown) => {
+  try {
+    localStorage.setItem(name, JSON.stringify(value));
+  } catch {
+    // Storage can be full or blocked in private mode; a failed save must not
+    // take the page down with it.
+  }
   window.dispatchEvent(new Event('rb:lib'));
 };
 
 export function useLib(k: KeyName) {
   const [ids, setIds] = useState<string[]>([]);
   useEffect(() => {
-    const s = () => setIds(read(k));
-    s();
-    window.addEventListener('rb:lib', s);
-    return () => window.removeEventListener('rb:lib', s);
+    const sync = () => setIds(read(KEY[k]));
+    sync();
+    window.addEventListener('rb:lib', sync);
+    return () => window.removeEventListener('rb:lib', sync);
   }, [k]);
   return ids;
 }
 
 export const toggleList = (id: string) => {
-  const l = read('list');
-  write('list', l.includes(id) ? l.filter((x) => x !== id) : [id, ...l]);
+  const list = read(KEY.list);
+  write(KEY.list, list.includes(id) ? list.filter((x) => x !== id) : [id, ...list]);
 };
 
 export const pushHistory = (id: string) =>
-  write('history', [id, ...read('history').filter((x) => x !== id)].slice(0, 20));
+  write(KEY.history, [id, ...read(KEY.history).filter((x) => x !== id)].slice(0, 20));
 
-export const clearHistory = () => write('history', []);
+export const clearHistory = () => write(KEY.history, []);
+
+/**
+ * Last known position for one source, keyed the way the classic player keys it
+ * (`source:title:year:type:season:episode`). Progress is deleted once a title is
+ * finished, so a rewatch starts at the beginning.
+ */
+export interface Progress {
+  url: string;
+  time: number;
+}
+
+export const readProgress = (): Progress[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(KEY.progress) || '[]');
+    return Array.isArray(parsed) ? parsed.filter((x) => x && typeof x.url === 'string') : [];
+  } catch {
+    return [];
+  }
+};
+
+export const progressFor = (key: string) =>
+  readProgress().find((x) => x.url === key)?.time ?? 0;
+
+export const saveProgress = (key: string, time: number) => {
+  const kept = readProgress().filter((x) => x.url !== key);
+  write(KEY.progress, [{ url: key, time }, ...kept].slice(0, 60));
+};
+
+export const clearProgress = (key: string) =>
+  write(KEY.progress, readProgress().filter((x) => x.url !== key));
+
+export const readHeight = () => (Number(localStorage.getItem(KEY.height)) === 360 ? 360 : 240);
+
+export const saveHeight = (height: number) => {
+  try {
+    localStorage.setItem(KEY.height, String(height));
+  } catch {
+    /* see write() */
+  }
+};
+
+export const readSaver = () => {
+  try {
+    const stored = localStorage.getItem(KEY.saver);
+    if (stored !== null) return stored === 'true';
+  } catch {
+    /* fall through to the connection hint */
+  }
+  return !!(navigator as any).connection?.saveData;
+};

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { Link, createFileRoute, notFound } from '@tanstack/react-router';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link, createFileRoute } from '@tanstack/react-router';
 import {
   ArrowLeft,
   Captions,
@@ -9,12 +9,12 @@ import {
   RotateCcw,
   RotateCw,
   Settings,
-  SkipForward,
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import { VIDEO, getTitle, titles } from '../lib/movies';
-import { pushHistory } from '../lib/library';
+import { Playback, type PlaybackState } from '../lib/playback';
+import { itemStore } from '../lib/item-store';
+import { clearProgress, pushHistory, readHeight, saveHeight, saveProgress, readProgress } from '../lib/library';
 
 interface Search {
   s?: number;
@@ -22,93 +22,167 @@ interface Search {
 }
 
 export const Route = createFileRoute('/watch/$id')({
-  validateSearch: (q: Record<string, unknown>): Search => ({
-    s: q.s ? Number(q.s) : undefined,
-    e: q.e ? Number(q.e) : undefined,
+  validateSearch: (raw: Record<string, unknown>): Search => ({
+    s: raw.s ? Number(raw.s) : undefined,
+    e: raw.e ? Number(raw.e) : undefined,
   }),
-  loader: ({ params }) => {
-    const t = getTitle(params.id);
-    if (!t) throw notFound();
-    return t;
-  },
-  head: ({ loaderData: t }) => ({
-    meta: [
-      { title: `Watch ${t?.title} — ReelBox` },
-      { name: 'description', content: `Now playing: ${t?.title}` },
-      { property: 'og:title', content: `Watch ${t?.title} — ReelBox` },
-      { property: 'og:description', content: t?.description },
-    ],
-  }),
-  component: Player,
+  head: () => ({ meta: [{ title: 'Watching — ReelBox' }, { name: 'description', content: 'Watch on ReelBox.' }] }),
+  component: Watch,
 });
 
-const fmt = (s: number) => {
-  if (!isFinite(s)) return '0:00';
-  return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const fmt = (seconds: number) => {
+  if (!isFinite(seconds) || seconds < 0) return '0:00';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
 };
 
-function Player() {
-  const t = Route.useLoaderData();
+function Watch() {
+  const { id } = Route.useParams();
   const { s, e } = Route.useSearch();
-  const v = useRef<HTMLVideoElement>(null);
+  const item = itemStore.get(id);
+  const video = useRef<HTMLVideoElement>(null);
   const box = useRef<HTMLDivElement>(null);
-  const [playing, setPlaying] = useState(false);
+  const engine = useRef<Playback | null>(null);
+
+  const [state, setState] = useState<PlaybackState>({
+    phase: 'idle',
+    message: '',
+    tried: [],
+    duration: null,
+    seekBase: 0,
+    providers: '',
+  });
   const [time, setTime] = useState(0);
-  const [dur, setDur] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [vol, setVol] = useState(1);
-  const [speed, setSpeed] = useState(1);
+  const [rate, setRate] = useState(1);
+  const [height, setHeight] = useState(240);
   const [menu, setMenu] = useState(false);
-  const [quality, setQuality] = useState('1080p');
-  const [subs, setSubs] = useState(false);
   const [show, setShow] = useState(true);
   const hide = useRef<number | undefined>(undefined);
 
-  const toggle = () => {
-    const el = v.current;
-    if (!el) return;
-    el.paused ? void el.play() : el.pause();
-  };
-  const seek = (d: number) => {
-    if (v.current) v.current.currentTime += d;
-  };
-  const fs = () =>
-    document.fullscreenElement ? void document.exitFullscreen() : box.current?.requestFullscreen();
-  const poke = () => {
+  const progressKey = item ? `${item.source}:${item.title}:${item.year}:${item.type}:${s ?? 1}:${e ?? 1}` : '';
+
+  const poke = useCallback(() => {
     setShow(true);
     clearTimeout(hide.current);
     hide.current = window.setTimeout(() => setShow(false), 2500);
-  };
-
-  useEffect(() => {
-    const k = (ev: KeyboardEvent) => {
-      if (ev.code === 'Space') {
-        ev.preventDefault();
-        toggle();
-      }
-      if (ev.key === 'ArrowRight') seek(10);
-      if (ev.key === 'ArrowLeft') seek(-10);
-      if (ev.key === 'f') fs();
-      if (ev.key === 'm') setMuted((x) => !x);
-      poke();
-    };
-    window.addEventListener('keydown', k);
-    return () => window.removeEventListener('keydown', k);
   }, []);
 
+  // One engine per mounted player. It reports on its own clock, so the UI only
+  // renders what the engine knows rather than polling the element separately.
   useEffect(() => {
-    if (v.current) {
-      v.current.muted = muted;
-      v.current.volume = vol;
-      v.current.playbackRate = speed;
+    if (!item) return;
+    const playback = new Playback({
+      onState: setState,
+      onProgress: (position, total, paused) => {
+        setTime(position);
+        setDuration(total ?? 0);
+        if (position > 5 && progressKey) saveProgress(progressKey, position);
+        void paused;
+      },
+    });
+    engine.current = playback;
+    setHeight(readHeight());
+    playback.quality = readHeight();
+    playback.attach(video.current);
+
+    const startAt = progressKey ? readProgress().find((x) => x.url === progressKey)?.time : 0;
+    void playback.start(
+      {
+        id: item.id,
+        title: item.title,
+        type: item.type,
+        season: s ?? 1,
+        episode: e ?? 1,
+        progressKey,
+      },
+      // Resume only when the saved point is meaningfully into the title and the
+      // caller did not pick an episode explicitly.
+      startAt && s === undefined ? startAt : undefined,
+    );
+    pushHistory(item.id);
+
+    return () => {
+      playback.attach(null);
+      void playback.stop();
+      engine.current = null;
+    };
+    // Starting again is an explicit user action (a retry button), never a render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item?.id, s, e]);
+
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      const playback = engine.current;
+      if (!playback) return;
+      if (ev.code === 'Space') {
+        ev.preventDefault();
+        playback.toggle();
+      }
+      if (ev.key === 'ArrowRight') playback.seek(playback.totalTime() + 10);
+      if (ev.key === 'ArrowLeft') playback.seek(playback.totalTime() - 10);
+      if (ev.key === 'm') setMuted((x) => !x);
+      if (ev.key === 'f') void fullscreen();
+      poke();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [poke]);
+
+  useEffect(() => {
+    const v = video.current;
+    if (!v) return;
+    v.muted = muted;
+    v.volume = vol;
+  }, [muted, vol]);
+
+  useEffect(() => {
+    engine.current?.setRate(rate);
+  }, [rate]);
+
+  const fullscreen = async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await box.current?.requestFullscreen();
+    } catch {
+      /* some browsers refuse without a gesture; the button is best-effort */
     }
-  }, [muted, vol, speed]);
+  };
 
-  useEffect(() => {
-    pushHistory(t.id);
-  }, [t.id]);
+  const changeQuality = (next: number) => {
+    setHeight(next);
+    saveHeight(next);
+    engine.current?.setQuality(next);
+  };
 
-  const next = titles[(titles.indexOf(t) + 1) % titles.length];
+  const retry = () => {
+    if (!item) return;
+    void engine.current?.start(
+      { id: item.id, title: item.title, type: item.type, season: s ?? 1, episode: e ?? 1, progressKey },
+      state.seekBase || undefined,
+    );
+  };
+
+  if (!item) {
+    return (
+      <div className="px-3 py-16 text-center">
+        <h1 className="font-display text-lg font-bold">This title is no longer loaded</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          Catalog entries expire an hour after the search that produced them. Search again to pick it up.
+        </p>
+        <Link to="/browse" search={{ q: undefined, g: undefined, t: undefined }} className="btn-ghost mt-4">
+          Search again
+        </Link>
+      </div>
+    );
+  }
+
+  const pending = state.phase === 'resolving' || state.phase === 'converting';
 
   return (
     <div className="min-h-screen bg-background">
@@ -119,26 +193,43 @@ function Player() {
         className={`relative aspect-video max-h-screen w-full bg-player ${show ? '' : 'cursor-none'}`}
       >
         <video
-          ref={v}
-          src={VIDEO}
-          poster={t.backdrop}
+          ref={video}
           className="h-full w-full"
-          onClick={toggle}
+          playsInline
+          onClick={() => engine.current?.toggle()}
           onPlay={() => setPlaying(true)}
           onPause={() => setPlaying(false)}
-          onTimeUpdate={(x) => setTime(x.currentTarget.currentTime)}
-          onLoadedMetadata={(x) => setDur(x.currentTarget.duration)}
         />
 
-        {subs && playing && (
-          <p className="pointer-events-none absolute bottom-14 left-1/2 -translate-x-1/2 whitespace-nowrap rounded bg-background/70 px-2 py-0.5 text-xs">
-            [ Subtitles: English ]
-          </p>
+        {pending && (
+          <div className="absolute inset-0 grid place-items-center bg-player/80 px-6 text-center">
+            <div>
+              <p className="font-display text-sm font-semibold">{state.message || 'Preparing…'}</p>
+              {state.providers && <p className="mt-2 text-[11px] text-muted-foreground">{state.providers}</p>}
+            </div>
+          </div>
         )}
 
-        {!playing && (
+        {state.phase === 'failed' && (
+          <div className="absolute inset-0 grid place-items-center bg-player/90 px-6 text-center">
+            <div>
+              <p className="text-sm">{state.message}</p>
+              <div className="mt-3 flex justify-center gap-2">
+                <button onClick={retry} className="btn-primary">
+                  Try again
+                </button>
+                <Link to="/title/$id" params={{ id: item.id }} search={{}} className="btn-ghost">
+                  Back
+                </Link>
+              </div>
+              {state.providers && <p className="mt-3 text-[11px] text-muted-foreground">{state.providers}</p>}
+            </div>
+          </div>
+        )}
+
+        {!playing && !pending && state.phase !== 'failed' && (
           <button
-            onClick={toggle}
+            onClick={() => engine.current?.toggle()}
             aria-label="Play"
             className="absolute left-1/2 top-1/2 grid h-14 w-14 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-primary text-primary-foreground shadow-glow"
           >
@@ -151,12 +242,12 @@ function Player() {
             show || !playing ? 'opacity-100' : 'opacity-0'
           }`}
         >
-          <Link to="/title/$id" params={{ id: t.id }} aria-label="Back">
+          <Link to="/title/$id" params={{ id: item.id }} search={{}} aria-label="Back">
             <ArrowLeft className="h-6 w-6" />
           </Link>
-          <div>
-            <p className="font-display font-bold">{t.title}</p>
-            {s && (
+          <div className="min-w-0">
+            <p className="truncate font-display font-bold">{item.title}</p>
+            {s !== undefined && (
               <p className="text-xs text-muted-foreground">
                 Season {s} · Episode {e}
               </p>
@@ -172,61 +263,53 @@ function Player() {
           <input
             type="range"
             min={0}
-            max={dur || 0}
+            max={duration || 0}
             step={0.1}
             value={time}
-            onChange={(x) => {
-              if (v.current) v.current.currentTime = +x.target.value;
-            }}
+            onChange={(ev) => engine.current?.seek(Number(ev.target.value))}
             className="range w-full"
-            style={{ ['--p' as string]: `${dur ? (time / dur) * 100 : 0}%` }}
+            style={{ ['--p' as string]: `${duration ? (time / duration) * 100 : 0}%` }}
             aria-label="Seek"
           />
           <div className="mt-1 flex min-w-0 items-center gap-3">
-            <button onClick={toggle} aria-label={playing ? 'Pause' : 'Play'}>
+            <button onClick={() => engine.current?.toggle()} aria-label={playing ? 'Pause' : 'Play'}>
               {playing ? <Pause className="h-6 w-6" /> : <Play className="h-6 w-6" />}
             </button>
-            <button onClick={() => seek(-10)} aria-label="Back 10s">
+            <button onClick={() => engine.current?.seek((engine.current?.totalTime() || 0) - 10)} aria-label="Back 10s">
               <RotateCcw className="h-5 w-5" />
             </button>
-            <button onClick={() => seek(10)} aria-label="Forward 10s">
+            <button onClick={() => engine.current?.seek((engine.current?.totalTime() || 0) + 10)} aria-label="Forward 10s">
               <RotateCw className="h-5 w-5" />
             </button>
             <button onClick={() => setMuted(!muted)} aria-label="Mute">
-              {muted || vol === 0 ? (
-                <VolumeX className="h-5 w-5" />
-              ) : (
-                <Volume2 className="h-5 w-5" />
-              )}
+              {muted || vol === 0 ? <VolumeX className="h-5 w-5" /> : <Volume2 className="h-5 w-5" />}
             </button>
             <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-              {fmt(time)} / {fmt(dur)}
+              {fmt(time)} / {duration ? fmt(duration) : '—'}
             </span>
 
             <div className="relative ml-auto flex shrink-0 items-center gap-3">
-              <Link to="/watch/$id" params={{ id: next.id }} search={{}} aria-label="Next">
-                <SkipForward className="h-5 w-5" />
-              </Link>
               <button
-                onClick={() => setSubs(!subs)}
-                aria-label="Subtitles"
-                className={subs ? 'text-primary' : ''}
-              >
-                <Captions className="h-5 w-5" />
-              </button>
+                onClick={() => {
+                  setMuted(false);
+                  setVol((v) => (v > 0 ? 0 : 1));
+                }}
+                aria-label="Toggle volume"
+                className="hidden"
+              />
               <button onClick={() => setMenu(!menu)} aria-label="Settings">
                 <Settings className="h-5 w-5" />
               </button>
               {menu && (
-                <div className="absolute bottom-8 right-0 w-48 rounded-lg border border-border bg-popover p-3 text-sm">
+                <div className="absolute bottom-8 right-0 w-52 rounded-lg border border-border bg-popover p-3 text-sm">
                   <p className="mb-1 text-xs text-muted-foreground">Speed</p>
                   <div className="mb-3 flex flex-wrap gap-1">
                     {[0.5, 1, 1.25, 1.5, 2].map((x) => (
                       <button
                         key={x}
-                        onClick={() => setSpeed(x)}
+                        onClick={() => setRate(x)}
                         className={`rounded px-2 py-0.5 ${
-                          speed === x ? 'bg-primary text-primary-foreground' : 'bg-secondary'
+                          rate === x ? 'bg-primary text-primary-foreground' : 'bg-secondary'
                         }`}
                       >
                         {x}×
@@ -235,21 +318,25 @@ function Player() {
                   </div>
                   <p className="mb-1 text-xs text-muted-foreground">Quality</p>
                   <div className="flex flex-wrap gap-1">
-                    {['1080p', '720p', '480p', '360p'].map((x) => (
+                    {/* Only what the conversion actually produces. */}
+                    {[240, 360].map((x) => (
                       <button
                         key={x}
-                        onClick={() => setQuality(x)}
+                        onClick={() => changeQuality(x)}
                         className={`rounded px-2 py-0.5 ${
-                          quality === x ? 'bg-primary text-primary-foreground' : 'bg-secondary'
+                          height === x ? 'bg-primary text-primary-foreground' : 'bg-secondary'
                         }`}
                       >
-                        {x}
+                        {x}p
                       </button>
                     ))}
                   </div>
+                  <p className="mt-2 text-[10px] leading-tight text-muted-foreground">
+                    Converted output only; the source may be higher.
+                  </p>
                 </div>
               )}
-              <button onClick={fs} aria-label="Fullscreen">
+              <button onClick={fullscreen} aria-label="Fullscreen">
                 <Maximize className="h-5 w-5" />
               </button>
             </div>
@@ -258,29 +345,27 @@ function Player() {
       </div>
 
       <div className="px-3 py-4">
-        <h1 className="font-display text-lg font-bold">{t.title}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{t.description}</p>
-        <h2 className="mb-3 mt-8 font-display text-lg font-bold">Up next</h2>
-        <div className="grid grid-cols-2 gap-3">
-          {titles
-            .filter((x) => x.id !== t.id)
-            .slice(0, 8)
-            .map((x) => (
-              <Link
-                key={x.id}
-                to="/watch/$id"
-                params={{ id: x.id }}
-                search={{}}
-                className="group min-w-0"
-              >
-                <img
-                  src={x.backdrop}
-                  alt={x.title}
-                  className="aspect-video w-full rounded-lg object-cover group-hover:opacity-80"
-                />
-                <p className="mt-1 truncate text-xs">{x.title}</p>
-              </Link>
-            ))}
+        <h1 className="font-display text-lg font-bold">{item.title}</h1>
+        {item.overview && <p className="mt-1 text-sm text-muted-foreground">{item.overview}</p>}
+        {state.message && state.phase === 'playing' && (
+          <p className="mt-2 text-[11px] text-muted-foreground">{state.message}</p>
+        )}
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Link to="/title/$id" params={{ id: item.id }} search={{}} className="btn-ghost">
+            <Captions className="h-4 w-4" />
+            Details
+          </Link>
+          {progressKey && (
+            <button
+              onClick={() => {
+                clearProgress(progressKey);
+                engine.current?.seek(0);
+              }}
+              className="btn-ghost"
+            >
+              Start over
+            </button>
+          )}
         </div>
       </div>
     </div>

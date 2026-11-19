@@ -155,9 +155,71 @@ const staticFiles = createStatic({
   root: __dirname,
   vendored: new Map([['/hls.js', 'node_modules/hls.js/dist/hls.min.js']]),
 });
+// The ReelBox shell is a built app, so its bundle lives in its own directory
+// rather than next to `index.html`. The build output is committed, which keeps
+// the panel's `npm start` free of a build step.
+// `app/` holds only the published bundle: `createStatic` resolves against
+// `<root>/public`, so pointing it at `app/dist` makes `/assets/...` and
+// `/favicon.ico` resolve without a second prefix in the URLs.
+const appFiles = createStatic({ root: path.join(__dirname, 'app', 'dist') });
+const APP_SHELL = path.join(__dirname, 'app', 'dist', 'public', '_shell.html');
+// Pages the shell owns. Anything else is a 404, not the app: a typo in a static
+// path should say so instead of silently rendering the home screen.
+const APP_ROUTES = [/^\/$/, /^\/browse$/, /^\/ranking$/, /^\/me$/, /^\/title\/[\w-]{1,64}$/, /^\/watch\/[\w-]{1,64}$/];
+
+/**
+ * The app shell carries two inline scripts written by the router at build time:
+ * a scroll-restoration preamble and the hydration payload. Inline script is
+ * normally forbidden here, so each one is allowed by hash instead of by
+ * weakening `script-src`. The hashes are read from the committed shell once at
+ * startup, which means a rebuilt shell cannot drift out of sync with the policy
+ * without the server noticing on the next start.
+ */
+function inlineScriptHashes() {
+  let shell;
+  try {
+    shell = fs.readFileSync(APP_SHELL, 'utf8');
+  } catch {
+    // Without the shell there is nothing to hash, and the app would render but
+    // never hydrate. Say so at startup rather than leaving a mystery in the
+    // browser console.
+    console.warn('app shell missing at ' + APP_SHELL + '; the UI will not start. Run npm run build in reelbox-src.');
+    return [];
+  }
+  const hashes = new Set();
+  for (const match of shell.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)) {
+    const body = match[1];
+    if (!body) continue;
+    hashes.add(`'sha256-${crypto.createHash('sha256').update(body, 'utf8').digest('base64')}'`);
+  }
+  if (!hashes.size) console.warn('app shell has no inline scripts; the CSP may be out of date with the build.');
+  return [...hashes];
+}
+const inlineHashes = inlineScriptHashes();
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "media-src 'self' blob:",
+  "worker-src 'self' blob:",
+  // blob: is used by the original player for uploaded subtitle files.
+  "img-src 'self' data: blob: https://wsrv.nl",
+  "style-src 'self'",
+  // The app's CSS is a static file; the only inline style it needs is the seek
+  // bar's custom property, so inline *attributes* are allowed but <style> is not.
+  "style-src-attr 'unsafe-inline'",
+  // Music and anime providers put their API behind a CDN; these are the hosts
+  // wsrv.nl proxies for, and nothing else is reachable from the page.
+  "connect-src 'self'",
+  "font-src 'self' https://fonts.gstatic.com",
+  "style-src-elem 'self' https://fonts.googleapis.com",
+  "frame-src 'none'",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  `script-src 'self' ${inlineHashes.join(' ')}`.replace(/\s+$/, ''),
+].join('; ');
 const server = http.createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https://wsrv.nl; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src 'none'; frame-ancestors 'none'");
+  res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
   const url = new URL(req.url, 'http://local');
   const sid = /(?:^|;\s*)cinema=([\w-]+)/.exec(req.headers.cookie || '')?.[1];
   const session = sessions.get(sid);
@@ -391,6 +453,29 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname.startsWith('/media/') && req.method === 'GET') return send(res, authorized ? 403 : 401, {error:authorized ? 'Direct playback is disabled; conversion is required' : 'Login required'});
     if (req.method === 'GET' || req.method === 'HEAD') {
+      // The app bundle first: its URLs are hashed and cannot collide with the
+      // classic player's flat file names.
+      const appEntry = appFiles.lookup(url.pathname);
+      if (appEntry && !appEntry.file.endsWith('_shell.html')) return appFiles.send(req, res, appEntry);
+      // A page the shell owns is answered with the shell, and that check comes
+      // before the classic player's files. Otherwise `/` would be the old
+      // document, which is exactly the confusion this rewrite is meant to end.
+      if (APP_ROUTES.some(pattern => pattern.test(url.pathname))) {
+        const shell = appFiles.lookup('/_shell.html');
+        if (!shell) return send(res, 503, { error: 'The app shell is missing; run the app build' });
+        const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' };
+        if (req.method === 'HEAD') { res.writeHead(200, headers); return res.end(); }
+        res.writeHead(200, headers);
+        return createReadStream(shell.file).pipe(res);
+      }
+      // The classic player keeps working under /classic/ and stays a real set of
+      // files. It is the rollback path while the new shell beds in.
+      if (url.pathname === '/classic' || url.pathname.startsWith('/classic/')) {
+        const rest = url.pathname.slice('/classic'.length) || '/';
+        const entry = staticFiles.lookup(rest);
+        if (entry) return staticFiles.send(req, res, entry);
+        return send(res, 404, { error: 'Not found' });
+      }
       const entry = staticFiles.lookup(url.pathname);
       if (entry) return staticFiles.send(req, res, entry);
     }
