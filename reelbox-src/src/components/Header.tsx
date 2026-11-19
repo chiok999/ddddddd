@@ -30,15 +30,6 @@ export function Header() {
           className="w-full min-w-0 bg-transparent text-sm outline-none"
         />
       </form>
-      {/* The classic player is still reachable while the new UI beds in: one
-          link, no hidden state, and easy to remove once it is not needed. */}
-      <a
-        href="/classic/"
-        className="col-span-2 -mt-1 text-right text-[10px] text-muted-foreground"
-        title="Open the previous interface"
-      >
-        Classic player
-      </a>
     </header>
   );
 }

@@ -3,7 +3,6 @@ import { Link, createFileRoute } from '@tanstack/react-router';
 import { Header } from '../components/Header';
 import { api, type Item, type Section } from '../lib/api';
 import { posterUrl } from '../lib/art';
-import { itemStore } from '../lib/item-store';
 
 export const Route = createFileRoute('/ranking')({
   head: () => ({
@@ -32,7 +31,6 @@ function Ranking() {
   }, []);
 
   useEffect(() => {
-    if (sections) itemStore.putAll(sections.flatMap((s) => s.items));
   }, [sections]);
 
   /**

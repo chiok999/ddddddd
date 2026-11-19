@@ -66,7 +66,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
             {busy ? 'Signing in…' : 'Sign in'}
           </button>
           <p className="mt-4 text-center text-[11px] text-muted-foreground">
-            The same password as the classic player.
+            The password you set for this server.
           </p>
         </form>
       </div>

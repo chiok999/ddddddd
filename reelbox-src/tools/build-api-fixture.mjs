@@ -7,8 +7,16 @@ await build({
   logLevel: 'error',
   build: {
     outDir: 'dist-test',
+    // Shared with the engine fixture, so the directory is cleared once, by the
+    // engine build, and both entries are written here.
     emptyOutDir: false,
-    lib: { entry: 'src/lib/api.ts', formats: ['es'], fileName: () => 'api.mjs' },
+    // Two entries: the API contract, and the item store, which is what decides
+    // whether a tapped card can be opened at all.
+    lib: {
+      entry: { api: 'src/lib/api.ts', 'item-store': 'src/lib/item-store.ts' },
+      formats: ['es'],
+      fileName: (_format, name) => `${name}.mjs`,
+    },
     minify: false,
   },
 });

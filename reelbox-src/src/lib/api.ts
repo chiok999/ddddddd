@@ -6,6 +6,10 @@
  * symptom is a blank home screen.
  */
 
+import { itemStore } from './item-store';
+import type { Item, Section } from './types';
+export type { Item, Section } from './types';
+
 export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) {
@@ -15,28 +19,6 @@ export class ApiError extends Error {
 }
 
 /** A catalog entry, already bound to this session by the server. */
-export interface Item {
-  id: string;
-  title: string;
-  type?: string;
-  year?: number | string;
-  overview?: string;
-  poster?: string | null;
-  source?: string;
-  anime?: boolean;
-  imdbId?: string | null;
-}
-
-export interface Section {
-  id: string;
-  title?: string;
-  source?: string;
-  groups?: string[];
-  genreTopId?: string;
-  error?: string | null;
-  items: Item[];
-}
-
 export interface Stream {
   provider: string;
   quality?: number | null;
@@ -97,17 +79,35 @@ const post = <T,>(path: string, data: unknown) =>
     body: JSON.stringify(data),
   });
 
+// Every entry Troy returns is bound to this session and expires, and the detail
+// and player pages hold only an id, so the entry has to be kept somewhere. This
+// is done in the API layer on purpose: it was previously done by one route
+// (/ranking) and forgotten by the others, which made every card tapped from Home
+// or Explore open a page saying the title no longer existed.
+const keep = <T extends { items: Item[] }>(sections: T[]) => {
+  itemStore.putAll(sections.flatMap((section) => section.items || []));
+  return sections;
+};
+
 export const api = {
   session: () => request<{ authenticated: boolean }>('/api/session').then((x) => x.authenticated),
   login: (password: string) => post<{ ok: true }>('/api/login', { password }),
   logout: () => post<{ ok: true }>('/api/logout', {}),
 
-  discover: () => request<{ sections: Section[] }>('/api/discover').then((x) => x.sections),
+  discover: () => request<{ sections: Section[] }>('/api/discover').then((x) => keep(x.sections)),
   category: (genreTopId: any, page: any) =>
-    post<{ items: Item[]; hasMore: boolean; page: number }>('/api/category', { genreTopId, page }),
+    post<{ items: Item[]; hasMore: boolean; page: number }>('/api/category', { genreTopId, page }).then(
+      (r) => {
+        itemStore.putAll(r.items || []);
+        return r;
+      },
+    ),
   search: (query: any) =>
     post<{ results: Item[]; providers: { provider: string; error: string | null }[] }>('/api/search', {
       query,
+    }).then((r) => {
+      itemStore.putAll(r.results || []);
+      return r;
     }),
   episodes: (id: any) => post<{ episodes: Episode[]; source: string }>('/api/episodes', { id }),
 
