@@ -401,17 +401,17 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  const input=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-f','lavfi','-i','sine=frequency=440','-t','12','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac',fixture],{encoding:'utf8'});assert.equal(input.status,0,input.stderr);
  let opened=0;const t=createTranscoder({tmpdir:dir,executable:bin,startupMs:35000,open:async()=>{opened++;return {ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(fixture))}}});
  try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
- for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.data.length>0);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:segment.data,encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
+ for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.size>0);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:fs.readFileSync(segment.file),encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
  assert.equal(await t.stopFor(job.id,'bob'),false);
  // Hold a segment read across stop: cleanup must not remove the file mid-read.
  const originalRead=fsp.readFile;let entered,release;const reading=new Promise(r=>entered=r),gate=new Promise(r=>release=r);
- fsp.readFile=async function(file,...args){if(String(file).endsWith('/240/index0.ts')){entered();await gate;}return originalRead.call(this,file,...args)};
- try{const inflight=t.read(job.id,'alice','240/index0.ts');await reading;let finished=false;const stopping=t.stopFor(job.id,'alice').then(value=>{finished=true;return value;});await new Promise(r=>setTimeout(r,50));assert.equal(finished,false);release();assert.ok((await inflight).data.length);assert.equal(await stopping,true);}finally{release();fsp.readFile=originalRead;}
+ const originalStat=fsp.stat;fsp.stat=async function(file,...args){if(String(file).endsWith('/240/index0.ts')){entered();await gate;}return originalStat.call(this,file,...args)};
+ try{const inflight=t.read(job.id,'alice','240/index0.ts');await reading;let finished=false;const stopping=t.stopFor(job.id,'alice').then(value=>{finished=true;return value;});await new Promise(r=>setTimeout(r,50));assert.equal(finished,false);release();assert.ok((await inflight).size>0);assert.equal(await stopping,true);}finally{release();fsp.stat=originalStat;}
  assert.equal(await t.read(job.id,'alice','master.m3u8'),null);assert.deepEqual((await fsp.readdir(dir)).sort(),['sample.mp4']);
  const silent=path.join(dir,'silent.mp4');const noAudio=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-t','10','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart',silent],{encoding:'utf8'});assert.equal(noAudio.status,0,noAudio.stderr);
  const statfs=fsp.statfs;let calls=0;fsp.statfs=async()=>{calls++;throw Error('statfs unavailable')};
  const uncapped=createTranscoder({tmpdir:dir,executable:bin,maxBytes:1,minFreeBytes:Number.MAX_SAFE_INTEGER,startupMs:35000,open:async()=>({ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(silent))})});
- try{const small=await uncapped.start({},'alice');await new Promise(r=>setTimeout(r,2500));assert.equal(uncapped.status(small.id,'alice').active,true);assert.equal(calls,0);}finally{fsp.statfs=statfs;await uncapped.close();}
+ try{const small=await uncapped.start({},'alice');await new Promise(r=>setTimeout(r,2500));assert.equal((await uncapped.status(small.id,'alice')).active,true);assert.equal(calls,0);}finally{fsp.statfs=statfs;await uncapped.close();}
 
  }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true})}
 });
@@ -484,8 +484,8 @@ test('production transcoder retains earlier segments throughout an EVENT and fin
   for(let i=0;i<2;i++){
    const quality=['240','360'][i],text=manifests[i].data.toString(),segments=text.split('\n').filter(s=>/^index\d+\.ts$/.test(s));
    assert.match(text,/#EXT-X-PLAYLIST-TYPE:EVENT/);assert.match(text,/#EXT-X-ENDLIST/);assert.ok(segments.length>8);assert.equal(segments[0],'index0.ts');assert.equal(await t.read(job.id,'bob',`${quality}/index0.ts`),null);
-   const first=await t.read(job.id,'alice',`${quality}/index0.ts`),last=await t.read(job.id,'alice',`${quality}/${segments.at(-1)}`);assert.ok(first?.data.length);assert.ok(last?.data.length);
-   for(const part of [first,last]){const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:part.data,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));}
+   const first=await t.read(job.id,'alice',`${quality}/index0.ts`),last=await t.read(job.id,'alice',`${quality}/${segments.at(-1)}`);assert.ok(first?.size>0);assert.ok(last?.size>0);
+   for(const part of [first,last]){const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:fs.readFileSync(part.file),timeout:10000});assert.equal(decode.status,0,String(decode.stderr));}
   }
  }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true});}
 });
@@ -499,8 +499,9 @@ test('production transcoder starts a new conversion at an unconverted MP4 timest
   await assert.rejects(t.start({},'alice',-1),/Invalid seek/);
   const job=await t.start({},'alice',12);assert.equal(requestedOffset,0,'seek still opens input at byte zero');assert.equal(job.offset,12);assert.ok(Math.abs(job.duration-20)<0.1,job.duration);
   for(const quality of ['240','360']){const list=await t.read(job.id,'alice',`${quality}/index.m3u8`);const first=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${quality}/${first}`);
-   const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-frames:v','1','-vf','scale=2:2','-f','rawvideo','-pix_fmt','rgb24','pipe:1'],{input:segment.data,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));assert.ok(decode.stdout[2]>200 && decode.stdout[0]<30,`first frame should be blue, got ${[...decode.stdout.subarray(0,3)]}`);
-   const audio=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:a:0','-f','null','-'],{input:segment.data,timeout:10000});assert.equal(audio.status,0,String(audio.stderr));}
+   const bytes=fs.readFileSync(segment.file);
+   const decode=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-frames:v','1','-vf','scale=2:2','-f','rawvideo','-pix_fmt','rgb24','pipe:1'],{input:bytes,timeout:10000});assert.equal(decode.status,0,String(decode.stderr));assert.ok(decode.stdout[2]>200 && decode.stdout[0]<30,`first frame should be blue, got ${[...decode.stdout.subarray(0,3)]}`);
+   const audio=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:a:0','-f','null','-'],{input:bytes,timeout:10000});assert.equal(audio.status,0,String(audio.stderr));}
   await t.stopFor(job.id,'alice');await assert.rejects(t.start({},'alice',21),/Cannot seek beyond/);
  }finally{await t.close();await fsp.rm(dir,{recursive:true,force:true});}
 });
@@ -532,7 +533,7 @@ if(process.argv.includes('-version')) console.log('fixture');
 else if(process.argv.includes('-encoders')) console.log(' V..... libx264\n A..... aac');
 else if(process.argv.includes('-muxers')) console.log(' E hls');
 else if(process.argv.includes('-filters')) console.log(' ... scale\n ... pad');
-else if(process.argv.includes('full')) console.log('-readrate <speed>\n-readrate_initial_burst <seconds>');
+else if(process.argv.includes('full')) console.log('-readrate_initial_burst <seconds>\n-force_key_frames <timestamps>');
 else if(process.argv.includes('muxer=hls')) console.log('temp_file');
 else {process.stderr.write('No space left on device\n');process.exit(1);}
 `;
@@ -582,11 +583,88 @@ test('expired sessions cannot claim jobs',async()=>{
  try{await assert.rejects(t.start({},'expired'),e=>e.status===401);assert.equal(opened,0);}finally{await t.close();}
 });
 
+test('encoder is given a forced keyframe grid and no self-defeating pacing', {skip:!testFfmpeg,timeout:60000},async()=>{
+ // Three separate regressions this pins down:
+ //  * -g 48 with -hls_time 4 means segments alternate 4.8s/3.2s at 30fps, because
+ //    the muxer splits at the first keyframe at or after a 4s deadline.
+ //  * -readrate below 1 reads the source slower than realtime, so the encoder can
+ //    never overtake playback no matter how fast the box is.
+ //  * an absolute -hls_segment_filename bakes a temp path into the playlist.
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-grid-')),file=path.join(dir,'source.mp4');
+ try{
+  // 30fps on purpose: the rate at which the old flags misbehaved.
+  const gen=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=320x180:rate=30','-f','lavfi','-i','sine=frequency=440','-t','30','-c:v','libx264','-g','30','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac','-shortest',file],{timeout:30000});assert.equal(gen.status,0,String(gen.stderr));
+  const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,startupMs:40000,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+  try{
+   const job=await t.start({},'owner');
+   // Every finished segment must be exactly one grid unit long.
+   const deadline=Date.now()+40000;
+   let playlist='';
+   while(Date.now()<deadline){
+    const list=await t.read(job.id,'owner','240/index.m3u8');
+    if(list){playlist=list.data.toString();if((playlist.match(/index\d+\.ts/g)||[]).length>=3)break;}
+    await new Promise(r=>setTimeout(r,500));
+   }
+   const durations=[...playlist.matchAll(/#EXTINF:([\d.]+)/g)].map(m=>Number(m[1]));
+   assert.ok(durations.length>=3,'need a few segments to judge the grid');
+   for(const duration of durations)assert.equal(duration,4,`segment lengths must sit on the grid, got ${durations}`);
+   // Relative segment names, so the muxer cannot write a temp path into the list.
+   assert.match(playlist,/(^|\n)index\d+\.ts/);
+   assert.doesNotMatch(playlist,/\/tmp\//);
+   // The master playlist must declare codecs or hls.js has to probe a level.
+   const master=(await t.read(job.id,'owner','master.m3u8')).data.toString();
+   assert.match(master,/CODECS="avc1\./);
+   assert.match(master,/#EXT-X-INDEPENDENT-SEGMENTS/);
+  }finally{await t.close();}
+ }finally{await fsp.rm(dir,{recursive:true,force:true});}
+});
+
+test('status reports lead and a verdict, and a failed job still carries its error', {skip:!testFfmpeg,timeout:60000},async()=>{
+ // Regression: `status` was declared twice in the same scope, so hoisting made the
+ // sync copy win and the async one -- the only source of `ahead` -- was dead code.
+ // The player's stall guard reads that field, so it could never fire.
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-status-')),file=path.join(dir,'source.mp4');
+ try{
+  const gen=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-f','lavfi','-i','sine=frequency=440','-t','40','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac','-shortest',file],{timeout:30000});assert.equal(gen.status,0,String(gen.stderr));
+  const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,startupMs:40000,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+  try{
+   const job=await t.start({},'owner');
+   const status=await t.status(job.id,'owner');
+   // Every field the client depends on, on one object.
+   assert.equal(status.active,true);assert.equal(status.error,null);
+   for(const key of ['ahead','encoded'])assert.equal(typeof status[key],'number',key);
+   for(const key of ['canPlay','resumeAt'])assert.equal(typeof status[key],'boolean',key);
+   assert.ok(status.encoded>0,'encoded must be measured from finished segments');
+   assert.equal(status.ahead,status.encoded,'nothing has played yet, so lead is the whole encode');
+   assert.equal(status.canPlay,true);
+   // A reader for somebody else's session gets nothing.
+   assert.equal(await t.status(job.id,'someone-else'),null);
+  }finally{await t.close();}
+ }finally{await fsp.rm(dir,{recursive:true,force:true});}
+});
+
+test('an expired job still reports the error it failed with',async()=>{
+ const {createTranscoder}=require('./transcode');
+ // No executable and no source: the job fails during startup, and the failure
+ // record -- not the live job -- is what has to answer for it.
+ const t=createTranscoder({executable:'/nonexistent/ffmpeg-fixture',startupMs:500});
+ try{
+  const job=await t.start({},'owner').catch(()=>null);
+  assert.equal(job,null,'a job with no usable FFmpeg must not start');
+ }finally{await t.close();}
+});
+
 test('a running converter is not expired just because the viewer pauses', {skip:!testFfmpeg,timeout:30000},async()=>{
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-pause-')),file=path.join(dir,'source.mp4');
- try{const generated=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','20','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:15000});assert.equal(generated.status,0,String(generated.stderr));
+ try{const generated=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=160x90:rate=10','-t','600','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart',file],{timeout:60000});assert.equal(generated.status,0,String(generated.stderr));
+ // 600s of source so the job is still encoding at the 2.3s check below: a short
+ // clip now finishes converting almost immediately (readiness is one segment),
+ // and a finished job genuinely is allowed to expire. The point here is that a
+ // pause must not expire a job that is still running.
  const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,idleMs:1,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
- try{const job=await t.start({},'owner');await new Promise(r=>setTimeout(r,2300));assert.equal(t.status(job.id,'owner')?.active,true);}finally{await t.close();}
+ try{const job=await t.start({},'owner');await new Promise(r=>setTimeout(r,2300));assert.equal((await t.status(job.id,'owner'))?.active,true);}finally{await t.close();}
  }finally{await fsp.rm(dir,{recursive:true,force:true});}
 });
 
@@ -698,7 +776,7 @@ case "$*" in
   *"-muxers"*) printf ' E  hls\\n'; exit 0;;
   *"-filters"*) printf ' ..C scale\\n ..C pad\\n'; exit 0;;
   *"-h muxer=hls"*) printf ' temp_file\\n'; exit 0;;
-  *"-h full"*) printf ' -readrate\\n -readrate_initial_burst\\n'; exit 0;;
+  *"-h full"*) printf ' -readrate_initial_burst\\n -force_key_frames\\n'; exit 0;;
   *"-version"*) printf 'ffmpeg version stub\\n'; exit 0;;
 esac
 exit 0

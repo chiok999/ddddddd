@@ -32,30 +32,45 @@ function reportPosition(){
   const video=$('video');
   const position=(current.seekBase||0)+Math.max(0,video.currentTime||0);
   post('/api/transcode/status',{id:current.transcodeId,position}).then(status=>{
-    if(!status || typeof status.ahead!=='number') return;
-    const lead=Number.isFinite(status.ahead)?status.ahead:0;
-    // Under a second of finished output left means the next segment may not
-    // exist. Pausing here is a visible "buffering" rather than a stall that the
-    // player misreads as broken and restarts.
-    if(lead<1 && !video.paused && !waitingForEncoder){
+    // The server owns the verdict. It used to be inferred here from `ahead`,
+    // but a shadowed function meant `ahead` never arrived and this whole guard
+    // was dead code -- the player simply outran the encoder until hls.js threw a
+    // stall and restarted. Now `canPlay`/`resumeAt` are always present.
+    if(!status || typeof status.canPlay!=='boolean') return;
+    if(!status.canPlay && !video.paused && !waitingForEncoder){
       waitingForEncoder=true;
       video.pause();
       $('playError').textContent='Catching up with the conversion…';
       const resume=setInterval(async()=>{
-        if(current?.transcodeId!==status.id && current?.transcodeId) { clearInterval(resume); waitingForEncoder=false; return; }
+        if(route!=='watch' || !current?.transcodeId){clearInterval(resume);waitingForEncoder=false;return;}
         const next=await post('/api/transcode/status',{id:current.transcodeId,position}).catch(()=>null);
         if(route!=='watch' || !current?.transcodeId){clearInterval(resume);waitingForEncoder=false;return;}
-        if(next && Number(next.ahead)>=3){
+        if(next && next.canPlay && next.resumeAt){
           clearInterval(resume); waitingForEncoder=false;
           $('playError').textContent='';
           video.play().catch(()=>{});
         }
-      },1500);
+      },1000);
     }
-    if(lead>=1 && waitingForEncoder===false && /Catching up/.test($('playError').textContent||'')) $('playError').textContent='';
+    if(status.canPlay && waitingForEncoder===false && /Catching up/.test($('playError').textContent||'')) $('playError').textContent='';
   }).catch(()=>{});
 }
-function startLeadReporting(){stopLeadReporting();reportPosition();leadTimer=setInterval(reportPosition,4000);}
+// Governor: if the buffer is thin, play slightly slow so the encoder catches up
+// rather than stalling outright. preservesPitch is on by default, so 0.92x costs
+// nothing audible, and it recovers on its own once the buffer refills.
+function governRate(){
+  const video=$('video');
+  if(!video || video.paused || waitingForEncoder) return;
+  if(!video.buffered.length) return;
+  const buffered=video.buffered.end(video.buffered.length-1)-video.currentTime;
+  // The viewer's own speed choice is authoritative; the governor only borrows
+  // the rate when the buffer is thin and hands it back above 20s.
+  const chosen=Number($('speed')?.value)||1;
+  const target=buffered<6?Math.min(chosen,0.92):chosen;
+  if(Math.abs((video.playbackRate||1)-target)>0.01) video.playbackRate=target;
+}
+// Sample once a second: a 2s lead threshold cannot be governed by a 4s poll.
+function startLeadReporting(){stopLeadReporting();reportPosition();leadTimer=setInterval(()=>{governRate();reportPosition();},1000);}
 function stopLeadReporting(){if(leadTimer){clearInterval(leadTimer);leadTimer=null;}waitingForEncoder=false;}
 setInterval(()=>{if(route==='watch' && current?.transcodeId && !leadTimer)reportPosition();},45000);
 function stopTranscode(){stopLeadReporting();++transcodeSequence;const pending=pendingRequestId;pendingRequestId=null;if(pending)post('/api/transcode/cancel',{requestId:pending}).catch(()=>{});const id=transcodeJob;transcodeJob=null;if(id)enqueueTranscode(()=>post('/api/transcode/stop',{id})).catch(()=>{});}
@@ -240,7 +255,12 @@ async function playItem(item, fail, isFallback = false, isActive = () => true) {
       // missing one fatal. A fatal error here triggered a fresh conversion, and a
       // fresh conversion starts a new timeline -- which is why playback appeared
       // to jump back to where it already was.
-      activeLevels=[]; hls=new Hls({startLevel:0,startPosition:0,liveDurationInfinity:false,maxBufferLength:120,maxMaxBufferLength:240,backBufferLength:30,maxBufferHole:0.5,highBufferWatchdogPeriod:4,nudgeOffset:0.1,nudgeMaxRetry:60,appendErrorMaxRetry:10,fragLoadPolicy:loadPolicy(40,20000,180000),playlistLoadPolicy:loadPolicy(20,15000,60000),manifestLoadPolicy:loadPolicy(10,15000,60000)}); const player=hls; player.loadSource(outputUrl); player.attachMedia(video);
+      // Buffering targets sized for a playlist produced just ahead of playback, not
+      // for a live edge. 120/240 was two to four minutes of media for hls.js to
+      // hold, which fights the encoder for no benefit; segments are immutable and
+      // re-fetchable, so the back buffer can be small.
+      activeLevels=[];
+      hls=new Hls({startLevel:0,startPosition:0,liveDurationInfinity:false,maxBufferLength:24,maxMaxBufferLength:48,backBufferLength:8,maxBufferHole:0.5,highBufferWatchdogPeriod:4,nudgeOffset:0.1,nudgeMaxRetry:60,appendErrorMaxRetry:10,fragLoadPolicy:loadPolicy(40,20000,180000),playlistLoadPolicy:loadPolicy(20,15000,60000),manifestLoadPolicy:loadPolicy(10,15000,60000)}); const player=hls; player.loadSource(outputUrl); player.attachMedia(video);
       startLeadReporting();
       player.on(Hls.Events.MANIFEST_PARSED, (_event, data)=>{ if(current!==item || hls!==player) return; activeLevels=data.levels || []; const index=activeLevels.findIndex(level=>level.height===preferredHeight); if(index<0){lastTranscodeError='The converted quality is unavailable.';pendingFailure=null;fail();return;} player.currentLevel=index; $('quality').value=String(preferredHeight); if(item.wasPaused!==true) video.play().catch(()=>{if(current===item) $('playError').textContent='Tap play on the video to start.';}); });
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_event,data)=>{ if(current!==item || hls!==player) return; const previous=$('subtitles').value; $('subtitles').replaceChildren(new Option('Off', '-1')); (data.subtitleTracks || []).forEach((track,i)=>$('subtitles').add(new Option(track.name || track.lang || `Track ${i+1}`, String(i)))); if(externalTrack) $('subtitles').add(new Option('English (provider)','external')); if(uploadTrack) $('subtitles').add(new Option('Uploaded subtitles','upload')); if([...$('subtitles').options].some(o=>o.value===previous)) $('subtitles').value=previous; });

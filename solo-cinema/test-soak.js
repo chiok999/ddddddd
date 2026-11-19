@@ -26,7 +26,7 @@ test('five-minute conversion soak tolerates a dropped socket', {skip:!bin,timeou
   const open=createSourceOpener({safeUrl:u=>new URL(u),remote:(url,headers,signal)=>fetch(url,{headers,signal})});
   transcode=createTranscoder({tmpdir:dir,executable:bin,open});const job=await transcode.start({url:base+'/old',refresh:async()=>{refreshes++;return {url:base+'/new'}}},'soak');
   const until=Date.now()+300000;let reads=0,last='';
-  while(Date.now()<until){const list=await transcode.read(job.id,'soak','240/index.m3u8');assert.ok(list,'conversion disappeared');const text=list.data.toString();assert.match(text,/#EXTM3U/);assert.equal(transcode.status(job.id,'soak').active,true);last=text;reads++;await new Promise(r=>setTimeout(r,1000));}
+  while(Date.now()<until){const list=await transcode.read(job.id,'soak','240/index.m3u8');assert.ok(list,'conversion disappeared');const text=list.data.toString();assert.match(text,/#EXTM3U/);assert.equal((await transcode.status(job.id,'soak')).active,true);last=text;reads++;await new Promise(r=>setTimeout(r,1000));}
   assert.ok(dropped,'fixture socket was not dropped');assert.ok(refreshes>0 && resumes>0,'range resume was not exercised');assert.ok((last.match(/index\d+\.ts/g)||[]).length>10);assert.ok(reads>=290);
   console.log(`Soak: ${reads} playlist reads, dropped socket, ${refreshes} refresh(es), ${resumes} range resume(s).`);
  }finally{clearTimeout(timer);await transcode?.close();if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}await fsp.rm(dir,{recursive:true,force:true});}
