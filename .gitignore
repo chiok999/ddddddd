@@ -20,3 +20,6 @@
 
 # scratch debug scripts
 *.tmp.js
+
+# Cloned separately for reference (chiok999/reelbox); not part of this repo
+/reelbox/
