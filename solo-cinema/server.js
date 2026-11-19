@@ -1,4 +1,5 @@
 'use strict';
+const { createReadStream } = require('node:fs');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -372,7 +373,21 @@ const server = http.createServer(async (req, res) => {
     if(url.pathname.startsWith('/transcode/') && req.method==='GET'){
       if(!authorized)return send(res,401,{error:'Login required'});const match=/^\/transcode\/([A-Za-z0-9_-]{32})\/(master\.m3u8|(?:240|360)\/(?:index\.m3u8|index\d+\.ts))$/.exec(url.pathname);
       if(!match)return send(res,404,{error:'Not found'});const result=await transcoder.read(match[1],sid,match[2]);if(!result)return send(res,404,{error:'Transcode unavailable'});
-      res.writeHead(200,{'Content-Type':result.type,'Cache-Control':match[2].endsWith('.ts')?'private, max-age=3600, immutable':'no-store'});return res.end(result.data);
+      const immutable=match[2].endsWith('.ts');
+      const headers={'Content-Type':result.type,'Cache-Control':immutable?'private, max-age=3600, immutable':'no-store'};
+      // A segment is immutable once written, so an ETag makes revalidation free
+      // and Content-Length lets the player size its buffer. Segments are streamed
+      // from disk rather than buffered in the heap.
+      if(result.file){
+        headers['Content-Length']=String(result.size);
+        headers.ETag=`"${match[1]}-${match[2]}-${result.size}"`;
+        res.writeHead(200,headers);
+        const stream=createReadStream(result.file);
+        stream.on('error',()=>res.destroy());
+        res.on('close',()=>stream.destroy());
+        return stream.pipe(res);
+      }
+      res.writeHead(200,headers);return res.end(result.data);
     }
     if (url.pathname.startsWith('/media/') && req.method === 'GET') return send(res, authorized ? 403 : 401, {error:authorized ? 'Direct playback is disabled; conversion is required' : 'Login required'});
     if (req.method === 'GET' || req.method === 'HEAD') {

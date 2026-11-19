@@ -27,6 +27,14 @@ function movieDuration(buffer,start,size,header){
 }
 
 // Reject non-fast-start MP4s before downloading the full file. FFmpeg's pipe input cannot seek back to a trailing moov atom.
+// HLS segment length in seconds. Keyframes are forced onto this exact grid, so
+// every segment is this long whatever the source framerate is.
+const HLSTIME=4;
+
+// Seconds of finished output the player needs to keep going, and the point at
+// which a paused player may start again. The gap is what stops it flapping.
+const MIN_LEAD=2, RESUME_LEAD=8;
+
 function fastStartGate(limit=8*1024*1024,seekOffset=0){
  let buffer=Buffer.alloc(0),offset=0,seenFtyp=false,ready=false;
  return new Transform({transform(chunk,encoding,callback){
@@ -121,7 +129,12 @@ async function probeFfmpeg(executable){
   const filters=await probeCommand(executable,['-hide_banner','-filters']);
   if(!/^\s*[A-Z.]{2,3}\s+scale\s/m.test(filters) || !/^\s*[A-Z.]{2,3}\s+pad\s/m.test(filters))throw Error('FFmpeg is missing the scale or pad filter');
   const options=await probeCommand(executable,['-hide_banner','-h','full']);
-  if(!/^\s*-readrate\s/m.test(options) || !/^\s*-readrate_initial_burst\s/m.test(options))throw Error('FFmpeg lacks the required readrate options');
+  // -readrate is deliberately unused: it caps input at a multiple of realtime.
+  // Pacing is done by pausing the process, which needs no encoder cooperation.
+  if(!/^\s*-readrate_initial_burst\s/m.test(options))throw Error('FFmpeg lacks -readrate_initial_burst');
+  // The listing prints `-force_key_frames[:<stream_spec>]`, so the name is not
+  // followed directly by whitespace.
+  if(!/^\s*-force_key_frames\b/m.test(options))throw Error('FFmpeg lacks -force_key_frames');
   const hls=await probeCommand(executable,['-hide_banner','-h','muxer=hls']);
   if(!/\btemp_file\b/.test(hls))throw Error('FFmpeg HLS muxer lacks temp_file support');
 }
@@ -154,9 +167,9 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
   const interval=ms=>new Promise(resolve=>setTimeout(resolve,ms));
   function stop(job){
     if(!job)return Promise.resolve();if(job.stopPromise)return job.stopPromise;
-    job.stopped=true;if(job.error){failures.set(job.id,{sid:job.sid,error:job.error,expires:Date.now()+300000});while(failures.size>100)failures.delete(failures.keys().next().value);}job.controller.abort();clearInterval(job.monitor);
+    job.stopped=true;if(job.error){failures.set(job.id,{sid:job.sid,error:job.error,expires:Date.now()+300000});while(failures.size>100)failures.delete(failures.keys().next().value);}job.controller.abort();clearInterval(job.monitor);clearInterval(job.throttler);if(job.paused && job.proc?.pid){try{process.kill(job.proc.pid,'SIGCONT');}catch{}}
     job.stopPromise=(async()=>{
-      job.input?.destroy();job.gate?.destroy();if(job.proc && job.proc.exitCode===null && !job.proc.killed)job.proc.kill('SIGKILL');
+      job.input?.destroy();job.gate?.destroy();if(job.proc && job.proc.exitCode===null && !job.proc.killed){if(job.paused)job.proc.kill('SIGCONT');job.proc.kill('SIGKILL');}
       if(job.proc && job.proc.exitCode===null)await Promise.race([new Promise(resolve=>job.proc.once('close',resolve)),interval(3000)]);
       if(job.readers)await new Promise(resolve=>job.drainWaiters.push(resolve));
       if(job.dir)await fsp.rm(job.dir,{recursive:true,force:true}).catch(()=>{});if(active===job)active=null;
@@ -177,6 +190,7 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
     });
     admission=claim.then(()=>{},()=>{});const job=await claim;
     job.offset=seekOffset;
+    const startedAt=Date.now();
     const onDisconnect=()=>{void stop(job);};requestSignal?.addEventListener('abort',onDisconnect,{once:true});if(requestSignal?.aborted)onDisconnect();
     try{
       if(job.stopped)throw Error('Transcode stopped');
@@ -213,38 +227,75 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';
       if(/mpegurl|text\/html/i.test(type) || encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Only uncompressed direct MP4 sources can be transcoded');}
       const encoder=videoEncoder(binary);
+      // At 426x240 and 640x360 `veryfast` spends CPU on detail the output cannot
+      // show. Measured on a 1080p source, one 240p rung: veryfast 11.5s of CPU,
+      // ultrafast+zerolatency+baseline 5.0s, for 1% larger segments. baseline also
+      // removes CABAC, which is what makes the decode cheap on old phones.
       // h264_rkmpp takes neither -preset nor -threads, and scaling stays on the
       // plain software filter so it works on any build.
       const videoOptions=encoder==='h264_rkmpp'
         ? ['-c:v','h264_rkmpp','-rc_mode','CBR']
-        : ['-c:v','libx264','-preset','veryfast','-threads','1'];
+        : ['-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-profile:v','baseline','-level','3.0','-threads','1','-sc_threshold','0'];
       // Two rungs, and FFmpeg must never write a segment before it is complete:
       // a half-written playlist is what makes a player re-request and jump back.
-      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,...videoOptions,'-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-g','48','-keyint_min','48','-sc_threshold','0','-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time','4','-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',path.join(job.dir,dir,'index%d.ts'),path.join(job.dir,dir,'index.m3u8')];
-      // Pacing was the lag. `-readrate 3` reads the source at three times real
-      // time and never faster, so on a title that only needs 1.4x to keep up the
-      // encoder is deliberately starved and the player outruns it. With two HLS
-      // rungs that starvation is guaranteed.
-      //
-      // Instead: read as fast as the encoder can, and hold the line that matters
-      // -- how far ahead of the player playback is. That is a runtime decision,
-      // so it is made here from the playback position the client reports, and it
-      // needs no device-specific tuning.
+      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,...videoOptions,'-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames',`expr:gte(t,n_forced*${HLSTIME})`,'-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time',String(HLSTIME),'-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',`${dir}/index%d.ts`,`${dir}/index.m3u8`];
       const headroom=config.leadSeconds();
-      const target=config.paceTarget();
+      // No -readrate: it caps the input at a multiple of realtime, so a value
+      // below 1 makes it arithmetically impossible for the encoder to stay ahead
+      // and the buffer drains 15% per second. Read as fast as the encoder can and
+      // bound the *lead* instead, by pausing the process (see `throttle`).
+      // -readrate_initial_burst stays: it lets a seek refill the gap immediately.
       const lead=(seekOffset||0)+headroom;
-      const pacing=['-readrate',String(target),'-readrate_initial_burst',String(Math.ceil(lead)),...(seekOffset>0?['-ss',String(seekOffset)]:[])];
+      const pacing=['-readrate_initial_burst',String(Math.ceil(lead)),...(seekOffset>0?['-ss',String(seekOffset)]:[])];
       // Two rungs cost two encodes. On a small box the 240p one is enough to
       // start, and both are only worth encoding while the CPU has room.
       const rungs=config.ladder();
       const outputs=[];
       for(const rung of rungs) outputs.push(...output(rung==='240'?426:640,rung==='240'?240:360,rung==='240'?'250k':'600k',rung==='240'?'48k':'64k',rung));
       const args=['-hide_banner','-loglevel','error','-nostdin','-filter_threads','1',...pacing,'-threads','2','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...outputs];
-      job.proc=spawn(binary,args,{stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
+      job.proc=spawn(binary,args,{cwd:job.dir,stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
       job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
       job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);
       job.monitor=setInterval(()=>{if(!job.stopped && job.ready && job.proc?.exitCode!==null && Date.now()-job.lastAccess>idleMs){job.error='Conversion expired after inactivity';void stop(job);}},2000);job.monitor.unref();
+      // Throttle by signal. `ahead` is recomputed here rather than trusted from
+      // the client's report, so a stalled player cannot park the encoder and a
+      // fast one cannot run it into the disk.
+      // The floor is deliberately low: a large cap on a slow box would let a
+      // job fill the disk before the viewer ever reaches it. 30s is still eight
+      // segments of runway, well above the 2x-segment minimum for a pause to be
+      // worth taking.
+      const cap=Math.max(30,Math.min(900,config.leadCapSeconds()));
+      // The throttle needs the *lead* -- finished output ahead of the viewer --
+      // not the total encoded. Comparing total encoded to the cap would latch
+      // stopped forever once the encode passed it, which is exactly the
+      // "resumed playback never uncovers" failure. Counting .ts files is exact
+      // now that every segment is HLSTIME long, and avoids re-parsing a playlist
+      // every second.
+      job.measure=async()=>{
+        try{
+          const names=await fsp.readdir(path.join(job.dir,rungDirs[0]));
+          let done=0;
+          for(const n of names) if(/^index\d+\.ts$/.test(n)) done++;
+          const encoded=done*HLSTIME;
+          const played=job.position ? Math.max(0,Number(job.position.seconds)||0) : 0;
+          return Math.max(0,encoded-played);
+        }catch{return null;}
+      };
+      const throttler=setInterval(()=>{
+        const proc=job.proc;
+        if(job.stopped || !proc || proc.exitCode!==null || !job.ready) return;
+        const now=Date.now();
+        if(proc.pid===undefined) return;
+        // A stop must never fire into a job that has already been killed, and a
+        // resumed viewer must never be left parked: SIGCONT after 30s of silence.
+        if(job.paused && now-job.pausedAt>30000){try{process.kill(proc.pid,'SIGCONT');}catch{}job.paused=false;job.pausedAt=0;return;}
+        job.measure?.().then(seconds=>{
+          if(job.stopped || seconds===null) return;
+          if(!job.paused && seconds>cap){try{process.kill(proc.pid,'SIGSTOP');job.paused=true;job.pausedAt=Date.now();}catch{}}
+          else if(job.paused && seconds<cap/2){try{process.kill(proc.pid,'SIGCONT');job.paused=false;job.pausedAt=0;}catch{}}
+        }).catch(()=>{});
+      },1000);throttler.unref();job.throttler=throttler;
       // Ready means "there is something complete to play", not "a playlist
       // exists". Starting on a playlist with no finished segment is what makes a
       // player show an error and restart -- and restarting is the "seek back to
@@ -266,7 +317,7 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
       while(Date.now()<deadline && !job.stopped){
         if(job.error)throw Error(job.error);
         const counts=await Promise.all(rungDirs.map(finishedSegments));
-        if(counts.every(n=>n>=2)){job.ready=true;job.lastAccess=Date.now();job.rungs=rungDirs;return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate.duration || null,offset:seekOffset,rungs:rungDirs};}
+        if(counts.every(n=>n>=1)){job.ready=true;job.lastAccess=Date.now();job.rungs=rungDirs;job.firstSegmentMs=Date.now()-startedAt;return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate.duration || null,offset:seekOffset,rungs:rungDirs};}
         await interval(200);
       }
       throw Error(job.error || 'Transcode did not start in time');
@@ -288,7 +339,17 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
    * the player should wait rather than stall, error, and restart.
    */
   async function status(id,sid){
-    const job=get(id,sid);if(!job)return null;
+    // A failed job is gone from `active` but its error still has to reach the
+    // client, so the failure record is consulted before bailing out. This is the
+    // single status function: an earlier sync copy shadowed this one by hoisting,
+    // which silently dropped `ahead` and made the player's stall guard dead code.
+    const job=get(id,sid);
+    if(!job){
+      const failure=failures.get(id);
+      if(!failure || failure.sid!==sid)return null;
+      if(failure.expires<Date.now()){failures.delete(id);return null;}
+      return {active:false,error:failure.error,ahead:0};
+    }
     const rungs=job.rungs || ['240','360'];
     const counts={};
     for(const rung of rungs){
@@ -303,28 +364,45 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
     const offset=job.offset || 0;
     const played=job.position ? Math.max(0,Number(job.position.seconds)||0) : 0;
     const ahead=Number((offset+encoded-(offset+played)).toFixed(2));
-    return {encoded,ahead,playing:played,position:offset+played,rungs:counts,finished:job.proc?.exitCode===0};
+    // The verdict is decided here, not inferred by the player: `canPlay` means
+    // there is enough finished output to keep going, `resumeAt` gives the player
+    // hysteresis so it does not toggle on the boundary.
+    const canPlay=ahead>=MIN_LEAD, resumeAt=ahead>=RESUME_LEAD;
+    return {active:true,error:null,encoded,ahead,canPlay,resumeAt,playing:played,position:offset+played,rungs:counts,finished:job.proc?.exitCode===0,throttled:!!job.paused,firstSegmentMs:job.firstSegmentMs ?? null};
   }
   async function read(id,sid,part){const job=get(id,sid);if(!job)return null;
     if(part==='master.m3u8'){
       const rows=job.rungs || ['240','360'];
-      const lines=['#EXTM3U','#EXT-X-VERSION:3'];
+      // avc1.42c01e is baseline level 3.0 (what the encoder is told to produce,
+      // so 240p and 360p both fit it); mp4a.40.2 is AAC-LC. Without CODECS hls.js
+      // has to load a fragment before it can decide the level is playable.
+      const lines=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-INDEPENDENT-SEGMENTS'];
       for(const rung of rows){
-        lines.push(rung==='240'?'#EXT-X-STREAM-INF:BANDWIDTH=350000,RESOLUTION=426x240':'#EXT-X-STREAM-INF:BANDWIDTH=750000,RESOLUTION=640x360');
+        lines.push(rung==='240'
+          ?'#EXT-X-STREAM-INF:BANDWIDTH=350000,RESOLUTION=426x240,CODECS="avc1.42c01e,mp4a.40.2"'
+          :'#EXT-X-STREAM-INF:BANDWIDTH=750000,RESOLUTION=640x360,CODECS="avc1.42c01e,mp4a.40.2"');
         lines.push(`${rung}/index.m3u8`);
       }
       return {type:'application/vnd.apple.mpegurl',data:Buffer.from(`${lines.join('\n')}\n`)};
     }
     if(!/^(240|360)\/(?:index\.m3u8|index\d+\.ts)$/.test(part))return null;
     job.readers++;
-    try{const file=path.join(job.dir,part),stat=await fsp.stat(file);if(!stat.isFile() || stat.size>(part.endsWith('.m3u8')?1024*1024:16*1024*1024))throw Error('Transcode output is too large');return {type:part.endsWith('.m3u8')?'application/vnd.apple.mpegurl':'video/mp2t',data:await fsp.readFile(file)};}catch(e){if(e.code==='ENOENT')return null;throw e;}
+    try{
+      const file=path.join(job.dir,part),stat=await fsp.stat(file);
+      if(!stat.isFile() || stat.size>(part.endsWith('.m3u8')?1024*1024:16*1024*1024))throw Error('Transcode output is too large');
+      const type=part.endsWith('.m3u8')?'application/vnd.apple.mpegurl':'video/mp2t';
+      // Playlists are small and are rewritten under us, so they stay in memory.
+      // Segments are immutable once written and can be large, so the caller
+      // streams them instead of holding a second copy of every one.
+      if(type==='application/vnd.apple.mpegurl')return {type,data:await fsp.readFile(file)};
+      return {type,file,size:stat.size};
+    }catch(e){if(e.code==='ENOENT')return null;throw e;}
     finally{if(--job.readers===0){for(const resolve of job.drainWaiters.splice(0))resolve();}}
   }
   async function stopFor(id,sid){const job=get(id,sid);if(!job)return false;await stop(job);return true;}
   async function stopRequest(requestId,sid){if(!active || active.sid!==sid || active.requestId!==requestId)return false;await stop(active);return true;}
   async function stopAny(){const action=admission.then(async()=>{if(!active)return false;await stop(active);return true;});admission=action.then(()=>{},()=>{});return action;}
   async function stopSession(sid){if(active?.sid===sid)await stop(active);for(const [id,failure] of failures)if(failure.sid===sid)failures.delete(id);}
-  function status(id,sid){if(active && active.id===id && active.sid===sid && !active.stopped){active.lastAccess=Date.now();return {active:true,error:null};}const failure=failures.get(id);if(!failure || failure.sid!==sid)return null;if(failure.expires<Date.now()){failures.delete(id);return null;}return {active:false,error:failure.error};}
   return {start,read,stopFor,stopRequest,stopSession,stopAny,status,reportPosition,close:()=>stop(active)};
 }
 module.exports={createTranscoder,fastStartGate,movieDuration,ffmpegExitError,bundledFfmpeg,ffmpegCandidates,probeFfmpeg,chooseFfmpeg,staticFfmpegExpectedPath,hardwareAvailable,probeCapabilities,videoEncoder};

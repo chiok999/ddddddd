@@ -9,6 +9,8 @@
  * test that changes a variable between cases is still honoured.
  */
 
+const { statfsSync } = require('node:fs');
+
 const RUNG_HEIGHTS = ['240', '360'];
 
 function number(name, fallback, { min, max, integer = false } = {}) {
@@ -31,9 +33,30 @@ function leadSeconds() {
   return number('CINEMA_LEAD_SECONDS', 12, { min: 2, max: 30, integer: true });
 }
 
-/** Encoder pace as a multiple of real time. Below 1 it can never outrun playback. */
-function paceTarget() {
-  return number('CINEMA_PACE_TARGET', 0.85, { min: 0.2, max: 1.2 });
+/**
+ * How far ahead of playback the encoder may run, in seconds.
+ *
+ * Sized from free disk rather than a constant: "always ahead" that fills the
+ * volume is not ahead of anything. Both rungs together write roughly 282 KB/s,
+ * so this is minutes of runway rather than a guess. Bounded so a small tmpfs
+ * still gets a usable window and a large disk does not convert a whole film
+ * nobody is going to watch to the end.
+ */
+function leadCapSeconds() {
+  // An explicit setting wins: a tiny tmpfs or a shared volume needs a bound the
+  // free-space figure cannot know about.
+  if (process.env.CINEMA_LEAD_CAP_SECONDS !== undefined && process.env.CINEMA_LEAD_CAP_SECONDS !== '') {
+    return number('CINEMA_LEAD_CAP_SECONDS', 600, { min: 30, max: 900, integer: true });
+  }
+  const fallback = 600;
+  try {
+    const stat = statfsSync(require('node:os').tmpdir());
+    const free = Number(stat.bavail) * Number(stat.bsize);
+    if (!Number.isFinite(free) || free <= 0) return fallback;
+    return Math.max(30, Math.min(900, Math.floor((free * 0.6) / (282 * 1000))));
+  } catch {
+    return fallback;
+  }
 }
 
 /** Which ladder rungs to build, in the order they appear in the master playlist. */
@@ -59,7 +82,7 @@ function startupMs() {
 module.exports = {
   RUNG_HEIGHTS,
   leadSeconds,
-  paceTarget,
+  leadCapSeconds,
   ladder,
   idleMs,
   startupMs,
