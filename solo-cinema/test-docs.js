@@ -87,3 +87,20 @@ test('the documented test count is not a lie', () => {
   const claimed = Number(found[1]);
   assert.ok(claimed >= 100 && claimed <= 400, `claimed ${claimed}, which is not this suite`);
 });
+
+test('the documented subtitle retiming describes what the code does', () => {
+  // The README claimed captions were "retimed for the restarted conversion" while
+  // nothing retimed them anywhere: not Troy, not the player. It was the single
+  // most expensive false claim in these documents, because it described the exact
+  // behaviour a viewer notices within seconds and blamed the browser for it.
+  const readme = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8');
+  const route = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8');
+  assert.ok(fs.existsSync(path.join(__dirname, 'caption-shift.js')), 'the shifter must exist');
+  assert.match(route, /caption-shift/, 'the caption route must call it');
+  // The claim must be present and must be about the window, not about the browser.
+  assert.match(readme, /retimed into the converted window/i);
+  assert.doesNotMatch(readme, /when browser cue APIs allow it/i,
+    'the old browser-dependent claim must not come back');
+  // And it must say what it assumes, since that is the part that can silently rot.
+  assert.match(readme, /timed against the whole film/i);
+});

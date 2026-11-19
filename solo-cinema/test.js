@@ -401,17 +401,21 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);
  // The advertised BANDWIDTH is what a player's bandwidth estimation compares
  // against, so it has to stay above the rung's real output or ABR will believe
- // 640x360 fits a connection it does not. Measured: ~250 kbps and ~531 kbps.
+ // 640x360 fits a connection it does not. Measured through this pipeline: ~130
+ // kbps on 240p, ~260 kbps on 360p; the ceilings are their `-maxrate` plus audio.
  const declared=[...master.data.toString().matchAll(/BANDWIDTH=(\d+)/g)].map(m=>Number(m[1]));
- assert.deepEqual(declared,[270000,620000]);
- assert.ok(declared[1]>531000,'360p must not be advertised below what it emits');assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
+ assert.deepEqual(declared,[290000,580000]);
+ assert.ok(declared[1]>500000,'360p must not be advertised below its maxrate plus audio');
+ // A CRF ladder can emit less than its ceiling, but never more: if it did, the
+ // declared BANDWIDTH is a lie and ABR picks a rung the connection cannot hold.
+ assert.ok(declared[0]>=250000,'240p must cover its own maxrate');assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
  for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.size>0);
  // Data cost is a product decision, not an implementation detail: 360p was
  // costing roughly twice the bytes of 240p for a picture a phone cannot
  // resolve. Measured through this pipeline on synthetic noise, which is the
  // worst case for any encoder: 240p 298->221 kbps and 360p 689->491 kbps. The
  // ceilings sit between the two so a return to the old 250k/600k ladder fails.
- const kbps=(segment.size*8/4)/1000;assert.ok(kbps<(level==='240'?270:620),`${level}p is emitting ${Math.round(kbps)} kbps`);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:fs.readFileSync(segment.file),encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
+ const kbps=(segment.size*8/4)/1000;assert.ok(kbps<(level==='240'?290:580),`${level}p is emitting ${Math.round(kbps)} kbps`);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:fs.readFileSync(segment.file),encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
  assert.equal(await t.stopFor(job.id,'bob'),false);
  // Hold a segment read across stop: cleanup must not remove the file mid-read.
  const originalRead=fsp.readFile;let entered,release;const reading=new Promise(r=>entered=r),gate=new Promise(r=>release=r);
@@ -983,4 +987,136 @@ test('a category page returns the provider order, signals more, and stops at the
   assert.equal((await post('/api/category',{genreTopId:'1234',page:'2'},cookie)).status,400);
   assert.equal((await post('/api/category',{genreTopId:'1234'},{})).status,401);
  }finally{child.kill();}
+});
+
+test('captions are retimed into a converted window and cues behind it are dropped',async()=>{
+ const {shift,parse,format}=require('./caption-shift');
+ // Both timestamp forms the spec allows, plus the comma separator that arrives
+ // with captions converted from SRT.
+ assert.equal(parse('00:30:00.000'),1800);
+ assert.equal(parse('01:02.500'),62.5);
+ assert.equal(parse('00:00:07,250'),7.25);
+ assert.equal(parse('not a time'),null);
+ assert.equal(format(0),'00:00:00.000');
+ assert.equal(format(3661.5),'01:01:01.500');
+ assert.equal(format(-4),'00:00:00.000');
+
+ const vtt=['WEBVTT','X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000','',
+  '1','00:00:10.000 --> 00:00:12.000','long before the window','',
+  '2','00:29:59.000 --> 00:30:02.000','straddles the seek point','',
+  '3','00:30:05.000 --> 00:30:08.000 align:start','inside it',''].join('\n');
+ const out=shift(vtt,1800);
+ // Cue 1 is entirely behind the window: it must not render, and it must not leave
+ // its identifier behind either (an identifier with no timing is stray text).
+ assert.ok(!out.includes('long before the window'));
+ assert.ok(!/^\s*1\s*$/m.test(out),'the dropped cue must take its identifier with it');
+ // The cue the viewer is in the middle of starts at the top of the window.
+ assert.match(out,/00:00:00\.000 --> 00:00:02\.000\nstraddles the seek point/);
+ // Cue settings after the timestamp survive the rewrite.
+ assert.match(out,/00:00:05\.000 --> 00:00:08\.000 align:start\ninside it/);
+ // A timestamp map pins cues to the *source* PTS, which the window does not share.
+ assert.ok(!/X-TIMESTAMP-MAP/.test(out));
+ assert.match(out,/^WEBVTT/);
+
+ // `from` of zero is the common case: it must return the input untouched, byte for
+ // byte, rather than re-serialising a file that needed no change.
+ assert.equal(shift(vtt,0),vtt);
+ assert.equal(shift(vtt,-5),vtt);
+
+ // A window after every cue yields a file with no cues at all, and still a header.
+ const empty=shift(vtt,99999);
+ assert.ok(!empty.includes('-->'));
+ assert.match(empty,/^WEBVTT/);
+});
+
+test('a seeked job reports lead relative to its window, not the full timeline',{skip:!testFfmpeg,timeout:90000},async()=>{
+ // Regression, and the most expensive one in this file. `status` used to return
+ // `offset + played` as the position while measuring `encoded` from the window
+ // start, so `ahead` came out understated by exactly the seek offset: on a job
+ // seeked to 30 s with 30 s encoded and the viewer at 30 s it reported -30, and
+ // the player waited 30 s before it would admit playback could start. At a deeper
+ // seek the wait is the offset, which is the whole film.
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-seek-')),file=path.join(dir,'source.mp4');
+ try{
+  // Long enough that a 30 s seek leaves real media on both sides of the cut.
+  const gen=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=320x180:rate=15','-f','lavfi','-i','sine=frequency=440','-t','60','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac','-shortest',file],{timeout:40000});
+  assert.equal(gen.status,0,String(gen.stderr));
+  const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,startupMs:60000,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+  try{
+   const job=await t.start({},'owner',30);
+   assert.equal(job.offset,30,'the job must report the window it starts at');
+   // Wait for output to actually exist, so `encoded` is a real number.
+   let status=null;
+   for(let i=0;i<120;i++){status=await t.status(job.id,'owner');if(status && status.encoded>=4)break;await new Promise(r=>setTimeout(r,250));}
+   assert.ok(status&&status.encoded>=4,`encoded never reached one segment: ${JSON.stringify(status)}`);
+   // Nothing has played yet: the whole window is lead, and it must not be
+   // inflated by the offset the way `offset + played` inflated the position.
+   assert.equal(status.ahead,status.encoded,'lead is the encoded span when nothing has played');
+   assert.equal(status.canPlay,true);
+   // The viewer reports an absolute position on the full timeline, as the player
+   // does. Sitting exactly at the window start means zero seconds consumed.
+   await t.reportPosition(job.id,'owner',30);
+   const atStart=await t.status(job.id,'owner');
+   assert.equal(atStart.ahead,status.encoded,'being at the window start consumes no lead');
+   // Two seconds into the window consumes two seconds of lead, not 32.
+   await t.reportPosition(job.id,'owner',32);
+   const played=await t.status(job.id,'owner');
+   assert.ok(Math.abs(played.ahead-(status.encoded-2))<0.01,`expected ${status.encoded-2}, got ${played.ahead}`);
+  }finally{await t.close();}
+ }finally{await fsp.rm(dir,{recursive:true,force:true});}
+});
+
+test('the caption route applies the requested window instead of serving the raw file',async()=>{
+ // The unit test above would still pass if `server.js` stopped passing `from`
+ // through, and the raw track is exactly the broken behaviour: every cue fires
+ // `offset` seconds early and the ones behind the window all fire at once. There
+ // is no provider-free way to reach that route over HTTP -- the caption map is
+ // only filled by a provider fetch -- so the wiring is asserted at the source.
+ const fs=require('node:fs'),server=fs.readFileSync(require('node:path').join(__dirname,'server.js'),'utf8');
+ const route=server.slice(server.indexOf("url.pathname.startsWith('/caption/')"));
+ assert.ok(route.length>0,'the caption route must exist');
+ assert.match(route,/caption-shift/,'the route must retime rather than serve the stored text');
+ assert.match(route,/searchParams\.get\('from'\)/,'the window must come from the request');
+ // And the response must be the shifted body, not the entry.
+ assert.match(route,/res\.end\(body\)/);
+ assert.ok(!/res\.end\(entry\.text\)/.test(route),'the raw text must not be served');
+});
+
+test('a rung with no finished segment is not advertised, and lead ignores it',{skip:!testFfmpeg,timeout:90000},async()=>{
+ // Readiness opens on the *first* rung having a segment, so the second can
+ // legitimately have nothing yet. Advertising it anyway made a player select a
+ // variant whose playlist did not exist and stall; and `status` reported zero
+ // lead because it took the minimum across every rung, including that empty one.
+ // Reproduced here by removing a rung's playlist from a finished job, which is
+ // the same state the gate exists to hide.
+ const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+ const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-rung-')),file=path.join(dir,'source.mp4');
+ try{
+  const gen=spawnSync(testFfmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=320x180:rate=15','-f','lavfi','-i','sine=frequency=440','-t','14','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac','-shortest',file],{timeout:40000});
+  assert.equal(gen.status,0,String(gen.stderr));
+  const t=createTranscoder({tmpdir:dir,executable:testFfmpeg,startupMs:60000,open:async()=>({status:200,body:Readable.toWeb(fs.createReadStream(file)),headers:new Headers({'content-type':'video/mp4'})})});
+  try{
+   const job=await t.start({},'owner');
+   const master=async()=>(await t.read(job.id,'owner','master.m3u8')).data.toString();
+   // Both rungs are up: both listed, in the declared order.
+   for(let i=0;i<200 && !(await master()).includes('360/index.m3u8');i++)await new Promise(r=>setTimeout(r,100));
+   assert.match(await master(),/240\/index\.m3u8/);
+   assert.match(await master(),/360\/index\.m3u8/);
+   const before=await t.status(job.id,'owner');
+   assert.ok(before.encoded>0);
+   // Now make the second rung look like it has produced nothing.
+   const jobDir=(await fsp.readdir(dir)).map(n=>path.join(dir,n)).find(n=>{try{return fs.statSync(path.join(n,'360')).isDirectory();}catch{return false;}});
+   assert.ok(jobDir,'the job directory must be visible under tmpdir');
+   await fsp.rename(path.join(jobDir,'360','index.m3u8'),path.join(jobDir,'360','index.m3u8.gone'));
+   const after=await master();
+   assert.match(after,/240\/index\.m3u8/,'the working rung stays listed');
+   assert.ok(!after.includes('360/index.m3u8'),'an empty rung must not be advertised');
+   // ...and the lead must still describe the rung that is actually being served,
+   // rather than collapsing to zero because a hidden rung has nothing.
+   const status=await t.status(job.id,'owner');
+   assert.ok(status.encoded>0,'lead must not be zeroed by a rung nobody can request');
+   assert.equal(status.ahead,status.encoded);
+  }finally{await t.close();}
+ }finally{await fsp.rm(dir,{recursive:true,force:true});}
 });

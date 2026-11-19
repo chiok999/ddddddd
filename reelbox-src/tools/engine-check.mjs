@@ -51,7 +51,9 @@ let responses = {};
 globalThis.fetch = async (url, init) => {
   calls.push({ url, body: init?.body ? JSON.parse(init.body) : null });
   const handler = responses[url];
-  const result = typeof handler === 'function' ? handler(init) : handler;
+  // Awaited so a handler can model a slow response. Conversion really is slow, and
+  // the interval before it answers is when a stale caption track does its damage.
+  const result = await (typeof handler === 'function' ? handler(init) : handler);
   if (!result) throw new Error(`unexpected fetch ${url}`);
   if (result instanceof Error) throw result;
   // A response without an explicit status is a success; one with a status is a
@@ -300,6 +302,92 @@ await check('seeking past the converted window restarts the conversion there', a
   const after = calls.filter((c) => c.url === '/api/transcode');
   assert.equal(after.length, before + 1, 'past the window needs a new conversion');
   assert.equal(after.at(-1).body.offset, 1800, 'and it starts at the requested point');
+});
+
+// 7b. The caption track is requested for the window it will be shown in.
+await check('the caption track is asked for the current window, not the whole film', async () => {
+  tracks.length = 0;
+  const { engine } = makeEngine();
+  responses['/api/resolve'] = resolved([{ provider: 'moviebox', format: 'file', url: '/media/s', captionId: 'cap1' }]);
+  responses['/api/transcode'] = job('d'.repeat(32), 3600);
+  responses['/api/transcode/status'] = { body: { canPlay: true } };
+  responses['/api/moviebox-subtitle'] = { body: { url: '/caption/xyz789' } };
+  // Start at 600 s. Provider captions are timed against the whole film, so a
+  // track fetched without `from` fires every cue ten minutes early -- and every
+  // cue before 600 s fires at once on load.
+  await engine.start({ ...target, startAt: 600 });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(tracks.length, 1);
+  assert.equal(tracks[0].src, '/caption/xyz789?from=600.000');
+  assert.equal(engine.subtitleState().on, false, 'still hidden on arrival');
+});
+
+// 7c. A restart must not turn the viewer's captions off behind their back.
+await check('subtitles stay on across a seek that restarts the conversion', async () => {
+  tracks.length = 0;
+  const { engine, video } = makeEngine();
+  responses['/api/resolve'] = resolved([{ provider: 'moviebox', format: 'file', url: '/media/s', captionId: 'cap1' }]);
+  responses['/api/transcode'] = job('e'.repeat(32), 3600);
+  responses['/api/transcode/status'] = { body: { canPlay: true } };
+  responses['/api/moviebox-subtitle'] = { body: { url: '/caption/on1' } };
+  await engine.start(target);
+  await new Promise((r) => setTimeout(r, 30));
+  engine.toggleSubtitle();
+  assert.equal(engine.subtitleState().on, true);
+  const firstTrack = tracks[0];
+  video.duration = 300;
+  video.seekable = { length: 1, start: () => 0, end: () => 300 };
+  // A real restart waits at least a segment's worth of conversion. That wait is
+  // the whole point: it is the interval in which a stale track is wrong.
+  const nextJob = responses['/api/transcode'];
+  responses['/api/transcode'] = () =>
+    new Promise((r) => setTimeout(() => r(nextJob), 150));
+  engine.seek(1800);
+  // The restart takes as long as a conversion does -- tens of seconds -- so the
+  // old track must be detached *when the restart begins*, not when the new one
+  // arrives. If it is left attached, its cues keep firing over the new picture
+  // for the whole wait, timed against a window the viewer has already left.
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!tracks.includes(firstTrack), 'the old window\'s track is detached at once');
+  assert.equal(firstTrack.removed, true);
+  await new Promise((r) => setTimeout(r, 600));
+  // And the requests are what prove it was re-fetched.
+  const asked = calls.filter((c) => c.url === '/api/moviebox-subtitle');
+  assert.equal(asked.length, 2, 'the new window asks for the caption again');
+  assert.equal(tracks.length, 1, 'and only one track is ever attached');
+  const latest = tracks[0];
+  assert.equal(latest.src, '/caption/on1?from=1800.000', 'retimed for the new window');
+  assert.equal(latest.track.mode, 'showing', 'the viewer already asked for captions');
+  assert.equal(engine.subtitleState().on, true, 'and the button still says so');
+});
+
+// 7d. A failed-over stream re-asks for its own caption without losing the choice.
+await check('a failed-over provider keeps the subtitle choice', async () => {
+  tracks.length = 0;
+  const { engine } = makeEngine();
+  responses['/api/resolve'] = resolved([
+    { provider: 'moviebox', format: 'file', url: '/media/one', captionId: 'cap1' },
+    { provider: 'moviebox', format: 'file', url: '/media/two', captionId: 'cap2' },
+  ]);
+  responses['/api/transcode'] = job('f'.repeat(32), 600);
+  responses['/api/transcode/status'] = { body: { canPlay: true } };
+  responses['/api/moviebox-subtitle'] = { body: { url: '/caption/first' } };
+  await engine.start({ ...target, startAt: 90 });
+  globalThis.__hls.emit('manifest', {});
+  await new Promise((r) => setTimeout(r, 30));
+  engine.toggleSubtitle();
+  assert.equal(engine.subtitleState().on, true);
+  responses['/api/moviebox-subtitle'] = { body: { url: '/caption/second' } };
+  globalThis.__hls.emit('error', { fatal: true, details: 'failed' });
+  await new Promise((r) => setTimeout(r, 500));
+  // The retry ladder re-converts the same stream first, so the second provider is
+  // only reached after that. What matters is which track ends up attached.
+  const asked = calls.filter((c) => c.url === '/api/moviebox-subtitle');
+  assert.ok(asked.length >= 2, `expected the caption to be re-fetched, saw ${asked.length}`);
+  const latest = tracks.at(-1);
+  assert.match(latest.src, /from=/, 'the new track is still retimed to the window');
+  assert.equal(latest.track.mode, 'showing', 'the choice survives the failover');
+  assert.equal(engine.subtitleState().on, true);
 });
 
 // 8. A failed conversion on the last provider names what was tried.

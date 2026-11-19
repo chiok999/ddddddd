@@ -255,3 +255,34 @@ receives `-profile:v high` or `-crf`.
 - Real-time encode ratios were measured on 2 cores. A 1 vCPU panel will be
   several times slower, which makes the `medium` vs `veryfast` decision
   deployment-specific — exactly as the prompt says.
+
+## What was implemented, and where the prescription was corrected
+
+All of the above is now in the code, in one change. Where implementation found the
+prescription wrong, the correction is recorded here rather than followed silently.
+
+| item | what shipped | correction |
+|---|---|---|
+| 1.1 double offset | `played` is absolute, `watched = played - offset`, `position: played` | the throttle's copy of the same bug had to be fixed too, and it was worse there: with `played` un-removed the throttle never paused, so the encoder could overrun the disk by a whole seek offset |
+| 1.2 `counts.every` | readiness opens on the first rung; master playlist lists a rung once it has a segment | this **caused** a new inconsistency: `status` took the minimum across every rung, so a not-yet-listed rung reported zero lead. `status` now counts only the rungs the playlist advertises |
+| 1.3 `MIN_LEAD` | `MIN_LEAD = HLSTIME`, `RESUME_LEAD = HLSTIME*3` | — |
+| 1.4 threads | `-threads 0` on x264, `-filter_threads` and the input-side `-threads 2` dropped | gain is 5.83x → 6.79x realtime, i.e. **+16%**, not the large factor the prompt implied |
+| 1.5 burst flag | removed, along with the startup probe that required it | it was inert, not harmful — but a flag nothing sets is a claim the code does not honour |
+| 1.6 governor | engage below 5 s, release above 9 s | — |
+| Track 2 | `caption-shift.js`, `?from=` on `/caption/`, client sends the window, track detached at `start()`, on-state preserved | the suggested shift algorithm leaves the **cue identifier** orphaned when it drops a cue behind the window, which some players render as stray text; that is fixed. `clearSubtitleEl` also had to stop resetting `subtitleActive`, and the choice has to be re-applied when the new track arrives — removing the reset alone is not enough |
+| 3.1/3.2 x264 | `medium`/`high`/crf27 for 360p, `veryfast`/`main`/crf30 for 240p, explicit `-x264-params`, ceilings 500k/250k | applied to **both** rungs: 240p at crf30 keeps the data-cheap rung cheap (96 → 57 MB/h), which is a product requirement, not an optimisation |
+| 3.3 AAC-HE | **not applied** | fails on both `aac` and `libfdk_aac` in the build we ship |
+| 3.4 fMP4 | **not applied** | out of scope for this change; the init-path escape and the real count of four regexes were confirmed and are recorded above |
+| 3.5 `avc1.64001f` | `avc1.4d401f` (240p) and `avc1.64001f` (360p) | the two rungs now emit genuinely different profiles, so **one CODECS string for both is no longer true**. Both verified by reading the SPS out of a real segment |
+| README | the "retimed when browser cue APIs allow it" line replaced; the 433 MB/h figure replaced with measured bytes | the old figure described bitrate targeting that no longer exists |
+
+Measured after the change, on 2 cores, 40 s of 1080p input:
+
+| rung | before | after |
+|---|---|---|
+| 360p | 491 kbps, 216 MB/h, SSIM 0.9919, 12.1x realtime | 260 kbps, 114 MB/h, SSIM 0.9937, 6.2x realtime |
+| 240p | 217 kbps, 96 MB/h, SSIM 0.9844, 13.4x realtime | 130 kbps, 57 MB/h, SSIM 0.9784, 11.5x realtime |
+
+The 360p rung is the one that pays in CPU, and 6.2x realtime still leaves room on
+this box. On a 1 vCPU panel that would not hold, which is why the prompt's
+`veryfast` fallback matters; the preset is a one-line change at `videoOptions`.

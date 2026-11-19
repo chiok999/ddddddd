@@ -331,7 +331,12 @@ const server = http.createServer(async (req, res) => {
       if (!authorized) return send(res,401,{error:'Login required'});
       const entry=captions.get(url.pathname.slice(9));
       if (!entry || entry.sid!==sid || entry.expires<Date.now()) return send(res,404,{error:'Subtitle expired'});
-      res.writeHead(200,{'Content-Type':'text/vtt; charset=utf-8','Cache-Control':'no-store'}); return res.end(entry.text);
+      // Captions are stored once, raw, against the full timeline. A converted
+      // window starts near zero, so `from` moves the cues into it on read. Keeping
+      // the text raw is what lets one download serve every window.
+      const from=Number(url.searchParams.get('from'));
+      const body=Number.isFinite(from) && from>0 ? require('./caption-shift').shift(entry.text,from) : entry.text;
+      res.writeHead(200,{'Content-Type':'text/vtt; charset=utf-8','Cache-Control':'no-store'}); return res.end(body);
     }
     if (url.pathname === '/api/resolve' && req.method === 'POST') {
       if (!authorized) return send(res, 401, { error: 'Login required' });

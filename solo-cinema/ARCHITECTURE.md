@@ -46,6 +46,8 @@ It is **not** a download, and it is **not** a completed file.
 |---|---|---|
 | concurrent jobs | 1, server-wide | `transcode.js` returns 409 to a second session |
 | rungs | 240p and 360p | `config.ladder()` |
+| rate control | CRF 30 (240p) / CRF 27 (360p), ceiling 250k / 500k | `transcode.js` |
+| codec profile | main @3.1 (240p) / high @3.1 (360p) | declared in the master playlist |
 | segment length | 4 s | `HLSTIME` |
 | startup deadline | 45 s | `config.startupMs()` |
 | idle expiry | 10 min | `config.idleMs()` |
@@ -109,12 +111,14 @@ Stated plainly, because earlier notes drifted into implying otherwise:
   proof that a stream resolves or survives URL expiry.
 - Subtitle positioning for native fullscreen, picture-in-picture, vertical and
   non-WebVTT captions is approximate.
+- Caption retiming assumes every provider times its captions against the whole
+  film. If one ever returned window-relative cues they would be shifted twice.
 - Concurrency, memory and disk behaviour under load on Botkeep are unknown.
 
 ## Testing
 
 ```bash
-npm test     # 129 tests
+npm test     # 140 tests
 ```
 
 They fall into four groups: the HTTP surface (auth, origin checks, session
