@@ -1,7 +1,13 @@
-# ReelBox — reconstructed source
+# ReelBox — the Troy interface
 
-Human-readable source for the **ReelBox** mobile streaming UI, reconstructed from the
-compiled build in `chiok999/reelbox` (`dist/`, built from a `bun run build`).
+Source for the **ReelBox** mobile streaming UI. It started as a reconstruction of the
+compiled build in `chiok999/reelbox`; it is now the interface Troy serves at `/`, wired
+to Troy's real catalog, search, episodes and transcoder rather than to placeholder data.
+
+The build is copied into `solo-cinema/app/dist/public/` and served by `solo-cinema`'s
+existing server, so the deployment stays one process on one port with no build step on
+the host. See `solo-cinema/UI.md` for the routing rules, the CSP changes and how to go
+back to the classic player.
 
 ## Why this exists
 
@@ -43,10 +49,29 @@ public/favicon.ico
 
 ```bash
 npm install
-npm run dev        # http://localhost:8792
-npm run build      # → dist/
-npm run preview
+npm run dev        # http://localhost:8792 -- against a Troy on :3000, or its own API mock
+npm run build      # builds and publishes into ../solo-cinema/app/dist/public
+npm test:engine    # 8 playback behaviours, mutation-checked
+npm test:api       # request shapes against Troy's validation
 ```
+
+`npm run dev` serves the shell alone; it has no API of its own, so sign-in and catalog
+calls need a Troy running behind the same origin. For local UI work that is annoying, so
+the checks above run against fixtures instead.
+
+## How it connects
+
+- `src/lib/api.ts` — every Troy endpoint the UI uses, in one place, so a failure has one
+  shape. Bodies are asserted in `tools/api-check.mjs` against each handler's validation.
+- `src/lib/playback.ts` — resolve → convert → play, ported from the classic player with
+  the original bug-and-rule comments kept. See `solo-cinema/UI.md`.
+- `src/lib/item-store.ts` — catalog ids are bound to the session that fetched them and
+  expire after an hour, so entries are kept in memory (mirrored to sessionStorage) rather
+  than re-fetched by id, which Troy does not support.
+- `src/lib/art.ts` — artwork through wsrv.nl, with the hostname allowlist the classic UI
+  used.
+- `src/lib/library.ts` — My List and history on the original `rb:*` keys, progress and
+  quality on Troy's existing `solo-*` keys, so the two UIs agree.
 
 ## Reconstruction notes
 

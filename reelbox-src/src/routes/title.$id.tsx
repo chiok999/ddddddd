@@ -1,151 +1,175 @@
-import { useState } from 'react';
-import { Link, createFileRoute, notFound } from '@tanstack/react-router';
-import { Check, Play, Plus, Share2, Star } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Link, createFileRoute } from '@tanstack/react-router';
+import { Check, Play, Plus } from 'lucide-react';
 import { Header } from '../components/Header';
-import { PosterCard } from '../components/PosterCard';
-import { getTitle, titles } from '../lib/movies';
+import { api, type Episode } from '../lib/api';
+import { backdropFor, posterUrl } from '../lib/art';
 import { toggleList, useLib } from '../lib/library';
+import { itemStore } from '../lib/item-store';
+
+interface Search {
+  season?: number;
+  episode?: number;
+}
 
 export const Route = createFileRoute('/title/$id')({
-  loader: ({ params }) => {
-    const t = getTitle(params.id);
-    if (!t) throw notFound();
-    return t;
-  },
-  head: ({ loaderData: t }) => ({
+  validateSearch: (raw: Record<string, unknown>): Search => ({
+    season: raw.season ? Number(raw.season) : undefined,
+    episode: raw.episode ? Number(raw.episode) : undefined,
+  }),
+  head: () => ({
     meta: [
-      { title: `${t?.title} (${t?.year}) — ReelBox` },
-      { name: 'description', content: t?.description },
-      { property: 'og:title', content: `${t?.title} — ReelBox` },
-      { property: 'og:description', content: t?.description },
-      { property: 'og:image', content: t?.backdrop },
-      { name: 'twitter:image', content: t?.backdrop },
+      { title: 'Title — ReelBox' },
+      { name: 'description', content: 'Title details, cast and episodes.' },
     ],
   }),
   component: Detail,
 });
 
 function Detail() {
-  const t = Route.useLoaderData();
-  const saved = useLib('list').includes(t.id);
+  const { id } = Route.useParams();
+  const item = itemStore.get(id);
+  const saved = useLib('list').includes(id);
+  const [episodes, setEpisodes] = useState<Episode[] | null>(null);
+  const [source, setSource] = useState('');
   const [season, setSeason] = useState(1);
-  const similar = titles
-    .filter((x) => x.id !== t.id && x.genres.some((g) => t.genres.includes(g)))
-    .slice(0, 10);
+
+  const series = item?.type === 'series' || item?.type === 'show';
+
+  useEffect(() => {
+    if (!series) return;
+    let live = true;
+    api
+      .episodes(id)
+      .then((r) => {
+        if (!live) return;
+        setEpisodes(r.episodes);
+        setSource(r.source);
+        const first = r.episodes[0];
+        if (first) setSeason(first.season);
+      })
+      .catch(() => live && setEpisodes([]));
+    return () => {
+      live = false;
+    };
+  }, [id, series]);
+
+  if (!item) {
+    return (
+      <div>
+        <Header />
+        <div className="px-3 py-16 text-center">
+          <h1 className="font-display text-lg font-bold">This title is no longer loaded</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Catalog entries are bound to the session that fetched them. Reload the page you came from, or search
+            again.
+          </p>
+          <Link to="/browse" search={{ q: undefined, g: undefined, t: undefined }} className="btn-ghost mt-4">
+            Search again
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  const art = backdropFor(item) || posterUrl(item.poster);
+  const seasons = [...new Set((episodes || []).map((e) => e.season))];
+  const inSeason = (episodes || []).filter((e) => e.season === season);
 
   return (
-    <div className="min-h-screen">
+    <div>
       <Header />
       <section className="relative">
-        <img
-          src={t.backdrop}
-          alt=""
-          className="absolute inset-0 h-full w-full object-cover opacity-40"
-        />
+        {art && <img src={art} alt="" className="absolute inset-0 h-full w-full object-cover opacity-40" />}
         <div className="hero-fade absolute inset-0" />
         <div className="relative grid grid-cols-[7rem_minmax(0,1fr)] gap-4 px-3 py-6">
-          <img src={t.poster} alt={t.title} className="w-28 rounded-xl shadow-2xl" />
+          {posterUrl(item.poster) ? (
+            <img src={posterUrl(item.poster)!} alt={item.title} className="w-28 rounded-xl shadow-2xl" />
+          ) : (
+            <div className="aspect-[2/3] w-28 rounded-xl bg-secondary" />
+          )}
           <div className="min-w-0">
-            <h1 className="font-display text-xl font-bold line-clamp-2">{t.title}</h1>
+            <h1 className="font-display text-xl font-bold line-clamp-3">{item.title}</h1>
             <p className="mt-1 flex flex-wrap gap-x-2 text-xs text-muted-foreground">
-              <span className="flex items-center gap-1">
-                <Star className="h-4 w-4 fill-primary text-primary" />
-                {t.rating}
-              </span>
-              {t.year}
-              {' · '}
-              {t.type}
-              {' · '}
-              {t.duration}
-              {' · '}
-              {t.country}
+              {item.year && <span>{item.year}</span>}
+              <span>·</span>
+              <span>{item.anime ? 'Anime' : series ? 'Series' : 'Film'}</span>
+              {item.source && (
+                <>
+                  <span>·</span>
+                  <span className="uppercase">{item.source}</span>
+                </>
+              )}
             </p>
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {t.genres.map((g) => (
-                <span key={g} className="rounded-full bg-secondary px-2 py-0.5 text-[11px]">
-                  {g}
-                </span>
-              ))}
-            </div>
           </div>
           <div className="col-span-2">
-            <p className="text-sm text-muted-foreground">{t.description}</p>
-            <p className="mt-2 text-xs">
-              <span className="text-muted-foreground">Cast: </span>
-              {t.cast.join(', ')}
-            </p>
+            {item.overview && <p className="text-sm text-muted-foreground">{item.overview}</p>}
           </div>
-          <div className="col-span-2 grid grid-cols-3 gap-2">
+          <div className="col-span-2 flex gap-2">
             <Link
               to="/watch/$id"
-              params={{ id: t.id }}
-              search={{}}
-              className="btn-primary justify-center px-2"
+              params={{ id: item.id }}
+              search={{ s: series ? season : undefined, e: series ? inSeason[0]?.episode : undefined }}
+              className="btn-primary"
             >
               <Play className="h-4 w-4 fill-current" />
               Play
             </Link>
-            <button onClick={() => toggleList(t.id)} className="btn-ghost justify-center px-2">
+            <button onClick={() => toggleList(item.id)} className="btn-ghost">
               {saved ? <Check className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
               My list
-            </button>
-            <button
-              onClick={() => navigator.clipboard?.writeText(location.href)}
-              className="btn-ghost justify-center px-2"
-            >
-              <Share2 className="h-4 w-4" />
-              Share
             </button>
           </div>
         </div>
       </section>
 
-      <div className="px-3">
-        {t.seasons && (
-          <section className="py-6">
-            <div className="no-scrollbar flex gap-2 overflow-x-auto">
-              {Array.from({ length: t.seasons }, (_, k) => (
-                <button
-                  key={k}
-                  onClick={() => setSeason(k + 1)}
-                  className={`shrink-0 rounded-full px-4 py-1.5 text-sm ${
-                    season === k + 1 ? 'bg-primary text-primary-foreground' : 'bg-secondary'
-                  }`}
-                >
-                  Season {k + 1}
-                </button>
-              ))}
-            </div>
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              {Array.from({ length: 8 }, (_, e) => (
-                <Link
-                  key={e}
-                  to="/watch/$id"
-                  params={{ id: t.id }}
-                  search={{ s: season, e: e + 1 }}
-                  className="flex items-center gap-3 rounded-lg bg-card p-3 hover:bg-secondary"
-                >
-                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded bg-primary/15 text-primary">
-                    <Play className="h-4 w-4" />
-                  </span>
-                  <span className="truncate text-xs">
-                    S{season} · Episode {e + 1}
-                  </span>
-                </Link>
-              ))}
-            </div>
-          </section>
-        )}
-
-        <section className="py-6">
-          <h2 className="mb-3 font-display text-xl font-bold">You may also like</h2>
-          <div className="no-scrollbar flex gap-4 overflow-x-auto pb-2">
-            {similar.map((x) => (
-              <PosterCard key={x.id} t={x} />
-            ))}
-          </div>
+      {series && (
+        <section className="px-3 py-4">
+          <h2 className="mb-2 flex items-baseline gap-2 font-display text-lg font-bold">
+            Episodes
+            <span className="text-[10px] font-normal uppercase text-muted-foreground">{source}</span>
+          </h2>
+          {episodes === null ? (
+            <p className="text-xs text-muted-foreground">Loading the episode list…</p>
+          ) : episodes.length === 0 ? (
+            <p className="text-xs text-muted-foreground">No episode list is available; play will use episode 1.</p>
+          ) : (
+            <>
+              {seasons.length > 1 && (
+                <div className="no-scrollbar mb-3 flex gap-2 overflow-x-auto">
+                  {seasons.map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => setSeason(s)}
+                      className={`shrink-0 rounded-full px-4 py-1.5 text-sm ${
+                        season === s ? 'bg-primary text-primary-foreground' : 'bg-secondary'
+                      }`}
+                    >
+                      Season {s}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                {inSeason.map((e) => (
+                  <Link
+                    key={`${e.season}-${e.episode}`}
+                    to="/watch/$id"
+                    params={{ id }}
+                    search={{ s: e.season, e: e.episode }}
+                    className="flex items-center gap-3 rounded-lg bg-card p-3 hover:bg-secondary"
+                  >
+                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded bg-primary/15 text-primary">
+                      <Play className="h-4 w-4" />
+                    </span>
+                    <span className="truncate text-xs">{e.title || `Episode ${e.episode}`}</span>
+                  </Link>
+                ))}
+              </div>
+            </>
+          )}
         </section>
-      </div>
+      )}
     </div>
   );
 }

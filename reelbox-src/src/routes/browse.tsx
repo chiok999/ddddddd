@@ -1,117 +1,157 @@
-import { Link, createFileRoute } from '@tanstack/react-router';
+import { useEffect, useMemo, useState } from 'react';
+import { createFileRoute } from '@tanstack/react-router';
+import { Search as SearchIcon } from 'lucide-react';
 import { Header } from '../components/Header';
 import { PosterCard } from '../components/PosterCard';
-import { genres, titles } from '../lib/movies';
+import { api, type Item } from '../lib/api';
 
 interface Search {
   q?: string;
-  type?: string;
-  genre?: string;
-  sort?: 'rating' | 'year';
+  /** Genre rail opened from "See more". */
+  g?: string;
+  t?: string;
 }
 
 export const Route = createFileRoute('/browse')({
-  validateSearch: (s: Record<string, unknown>): Search => ({
-    q: typeof s.q === 'string' ? s.q : undefined,
-    type: typeof s.type === 'string' ? s.type : undefined,
-    genre: typeof s.genre === 'string' ? s.genre : undefined,
-    sort: s.sort === 'rating' || s.sort === 'year' ? s.sort : undefined,
+  validateSearch: (raw: Record<string, unknown>): Search => ({
+    q: typeof raw.q === 'string' && raw.q ? raw.q : undefined,
+    g: typeof raw.g === 'string' && /^\d{1,25}$/.test(raw.g) ? raw.g : undefined,
+    t: typeof raw.t === 'string' ? raw.t : undefined,
   }),
   head: () => ({
     meta: [
-      { title: 'Browse & Search — ReelBox' },
-      { name: 'description', content: 'Filter movies, series and anime by type, genre and rating.' },
-      { property: 'og:title', content: 'Browse & Search — ReelBox' },
-      {
-        property: 'og:description',
-        content: 'Filter movies, series and anime by type, genre and rating.',
-      },
+      { title: 'Explore — ReelBox' },
+      { name: 'description', content: 'Search and browse movies, series and anime by type, genre and rating.' },
+      { property: 'og:title', content: 'Explore — ReelBox' },
+      { property: 'og:description', content: 'Search and browse movies, series and anime by type, genre and rating.' },
     ],
   }),
   component: Browse,
 });
 
-const types = [undefined, 'Movie', 'TV Series', 'Anime'] as const;
-const sorts = [
-  [undefined, 'Popular'],
-  ['rating', 'Top rated'],
-  ['year', 'Newest'],
-] as const;
-
-function Chip({
-  active,
-  to,
-  search,
-  children,
-}: {
-  active: boolean;
-  to: '/browse';
-  search: Search;
-  children: React.ReactNode;
-}) {
-  return (
-    <Link
-      to={to}
-      search={search}
-      className={`shrink-0 rounded-full px-3 py-1 text-xs ${
-        active ? 'bg-primary text-primary-foreground' : 'bg-secondary'
-      }`}
-    >
-      {children}
-    </Link>
-  );
-}
-
 function Browse() {
-  const s = Route.useSearch();
-  const q = (s.q || '').toLowerCase();
+  const { q, g, t } = Route.useSearch();
+  const [query, setQuery] = useState(q || '');
+  const [results, setResults] = useState<Item[] | null>(null);
+  const [providers, setProviders] = useState<{ provider: string; error: string | null }[]>([]);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
 
-  let r = titles.filter(
-    (t) =>
-      (!q || t.title.toLowerCase().includes(q)) &&
-      (!s.type || t.type === s.type) &&
-      (!s.genre || t.genres.includes(s.genre)),
-  );
-  if (s.sort) r = [...r].sort((a, b) => (b[s.sort!] as number) - (a[s.sort!] as number));
+  useEffect(() => setQuery(q || ''), [q]);
+
+  // A search replaces the list; a category page appends to it, because "see
+  // more" is a continuation and not a new question.
+  useEffect(() => {
+    let live = true;
+    setError('');
+    setResults(null);
+    setPage(1);
+    setHasMore(false);
+    if (g) {
+      setBusy(true);
+      api
+        .category(g, 1)
+        .then((r) => {
+          if (!live) return;
+          setResults(r.items);
+          setHasMore(!!r.hasMore);
+        })
+        .catch((e) => live && setError(e.message))
+        .finally(() => live && setBusy(false));
+    } else if (q) {
+      setBusy(true);
+      api
+        .search(q)
+        .then((r) => {
+          if (!live) return;
+          setResults(r.results);
+          setProviders(r.providers);
+        })
+        .catch((e) => live && setError(e.message))
+        .finally(() => live && setBusy(false));
+    } else {
+      setResults([]);
+    }
+    return () => {
+      live = false;
+    };
+  }, [q, g]);
+
+  const more = async () => {
+    if (!g || busy) return;
+    setBusy(true);
+    try {
+      const next = page + 1;
+      const r = await api.category(g, next);
+      setResults((prev) => [...(prev || []), ...r.items]);
+      setPage(next);
+      setHasMore(!!r.hasMore);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const failed = useMemo(() => providers.filter((p) => p.error).map((p) => `${p.provider}: ${p.error}`), [providers]);
+  const heading = g ? t || 'Category' : 'Explore';
 
   return (
-    <div className="min-h-screen">
+    <div>
       <Header />
       <div className="px-3 py-4">
-        <h1 className="font-display text-xl truncate font-bold">
-          {s.q ? `Results for "${s.q}"` : 'Browse'}
-        </h1>
+        <h1 className="font-display text-xl font-bold">{heading}</h1>
 
-        <div className="mt-5 space-y-2">
-          <div className="no-scrollbar flex gap-2 overflow-x-auto">
-            {types.map((t) => (
-              <Chip key={t || 'all'} to="/browse" search={{ ...s, type: t }} active={s.type === t}>
-                {t ?? 'All types'}
-              </Chip>
-            ))}
-          </div>
-          <div className="no-scrollbar flex gap-2 overflow-x-auto">
-            {[undefined, ...genres].map((g) => (
-              <Chip key={g || 'all'} to="/browse" search={{ ...s, genre: g }} active={s.genre === g}>
-                {g ?? 'All genres'}
-              </Chip>
-            ))}
-          </div>
-          <div className="no-scrollbar flex gap-2 overflow-x-auto">
-            {sorts.map(([v, label]) => (
-              <Chip key={label} to="/browse" search={{ ...s, sort: v }} active={s.sort === v}>
-                {label}
-              </Chip>
-            ))}
-          </div>
-        </div>
+        <form
+          className="mt-3 flex items-center gap-2 rounded-full bg-secondary px-3 py-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const next = query.trim();
+            if (next) window.history.pushState({}, '', `/browse?q=${encodeURIComponent(next)}`);
+            window.dispatchEvent(new PopStateEvent('popstate'));
+          }}
+        >
+          <SearchIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search a title…"
+            aria-label="Search a title"
+            maxLength={150}
+            className="w-full min-w-0 bg-transparent text-sm outline-none"
+          />
+        </form>
 
-        <div className="mt-5 grid grid-cols-3 gap-3">
-          {r.map((t) => (
-            <PosterCard key={t.id} t={t} grid />
-          ))}
-        </div>
-        {!r.length && <p className="mt-10 text-muted-foreground">Nothing found.</p>}
+        {failed.length > 0 && (
+          <p className="mt-2 text-[11px] text-muted-foreground">Some providers did not answer — {failed.join(' · ')}</p>
+        )}
+        {error && <p className="mt-4 rounded-lg bg-secondary p-3 text-sm">{error}</p>}
+
+        {results === null ? (
+          <p className="py-16 text-center text-sm text-muted-foreground">{busy ? 'Searching…' : ''}</p>
+        ) : results.length === 0 ? (
+          <p className="py-16 text-center text-sm text-muted-foreground">
+            {g || q ? 'Nothing found. Try a different title or category.' : 'Search for a film or series to begin.'}
+          </p>
+        ) : (
+          <>
+            <p className="mb-2 mt-4 text-xs text-muted-foreground">
+              {results.length} title{results.length === 1 ? '' : 's'}
+            </p>
+            <div className="grid grid-cols-3 gap-3">
+              {results.map((item) => (
+                <PosterCard key={item.id} item={item} grid />
+              ))}
+            </div>
+            {hasMore && (
+              <button onClick={more} disabled={busy} className="btn-ghost mt-4 w-full justify-center">
+                {busy ? 'Loading…' : 'Load more'}
+              </button>
+            )}
+          </>
+        )}
       </div>
     </div>
   );

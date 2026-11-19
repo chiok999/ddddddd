@@ -40,11 +40,20 @@ function createStatic({ root, vendored = new Map() } = {}) {
     const vendoredFile = vendored.get(urlPath);
     if (vendoredFile) return path.join(root, vendoredFile);
     const name = urlPath === '/' ? 'index.html' : urlPath.replace(/^\//, '');
-    // One flat directory: no subpaths, no dotfiles. A traversal attempt has a
-    // slash or a leading dot and is refused before it touches the filesystem.
-    if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) return null;
-    const file = path.join(publicDir, name);
-    return path.dirname(file) === publicDir ? file : null;
+    if (!name) return null;
+    // Subdirectories are allowed because the app shell has its own `assets/`
+    // directory and a hashed bundle is not a hand-kept table either. Every
+    // segment is still checked, so `..`, a leading dot, or a backslash is
+    // refused before the filesystem is touched -- this is the same rule as
+    // before, applied per segment instead of to the whole path.
+    const segments = name.split('/');
+    if (segments.some(segment => !segment || segment.startsWith('.') || segment.includes('\\'))) return null;
+    const file = path.join(publicDir, ...segments);
+    // The resolved path must stay inside `public/`, which is a stronger check
+    // than comparing the parent directory now that nesting is permitted.
+    const relative = path.relative(publicDir, file);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    return file;
   }
 
   /** @returns {{file:string,type:string,size:number,modified:Date}|null} */

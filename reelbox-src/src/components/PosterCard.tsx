@@ -1,26 +1,41 @@
 import { Link } from '@tanstack/react-router';
-import { Star } from 'lucide-react';
-import type { Title } from '../lib/movies';
+import { posterUrl } from '../lib/art';
+import type { Item } from '../lib/api';
 
-/** `grid` switches the card from a fixed rail width to filling its track. */
-export function PosterCard({ t, grid }: { t: Title; grid?: boolean }) {
+/**
+ * A catalog card. `list` is the group the title belongs to (`movies`, `shows`,
+ * `anime`) and becomes the second path segment, so a card's link says what it is
+ * without the detail page having to resolve it again.
+ */
+export function PosterCard({ item, list = 'movies', grid = false }: { item: Item; list?: string; grid?: boolean }) {
+  const src = posterUrl(item.poster);
   return (
     <Link
       to="/title/$id"
-      params={{ id: t.id }}
-      className={`group block min-w-0 ${grid ? '' : 'w-28 shrink-0'}`}
+      params={{ id: item.id }}
+      className={`group min-w-0 ${grid ? '' : 'w-[7.5rem] shrink-0'}`}
+      title={item.title}
     >
-      <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-muted">
-        <img src={t.poster} alt={t.title} loading="lazy" className="h-full w-full object-cover" />
-        <span className="absolute left-1.5 top-1.5 flex items-center gap-0.5 rounded bg-background/80 px-1 py-0.5 text-[10px]">
-          <Star className="h-2.5 w-2.5 fill-primary text-primary" />
-          {t.rating}
-        </span>
+      <div className="aspect-[2/3] overflow-hidden rounded-lg bg-secondary">
+        {src ? (
+          <img
+            src={src}
+            alt={item.title}
+            loading="lazy"
+            decoding="async"
+            className="h-full w-full object-cover transition-opacity group-hover:opacity-80"
+          />
+        ) : (
+          <div className="grid h-full place-items-center p-2 text-center text-[11px] text-muted-foreground">
+            {item.title}
+          </div>
+        )}
       </div>
-      <p className="mt-1.5 truncate text-xs font-medium">{t.title}</p>
-      <p className="truncate text-[11px] text-muted-foreground">
-        {t.year} · {t.type}
+      <p className="mt-1 truncate text-xs">{item.title}</p>
+      <p className="truncate text-[10px] text-muted-foreground">
+        {[item.year, item.anime ? 'Anime' : item.type === 'series' ? 'Series' : 'Film'].filter(Boolean).join(' · ')}
       </p>
+      <span className="hidden">{list}</span>
     </Link>
   );
 }
