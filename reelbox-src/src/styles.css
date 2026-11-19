@@ -216,3 +216,92 @@
     filter: blur(var(--tw-enter-blur, 0));
   }
 }
+
+/* ── Player ────────────────────────────────────────────────────────────────
+   The player is the one screen that is not inside `.app-shell`: on a phone it
+   should be full-bleed, and on a desktop a capped column would leave the video
+   floating in a 480 px strip. */
+
+.player-box {
+  /* Mobile-first: the frame is as tall as the viewport allows and as wide as the
+     screen, and the picture decides the rest. */
+  height: min(56.25vw, 100dvh);
+  max-height: 100dvh;
+}
+
+@media (min-width: 768px) {
+  .player-box {
+    height: min(56.25vw, calc(100dvh - 2rem));
+    border-radius: var(--radius-lg);
+    max-width: 1280px;
+    margin-inline: auto;
+  }
+}
+
+@layer components {
+  /* A control target is 44 px on its smallest side: the WCAG figure, and the
+     difference between a button that works with a thumb and one that does not. */
+  .player-btn {
+    display: grid;
+    place-items: center;
+    width: 2.75rem;
+    height: 2.75rem;
+    border-radius: 9999px;
+    color: var(--foreground);
+    transition: background-color 0.15s, opacity 0.15s;
+  }
+  .player-btn:disabled {
+    opacity: 0.3;
+  }
+  .player-btn:not(:disabled):hover {
+    background: oklch(100% 0 0 / 0.12);
+  }
+
+  /* Notch and home indicator. Both bars sit inside the inset rather than being
+     clipped by it, which is what put the seek bar under the home gesture. */
+  .player-safe-top {
+    padding-top: max(0.5rem, env(safe-area-inset-top));
+    padding-left: max(0.75rem, env(safe-area-inset-left));
+    padding-right: max(0.75rem, env(safe-area-inset-right));
+  }
+  .player-safe-bottom {
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+    padding-left: max(0.75rem, env(safe-area-inset-left));
+    padding-right: max(0.75rem, env(safe-area-inset-right));
+  }
+  .sheet-safe {
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+
+  /* The settings sheet is scrollable: on a small phone in landscape the frame
+     controls land below the fold, and a sheet that cannot scroll hides them. */
+  .player-sheet {
+    max-height: 85dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  /* The transport bar gets a taller hit area than the thin track it draws, so a
+     thumb can grab it without aiming; the track itself is the painted part. */
+  .range-player {
+    height: 1.75rem;
+    background: transparent;
+  }
+  .range-player::-webkit-slider-thumb {
+    width: 16px;
+    height: 16px;
+    box-shadow: 0 0 0 4px oklch(0% 0 0 / 0.35);
+  }
+  .range-player::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border: 0;
+    border-radius: 9999px;
+    background: var(--primary);
+  }
+  /* The painted track lives behind the input, so a filled pseudo-track would
+     double up: only the thumb is styled here. */
+  .range-player::-moz-range-track {
+    background: transparent;
+  }
+}

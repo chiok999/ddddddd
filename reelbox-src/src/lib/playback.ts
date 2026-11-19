@@ -75,8 +75,15 @@ export interface SubtitleState {
 
 export interface PlayerEvents {
   onState: (state: PlaybackState) => void;
-  /** Full-timeline position, for resume bookkeeping. */
-  onProgress: (position: number, duration: number | null, paused: boolean) => void;
+  /**
+   * Full-timeline position, for resume bookkeeping.
+   *
+   * `ahead` is seconds of finished output past the playhead -- what the seek bar
+   * draws as its second layer. It is not the browser's own buffer: during a
+   * conversion the interesting question is how much exists on the server, not how
+   * much has been appended locally.
+   */
+  onProgress: (position: number, duration: number | null, paused: boolean, ahead?: number) => void;
   /** Subtitle availability, which changes per stream rather than per title. */
   onSubtitle?: (state: SubtitleState) => void;
 }
@@ -119,6 +126,8 @@ export class Playback {
   private recoveryTimer: number | null = null;
   private generation = 0;
   private waiting = false;
+  /** Seconds of converted output past the playhead, from the last status poll. */
+  private leadAhead = 0;
   private pausedByViewer = false;
   private attemptedSeek = false;
   private subtitle: SubtitleState = { available: false, on: false, note: '' };
@@ -668,11 +677,12 @@ export class Playback {
     const video = this.video;
     if (!job || !video) return;
     const position = this.totalTime();
-    this.events.onProgress(position, this.duration, this.pausedByViewer || video.paused);
+    this.events.onProgress(position, this.duration, this.pausedByViewer || video.paused, this.leadAhead);
     void api
       .transcodeStatus(job.id, position)
       .then(async (status) => {
         if (!status || typeof status.canPlay !== 'boolean') return;
+        this.leadAhead = typeof status.ahead === 'number' && Number.isFinite(status.ahead) ? Math.max(0, status.ahead) : 0;
         if (!status.canPlay && !video.paused && !this.waiting) {
           // The server owns the verdict: stop, and ask again until it says yes.
           this.waiting = true;
