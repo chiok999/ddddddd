@@ -47,6 +47,9 @@ Set `CINEMA_RELAY=0` to disable the relay and require conversion (the previous b
   modes actually work, with the limits read from the source. Start here.
 - `UI.md` — routing, the app bundle and the CSP hash rule.
 - `RELAY-PERF.md` — what the relay does and the measurements behind it.
+- `PROMPT-REVIEW.md` — a line-by-line check of a proposed three-track
+  remediation, with the encode measurements. Records which claims were true,
+  which were not, and which prescribed fixes would have broken playback.
 
 Earlier audit notes were removed: they had been corrected in place so often that
 their "current policy" headers contradicted both their own bodies and the code.
