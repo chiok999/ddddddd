@@ -103,8 +103,12 @@ function relayUrl(config, target, context = {}) {
 }
 
 /** The signature as a header, for relays reached over plain HTTP. */
-function relayHeaders(config, target) {
-  return config.inQuery === false ? { 'x-troy-sig': sign(config.secret, target) } : {};
+function relayHeaders(config, target, longRead = false) {
+  const headers = config.inQuery === false ? { 'x-troy-sig': sign(config.secret, target) } : {};
+  // Passed through untouched: the relay decides what to do with it, and refusing
+  // an unsigned hint is the relay's job, not this one's.
+  if (longRead) headers['x-troy-upstream-timeout'] = '900000';
+  return headers;
 }
 
 function headerValue(headers, name) {
@@ -160,7 +164,8 @@ function createRelayRemote({ config, send, direct, fallback = false }) {
     });
     let response;
     try {
-      response = await send(request, { accept: 'application/octet-stream', ...relayHeaders(config, target) }, signal);
+      const longRead = headerValue(headers, 'x-troy-upstream-timeout') !== null;
+      response = await send(request, { accept: 'application/octet-stream', ...relayHeaders(config, target, longRead) }, signal);
     } catch (error) {
       if (signal?.aborted) throw error;
       if (fallback && direct) return direct(url, headers, signal);

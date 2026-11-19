@@ -203,7 +203,7 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
       let response=null, attempt=0;
       for(;attempt<3;attempt++){
         const timer=setTimeout(()=>job.controller.abort(),30000);
-        try{response=await open(source,job.controller.signal);}finally{clearTimeout(timer);}
+        try{response=await open(source,job.controller.signal,0,null,true);}finally{clearTimeout(timer);}
         if(job.stopped){await response.body?.cancel();throw Error('Transcode stopped');}
         if(response.status!==426 || seekOffset>0 || attempt===2) break;
         await response.body?.cancel().catch(()=>{});
@@ -263,7 +263,7 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
       job.proc=spawn(binary,args,{cwd:job.dir,stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
       job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
-      job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);
+      job.input=resumableInput(response,async(offset,validator)=>{const timer=setTimeout(()=>job.controller.abort(),30000);try{return await open(source,job.controller.signal,offset,validator,true);}finally{clearTimeout(timer);}},job.controller.signal);job.gate=fastStartGate(8*1024*1024,seekOffset);job.input.on('error',err=>{if(!job.stopped){job.error=err.message || 'Source stream failed';void stop(job);}});job.gate.on('error',err=>{if(!job.stopped){job.error=err.message;void stop(job);}});job.proc.stdin.on('error',()=>{});job.input.pipe(job.gate).pipe(job.proc.stdin);
       job.monitor=setInterval(()=>{if(!job.stopped && job.ready && job.proc?.exitCode!==null && Date.now()-job.lastAccess>idleMs){job.error='Conversion expired after inactivity';void stop(job);}},2000);job.monitor.unref();
       // Throttle by signal. `ahead` is recomputed here rather than trusted from
       // the client's report, so a stalled player cannot park the encoder and a

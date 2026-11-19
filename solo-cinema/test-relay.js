@@ -625,3 +625,80 @@ test('a real environment value still wins over the file', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a pooled socket the CDN closed is retried instead of reported as a failure', async () => {
+  // Node keeps sockets alive by default, so an idle CDN that drops one leaves the
+  // pool holding a dead socket. The next segment then fails with ECONNRESET even
+  // though the request never reached the origin. Previously that surfaced as a
+  // 502 and the player lost a segment; it is now retried once on a fresh socket.
+  const http = require('node:http');
+  const { createRelayServer, sign } = require('./troy-relay-server.js');
+  const SECRET = 'c'.repeat(32);
+  const origin = http.createServer((req, res) => res.end('segment'));
+  await new Promise((resolve) => origin.listen(0, '127.0.0.1', resolve));
+  const server = createRelayServer({ secret: SECRET, allowPrivate: true });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const original = http.request;
+  let calls = 0;
+  http.request = function (options, callback) {
+    calls++;
+    // Fail exactly the first attempt the way a dead pooled socket does.
+    if (calls === 1) {
+      const fake = new (require('node:events').EventEmitter)();
+      fake.end = () => setImmediate(() => {
+        const error = new Error('read ECONNRESET');
+        error.code = 'ECONNRESET';
+        fake.emit('error', error);
+      });
+      fake.destroy = () => {};
+      fake.on = fake.on.bind(fake);
+      return fake;
+    }
+    return original.call(this, options, callback);
+  };
+  try {
+    const target = `http://127.0.0.1:${origin.address().port}/seg.ts`;
+    const url = `http://127.0.0.1:${server.address().port}/?url=${encodeURIComponent(target)}&sig=${sign(SECRET, target)}`;
+    const response = await fetch(url);
+    assert.equal(response.status, 200, 'the segment is served despite the dead socket');
+    assert.equal(await response.text(), 'segment');
+    assert.equal(calls, 2, 'exactly one retry');
+  } finally {
+    http.request = original;
+    await new Promise((r) => server.close(r));
+    await new Promise((r) => origin.close(r));
+  }
+});
+
+test('a client can declare a long read so a film is not cut off mid-stream', async () => {
+  // The transcoder's input is one body read for a whole film, while the relay's
+  // upstream socket deadline is 30 s. The hint is how the two are told apart.
+  const http = require('node:http');
+  const { createRelayServer, sign } = require('./troy-relay-server.js');
+  const SECRET = 'b'.repeat(32);
+  const origin = http.createServer((req, res) => res.end('ok'));
+  await new Promise((resolve) => origin.listen(0, '127.0.0.1', resolve));
+  const server = createRelayServer({ secret: SECRET, allowPrivate: true });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const timeouts = [];
+  const original = http.request;
+  http.request = function (options, callback) {
+    timeouts.push(options.timeout);
+    return original.call(this, options, callback);
+  };
+  try {
+    const target = `http://127.0.0.1:${origin.address().port}/film.mp4`;
+    const base = `http://127.0.0.1:${server.address().port}/?url=${encodeURIComponent(target)}&sig=${sign(SECRET, target)}`;
+    await (await fetch(base, { headers: { 'x-troy-upstream-timeout': '900000' } })).text();
+    assert.equal(timeouts.at(-1), 900000, 'a declared long read raises the socket deadline');
+    await (await fetch(base)).text();
+    assert.equal(timeouts.at(-1), 30000, 'and an ordinary request keeps the short default');
+    // The hint must not be usable to hold a socket open forever.
+    await (await fetch(base, { headers: { 'x-troy-upstream-timeout': '99999999' } })).text();
+    assert.equal(timeouts.at(-1), 900000, 'and it is clamped');
+  } finally {
+    http.request = original;
+    await new Promise((r) => server.close(r));
+    await new Promise((r) => origin.close(r));
+  }
+});
