@@ -84,6 +84,11 @@ const RETRY_BUDGET_MS = 12000;
 const PASS_THROUGH_HEADERS = ['content-type', 'content-length', 'content-range', 'content-encoding', 'etag', 'last-modified', 'accept-ranges'];
 const MIN_SECRET_LENGTH = 16;
 
+// 30 s was the deadline for every upstream read, including a film-length body
+// (see upstreamSocketTimeout).
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
+const MAX_UPSTREAM_TIMEOUT_MS = 15 * 60_000;
+
 const PRIVATE_SUFFIXES = ['.localhost', '.local', '.internal', '.home.arpa', '.lan', '.intranet'];
 const isIpLiteral = (host) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.startsWith('[') || host.includes(':');
 
@@ -121,22 +126,73 @@ function equalHex(a, b) {
 const clean = (value) => (typeof value === 'string' && value ? value.replace(/[\r\n]+/g, ' ').trim() : null);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** One GET, no redirect following, no decompression. Streams; never buffers. */
-function requestOnce(target, headers) {
+/**
+ * How long an upstream socket may sit idle before Node gives up on it.
+ *
+ * The 30 s this used to be is sized for a metadata fetch, but the same transport
+ * carries the transcoder's *input*: one open-ended body read from the first byte
+ * to the last, which for a two-hour film is mostly spent waiting on the CDN, not
+ * transferring. A 30 s deadline kills that mid-film and the encoder reports a
+ * truncated source. The relay cannot tell the two apart — the signature covers
+ * only the target — so the caller raises the limit when it knows it is long.
+ */
+function upstreamSocketTimeout(request) {
+  const raw = Number(request.headers['x-troy-upstream-timeout']);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_UPSTREAM_TIMEOUT_MS;
+  return Math.min(MAX_UPSTREAM_TIMEOUT_MS, Math.max(5000, raw));
+}
+
+/**
+ * Sockets are pooled and kept alive.
+ *
+ * Node 18 made keep-alive the default for `http.globalAgent`, so this is not the
+ * "no keep-alive at all" case a generic Node-tuning list assumes. What the
+ * default does not do is survive an idle CDN, which silently drops a pooled
+ * socket and turns the next request into a reset. Keeping the socket warm and
+ * retrying once when that race is lost is the difference between a stall and a
+ * segment the player never gets.
+ */
+const AGENT = {
+  keepAlive: true,
+  // A media proxy talks to a handful of CDN hosts, each of which may have several
+  // ranges open at once. The global default is already Infinity, so this is only
+  // here to bound memory on a small container.
+  maxSockets: 128,
+  maxTotalSockets: 256,
+  maxFreeSockets: 32,
+  // Reuse the hottest socket: it is the one still in a large congestion window.
+  scheduling: 'lifo',
+};
+const httpsAgent = new https.Agent(AGENT);
+const httpAgent = new http.Agent(AGENT);
+
+/**
+ * One GET, no redirect following, no decompression.
+ *
+ * The response body is handed back as a stream and is never accumulated here.
+ * That is not merely a preference: the transcoder's input is a single film-length
+ * body, so buffering any part of it would be an out-of-memory waiting for the
+ * right title. Small responses are still streamed for the same reason -- one code
+ * path that cannot buffer is safer than two, one of which is a memory hazard if
+ * its size check is ever wrong.
+ */
+function requestOnce(target, headers, socketTimeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const url = new URL(target);
-    const transport = url.protocol === 'https:' ? https : http;
+    const secure = url.protocol === 'https:';
+    const transport = secure ? https : http;
     const request = transport.request(
       {
         method: 'GET',
         hostname: url.hostname,
-        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        port: url.port || (secure ? 443 : 80),
         path: `${url.pathname}${url.search}`,
         headers,
+        agent: secure ? httpsAgent : httpAgent,
         // A provider CDN behind its own CDN is common; the certificate is still
         // validated against the hostname we asked for.
         servername: url.hostname,
-        timeout: 30000,
+        timeout: socketTimeoutMs,
       },
       (response) => {
         const lowered = {};
@@ -160,13 +216,25 @@ function retryAfterMs(headers) {
 }
 
 /** Follow redirects here, because Troy cannot: it would leave the relay. */
-async function upstream(target, headers, allowPrivate) {
+async function upstream(target, headers, allowPrivate, socketTimeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS) {
   let current = target;
   let requestHeaders = headers;
   let waited = 0;
   let attempt = 0;
   for (let hop = 0; hop <= 5; hop++) {
-    let response = await requestOnce(current, requestHeaders);
+    // A pooled socket the CDN closed while it sat idle fails on first use with
+    // ECONNRESET/EPIPE. The request never reached the origin, so retrying once on
+    // a fresh socket is safe -- but only on a reused socket, or a genuine reset
+    // mid-transfer would be retried forever.
+    let response;
+    try {
+      response = await requestOnce(current, requestHeaders, socketTimeoutMs);
+    } catch (error) {
+      const staleSocket = ['ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error?.code);
+      if (!staleSocket || attempt >= 1) throw error;
+      attempt++;
+      response = await requestOnce(current, requestHeaders, socketTimeoutMs);
+    }
     while (RATE_LIMITED.has(response.status) && attempt < RETRY_DELAYS_MS.length) {
       const delay = retryAfterMs(response.headers) ?? RETRY_DELAYS_MS[attempt];
       if (waited + delay > RETRY_BUDGET_MS) break;
@@ -174,7 +242,7 @@ async function upstream(target, headers, allowPrivate) {
       await sleep(delay);
       waited += delay;
       attempt++;
-      response = await requestOnce(current, requestHeaders);
+      response = await requestOnce(current, requestHeaders, socketTimeoutMs);
     }
     if (!REDIRECTS.has(response.status)) return response;
     const location = response.headers.location;
@@ -270,7 +338,7 @@ function createRelayServer({ secret, allowPrivate = false, log = () => {} } = {}
 
       let result;
       try {
-        result = await upstream(parsed.href, headers, allowPrivate);
+        result = await upstream(parsed.href, headers, allowPrivate, upstreamSocketTimeout(request));
       } catch (error) {
         log(`upstream failed: ${String(error?.message || error).slice(0, 160)}`);
         return reply(json(502, { error: `Relay could not fetch the source (${String(error?.message || error).slice(0, 120)})` }));
