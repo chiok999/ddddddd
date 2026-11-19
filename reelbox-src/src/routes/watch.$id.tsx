@@ -6,7 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Loader2,
-  Lock,
+  Lock as LockIcon,
   LockOpen,
   Maximize,
   Minimize,
@@ -37,6 +37,14 @@ import {
   type ZoomId,
 } from '../lib/frame';
 import { Gestures, type GestureCommand } from '../lib/gestures';
+import {
+  currentOrientation,
+  nextLock,
+  rotationNote,
+  rotationStrategy,
+  shouldRelease,
+  type Lock as ScreenLock,
+} from '../lib/orientation';
 import { chromeVisible, gestureLabel, seekSegments, seekTarget, IDLE_MS } from '../lib/player-ux';
 import { api, type Episode } from '../lib/api';
 import { itemStore } from '../lib/item-store';
@@ -105,6 +113,15 @@ function Watch() {
   const [trimmed, setTrimmed] = useState<string | null>(null);
   /** True when the viewer asked to crop those bars rather than live with them. */
   const [cropped, setCropped] = useState(false);
+  /**
+   * The screen lock this player holds, if any. A lock outlives the component, so
+   * this is state that has to be given back rather than a setting.
+   */
+  const [lock, setLock] = useState<ScreenLock>(null);
+  const [lockReleased, setLockReleased] = useState(false);
+  const [orientation, setOrientation] = useState<'landscape' | 'portrait'>(() =>
+    currentOrientation(undefined, true),
+  );
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [ahead, setAhead] = useState(0);
@@ -279,6 +296,33 @@ function Watch() {
     return () => document.removeEventListener('fullscreenchange', onFs);
   }, []);
 
+  // The orientation is read from the screen rather than assumed, so the button's
+  // label and the frame stay honest when the viewer rotates the phone by hand.
+  useEffect(() => {
+    const read = () => setOrientation(currentOrientation((screen.orientation as any)?.type, matchMedia('(orientation: portrait)').matches));
+    read();
+    const mq = matchMedia('(orientation: portrait)');
+    mq.addEventListener?.('change', read);
+    screen.orientation?.addEventListener?.('change', read as any);
+    return () => {
+      mq.removeEventListener?.('change', read);
+      screen.orientation?.removeEventListener?.('change', read as any);
+    };
+  }, []);
+
+  // A lock taken here must not outlive the player: without this the home rail and
+  // the settings page stay sideways after the viewer leaves.
+  useEffect(() => {
+    return () => {
+      if (!shouldRelease(lock, lockReleased)) return;
+      try {
+        (screen.orientation as any)?.unlock?.();
+      } catch {
+        /* the browser will drop it with the document */
+      }
+    };
+  }, [lock, lockReleased]);
+
   // The screen must not sleep under a playing film. Best-effort: the API needs a
   // visible document and a gesture in some browsers, so failure is silent.
   useEffect(() => {
@@ -308,16 +352,50 @@ function Watch() {
     }
   };
 
-  // A phone held upright should not be asked to watch inside a letterbox. Where
-  // the API exists, ask for landscape on request and give it back on exit.
-  const rotateLandscape = async () => {
-    const orientation = screen.orientation as any;
+  /**
+   * Rotates the screen, taking the fullscreen and no-API cases into account.
+   *
+   * A lock only succeeds inside fullscreen, so the request goes after entering
+   * it rather than before -- doing it the other way round is why this used to
+   * fail on every Android device. Where there is no lock API (iOS Safari) the
+   * fullscreen request is still worth making, and the viewer is told what
+   * happened instead of pressing a button that appears dead.
+   */
+  const rotate = async () => {
+    const api = (screen.orientation || {}) as any;
+    const strategy = rotationStrategy({
+      canLock: typeof api.lock === 'function',
+      canUnlock: typeof api.unlock === 'function',
+      canFullscreen: !!box.current?.requestFullscreen,
+      fullscreen,
+    });
+    // A vertical film wants the app upright; a normal one wants it on its side.
+    const hint = aspect === '4:5' ? 'portrait' : 'landscape';
+    const want = nextLock(lock, hint);
     try {
-      if (fullscreen && orientation?.lock) await orientation.lock('landscape');
-      else if (orientation?.lock) await orientation.lock('landscape');
+      if (strategy === 'fullscreen-then-lock') await box.current?.requestFullscreen();
+      if (strategy === 'lock' || strategy === 'fullscreen-then-lock') await api.lock(want);
+      if (strategy === 'lock' || strategy === 'fullscreen-then-lock') {
+        setLock(want);
+        setLockReleased(false);
+      }
     } catch {
-      /* unsupported or refused; the viewer can rotate by hand */
+      // Browsers refuse outside a gesture, in an iframe, or with the screen locked
+      // by the OS. The note below is the whole failure surface.
     }
+    flash(rotationNote(strategy, strategy === 'lock' || strategy === 'fullscreen-then-lock' ? want : null));
+  };
+
+  /** Gives the lock back without rotating anything. */
+  const releaseLock = () => {
+    const api = (screen.orientation || {}) as any;
+    try {
+      if (typeof api.unlock === 'function') api.unlock();
+    } catch {
+      /* nothing to do; the page is leaving anyway */
+    }
+    setLock(null);
+    setLockReleased(true);
   };
 
   const pip = async () => {
@@ -726,7 +804,7 @@ function Watch() {
             aria-label="Lock controls"
             className="mt-2 grid h-9 w-9 shrink-0 place-items-center rounded-full bg-black/40 backdrop-blur"
           >
-            <Lock className="h-4 w-4" />
+            <LockIcon className="h-4 w-4" />
           </button>
         </div>
 
@@ -807,6 +885,16 @@ function Watch() {
                 className={`player-btn ${subs.on ? 'text-primary' : subs.available ? '' : 'opacity-30'}`}
               >
                 <Captions className="h-5 w-5" />
+              </button>
+              {/* Rotation belongs on the bar, not three taps deep: on a phone it
+                  is used mid-film, when the phone is already being turned. */}
+              <button
+                onClick={lock ? releaseLock : rotate}
+                aria-label={lock ? 'Release screen rotation' : 'Rotate screen'}
+                aria-pressed={!!lock}
+                className={`player-btn ${lock ? 'text-primary' : ''}`}
+              >
+                <RotateCcw className={`h-5 w-5 ${orientation === 'portrait' ? 'rotate-90' : ''}`} />
               </button>
               <button onClick={() => setMenu(true)} aria-label="Settings" className="player-btn">
                 <Settings className="h-5 w-5" />
@@ -937,8 +1025,15 @@ function Watch() {
               <button onClick={pip} className="flex flex-col items-center gap-1 rounded-lg bg-secondary px-2 py-2 text-[10px]">
                 <PictureInPicture2 className="h-4 w-4" /> PiP
               </button>
-              <button onClick={rotateLandscape} className="flex flex-col items-center gap-1 rounded-lg bg-secondary px-2 py-2 text-[10px]">
-                <Maximize className="h-4 w-4 rotate-45" /> Landscape
+              <button
+                onClick={lock ? releaseLock : rotate}
+                aria-pressed={!!lock}
+                className={`flex flex-col items-center gap-1 rounded-lg px-2 py-2 text-[10px] ${
+                  lock ? 'bg-primary/20 text-primary' : 'bg-secondary'
+                }`}
+              >
+                <Maximize className={`h-4 w-4 ${lock ? '' : 'rotate-45'}`} />
+                {lock ? 'Release' : orientation === 'portrait' ? 'Rotate' : 'Upright'}
               </button>
               <button
                 onClick={() => {
