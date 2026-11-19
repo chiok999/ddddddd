@@ -1,5 +1,11 @@
 # Provider follow-up audit
 
+> **Historical.** These audits describe the hand-written player in `public/`,
+> which has since been deleted; ReelBox (`reelbox-src/`, built to `app/dist/public/`)
+> replaced it. The findings and reasoning are kept because the behaviours they
+> describe were carried over to the new player, but the file references below no
+> longer resolve.
+
 This audit is based on code and offline fixtures. The user supplied independent upstream observations; this environment did not verify those providers or Botkeep playback. No provider is permanent, and successful metadata is not proof a stream works or survives signed-URL expiry.
 
 ## Confirmed and changed

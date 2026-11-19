@@ -51,13 +51,39 @@ globalThis.fetch = async (url, init) => {
   const result = typeof handler === 'function' ? handler(init) : handler;
   if (!result) throw new Error(`unexpected fetch ${url}`);
   if (result instanceof Error) throw result;
-  return { ok: result.ok !== false, status: result.status || 200, json: async () => result.body ?? result };
+  // A response without an explicit status is a success; one with a status is a
+  // success only below 400. Getting this wrong made a 502 look like an empty
+  // body, which is a different failure than the one under test.
+  const status = result.status ?? 200;
+  return { ok: result.ok !== undefined ? result.ok : status < 400, status, json: async () => result.body ?? result };
 };
 
 /**
  * A video element's pause() emits `pause` asynchronously in real browsers, and
  * that delay is what a playing engine reacts to. This stand-in does the same.
  */
+// jsdom is not available here, so the engine's only DOM need -- creating and
+// appending a <track> -- is stood in for. The assertions are about the calls the
+// engine makes, not about how a browser renders captions.
+const tracks = [];
+globalThis.document = {
+  createElement(tag) {
+    // A real HTMLTrackElement always has a `track` property (a TextTrack whose
+    // mode starts 'disabled'), and the engine relies on that when it sets the
+    // default mode before attaching. The stand-in must have the same shape or the
+    // test is checking a DOM that does not exist.
+    const track = { mode: 'disabled' };
+    const el = { tag, kind: '', label: '', srclang: '', src: '', track, removed: false };
+    el.remove = () => {
+      el.removed = true;
+      const i = tracks.indexOf(el);
+      if (i >= 0) tracks.splice(i, 1);
+    };
+    if (tag === 'track') tracks.push(el);
+    return el;
+  },
+};
+
 class FakeVideo extends EventTarget {
   constructor() {
     super();
@@ -78,6 +104,9 @@ class FakeVideo extends EventTarget {
   pause() {
     this.paused = true;
     setTimeout(() => this.dispatchEvent(new Event('pause')), 0);
+  }
+  append(el) {
+    (this.children ||= []).push(el);
   }
   removeAttribute(name) {
     delete this.attrs[name];
@@ -127,12 +156,17 @@ function makeEngine() {
   const video = new FakeVideo();
   const states = [];
   const progress = [];
+  const subtitles = [];
   const engine = new Playback({
     onState: (s) => states.push(s),
     onProgress: (p, d, paused) => progress.push([p, d, paused]),
+    onSubtitle: (st) => subtitles.push(st),
   });
   engine.attach(video);
-  return { engine, video, states, progress, last: () => states.at(-1) };
+  // Registered here so every case cleans up, including the ones that fail.
+  cleanups.push(() => engine.stop());
+  cleanups.push(() => engine.attach(null));
+  return { engine, video, states, progress, subtitles, last: () => states.at(-1) };
 }
 
 const target = { id: 'abc', title: 'X', type: 'movie', progressKey: 'k' };
@@ -279,6 +313,68 @@ await check('the final message lists the providers that were tried', async () =>
   assert.match(last().message, /Provider refused/);
   assert.match(last().message, /moviebox/);
   assert.match(last().message, /vaplayer/);
+});
+
+// 9. A provider caption is attached but not shown, and the button toggles it.
+await check('a provider subtitle is attached hidden, then toggled on and off', async () => {
+  tracks.length = 0;
+  const { engine, video, subtitles } = makeEngine();
+  responses['/api/resolve'] = resolved([{ provider: 'moviebox', format: 'file', url: '/media/s', captionId: 'cap1' }]);
+  responses['/api/transcode'] = job();
+  responses['/api/transcode/status'] = { body: { canPlay: true } };
+  responses['/api/moviebox-subtitle'] = { body: { url: '/caption/abc123' } };
+  await engine.start({ ...target, source: 'moviebox' });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(tracks.length, 1, 'exactly one track is created');
+  assert.equal(tracks[0].src, '/caption/abc123');
+  assert.equal(tracks[0].kind, 'subtitles');
+  assert.equal(tracks[0].track.mode, 'hidden', 'captions must not autoplay');
+  assert.ok((video.children || []).includes(tracks[0]), 'the track is attached to the video');
+  assert.deepEqual(engine.subtitleState(), { available: true, on: false, note: '' });
+  assert.equal(engine.toggleSubtitle().on, true);
+  assert.equal(tracks[0].track.mode, 'showing');
+  assert.equal(engine.toggleSubtitle().on, false);
+  assert.equal(tracks[0].track.mode, 'hidden');
+  assert.ok(subtitles.length >= 2, 'the UI is told about each change');
+});
+
+// 10. No caption is normal: the button reports why instead of offering a dead track.
+await check('a source with no subtitle says so and creates no track', async () => {
+  tracks.length = 0;
+  const { engine } = makeEngine();
+  responses['/api/resolve'] = resolved([{ provider: 'moviebox', format: 'file', url: '/media/s' }]);
+  responses['/api/transcode'] = job();
+  responses['/api/transcode/status'] = { body: { canPlay: true } };
+  await engine.start({ ...target, source: 'moviebox' });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(tracks.length, 0);
+  const st = engine.subtitleState();
+  assert.equal(st.available, false);
+  assert.match(st.note, /no subtitles/i);
+  // Toggling with no track must not claim captions are on.
+  assert.equal(engine.toggleSubtitle().on, false);
+});
+
+// 11. A failing subtitle request must not break playback.
+await check('a subtitle outage leaves the video playing', async () => {
+  tracks.length = 0;
+  const { engine, video, last, subtitles } = makeEngine();
+  responses['/api/resolve'] = resolved([{ provider: 'moviebox', format: 'file', url: '/media/s', captionId: 'cap1' }]);
+  responses['/api/transcode'] = job();
+  responses['/api/transcode/status'] = { body: { canPlay: true } };
+  responses['/api/moviebox-subtitle'] = { status: 502, body: { error: 'Provider refused' } };
+  await engine.start({ ...target, source: 'moviebox' });
+  globalThis.__hls.emit('manifest', {});
+  // The subtitle request runs alongside playback, so wait for its report rather
+  // than guessing how long a failing request takes.
+  for (let i = 0; i < 100 && !subtitles.some((st) => st.note); i++) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(subtitles.some((st) => st.note), 'the UI was told why there is no track');
+  assert.equal(tracks.length, 0);
+  assert.equal(last().phase, 'playing', 'playback continues');
+  assert.equal(video.paused, false);
+  assert.match(engine.subtitleState().note, /Provider refused/);
 });
 
 // Everything above stops its own engine, so nothing should be left holding the

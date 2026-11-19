@@ -14,7 +14,14 @@ test('login, origin, and private URL protections', async () => {
   assert.equal((await post('/api/source',{url:'https://example.com/video'})).status,401);
   assert.equal((await post('/api/transcode/reclaim',{})).status,401);
   const page=await fetch(base+'/'); assert.match(page.headers.get('content-security-policy'),/frame-src 'none'/);
-  for(const asset of ['/player-ui.js','/player.css']){const response=await fetch(base+asset);assert.equal(response.status,200);assert.match(response.headers.get('content-type'),asset.endsWith('.css')?/text\/css/:/javascript/);}
+  // The app's files are hashed, so they are discovered from the shell rather than
+  // hard-coded here; that is also what proves the shell references real files.
+  const shellHtml=await page.text();
+  const bundle=[...shellHtml.matchAll(/\/assets\/[\w.-]+\.(?:js|css)/g)].map(m=>m[0]);
+  assert.ok(bundle.length>0,'the shell must reference its bundle');
+  for(const asset of bundle){const response=await fetch(base+asset);assert.equal(response.status,200,`${asset} is missing`);assert.match(response.headers.get('content-type'),asset.endsWith('.css')?/text\/css/:/javascript/);}
+  // The deleted player must be gone, not just unlinked.
+  assert.equal((await fetch(base+'/player-ui.js')).status,404);
   assert.equal((await post('/api/login',{password:'wrong'})).status,401);
   assert.equal((await post('/api/login',{password:'a-strong-test-password'},{origin:'https://evil.test'})).status,403);
   const login=await post('/api/login',{password:'a-strong-test-password'}); assert.equal(login.status,200);
@@ -166,15 +173,6 @@ test('KissKh English subtitle decryption produces browser WebVTT', async () => {
   const kk=create({request,safeUrl:value=>new URL(value)});
   const sub=await kk.subtitle({source:'kisskh',kissId:44,type:'series'},1,2);
   assert.match(sub,/^WEBVTT\n\n/); assert.match(sub,/00:00:01\.200 --> 00:00:03\.400\nHello there/);
-});
-
-test('playback fallback tries each candidate once and ignores stale errors', () => {
-  const create=require('./public/fallback'); const attempts=[], failures=[]; let exhausted=0;
-  const fallback=create((item,index,total,fail,active)=>{ attempts.push({item,index,total,active}); failures.push(fail); },()=>exhausted++);
-  fallback.play(['first','second','third']); assert.equal(attempts[0].item,'first'); assert.equal(attempts[0].active(),true);
-  failures[0](); assert.equal(attempts[1].item,'second'); assert.equal(attempts[0].active(),false);
-  failures[0](); assert.equal(attempts.length,2); failures[1](); assert.equal(attempts[2].item,'third'); failures[2](); assert.equal(exhausted,1);
-  fallback.play(['new']); fallback.cancel(); assert.equal(attempts[3].active(),false); failures[3](); assert.equal(exhausted,1);
 });
 
 test('HTTP flow authenticates, resolves a fixture and blocks direct playback', async () => {

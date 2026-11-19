@@ -1,5 +1,11 @@
 # Player integration audit
 
+> **Historical.** These audits describe the hand-written player in `public/`,
+> which has since been deleted; ReelBox (`reelbox-src/`, built to `app/dist/public/`)
+> replaced it. The findings and reasoning are kept because the behaviours they
+> describe were carried over to the new player, but the file references below no
+> longer resolve.
+
 The supplied `troy-player.html` is a standalone demo, not a drop-in adapter for Troy's session-bound source URLs. Its example creates a separate HLS instance, guesses HLS from filename, inserts title/track labels as HTML, and uses CDN JavaScript. Troy instead keeps its existing proxied resolver, HLS.js instance, text-safe DOM construction, fixed same-origin assets and no-frame CSP. The reference layout and interactions are implemented in `public/index.html`, `public/player.css` and `public/player-ui.js`; stream/track/episode state remains in `public/app.js`.
 
 Offline tests cover play/pause, seeking/progress, gestures, lock and keyboard, settings, PiP/fullscreen API calls, previous/automatic-next episodes, adaptive quality menu, preference persistence, native exposed subtitle/audio tracks, static assets and pre-existing provider/fallback fixtures. These simulated DOM tests do not prove browser rendering, touchscreen behavior, actual media playback or provider availability. No real browser/CDN/Botkeep playback was verified in this environment.

@@ -42,6 +42,11 @@ export interface Stream {
   quality?: number | null;
   format: string;
   duration?: number | null;
+  /**
+   * Opaque handle for this stream's subtitle, if the provider offers one. It is
+   * not a URL: it is redeemed through one of the three subtitle endpoints, and
+   * which one depends on the provider that produced it.
+   */
   captionId?: string | null;
   url: string;
 }
@@ -121,5 +126,45 @@ export const api = {
   stopTranscode: (id: any) => post<{ stopped: boolean }>('/api/transcode/stop', { id }),
   cancelTranscode: (requestId: any) => post<{ stopped: boolean }>('/api/transcode/cancel', { requestId }),
   reclaim: () => post<{ stopped: boolean }>('/api/transcode/reclaim', {}),
-  subtitle: (path: any, data: any) => post<{ url: string | null }>(path, data),
+  /**
+   * Redeems a subtitle and returns a VTT URL the player can attach.
+   *
+   * Troy answers with `{ url: '/caption/<id>' }` or `{ url: null }`, and the URL
+   * is session-scoped and expires after six hours, so it must be fetched when
+   * playback starts rather than stored.
+   */
+  subtitle: (path: SubtitlePath, data: Record<string, unknown>) =>
+    post<{ url: string | null }>(path, data),
 };
+
+export type SubtitlePath =
+  | '/api/kiss-subtitle'
+  | '/api/moviebox-subtitle'
+  | '/api/movy-subtitle'
+  | '/api/vidlink-subtitle';
+
+/**
+ * Which subtitle endpoint a stream's caption belongs to.
+ *
+ * The provider name is the only thing that distinguishes them, and getting it
+ * wrong asks one provider for another's caption id, which comes back empty. The
+ * mapping mirrors the classic player exactly, including that 7movies serves its
+ * captions from the VidLink endpoint.
+ */
+export function subtitleRequest(
+  provider: string,
+  stream: { captionId?: string | null },
+  source: string | undefined,
+  ids: { id: string; season: number; episode: number },
+): { path: SubtitlePath; data: Record<string, unknown> } | null {
+  if (source === 'kisskh') {
+    return { path: '/api/kiss-subtitle', data: ids };
+  }
+  if (!stream.captionId) return null;
+  const path: SubtitlePath = provider.startsWith('movy:')
+    ? '/api/movy-subtitle'
+    : provider === '7movies'
+      ? '/api/vidlink-subtitle'
+      : '/api/moviebox-subtitle';
+  return { path, data: { id: stream.captionId } };
+}

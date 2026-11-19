@@ -578,19 +578,22 @@ test('the relay reads the panel .env file, which is the only place the panel put
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
+    // The banner arrives in several chunks and the split is not fixed, so this
+    // waits for the last line it asserts on rather than for the first. Stopping
+    // at "listening" dropped the "secret:" line whenever the two were split
+    // across chunks, which made this test fail about half the time.
     const output = await new Promise((resolve) => {
       let text = '';
       const timer = setTimeout(() => resolve(text), 8000);
-      child.stdout.on('data', (chunk) => {
+      const read = (chunk) => {
         text += String(chunk);
-        if (/listening/.test(text)) {
+        if (/listening/.test(text) && /secret:/.test(text)) {
           clearTimeout(timer);
           resolve(text);
         }
-      });
-      child.stderr.on('data', (chunk) => {
-        text += String(chunk);
-      });
+      };
+      child.stdout.on('data', read);
+      child.stderr.on('data', read);
     });
     assert.match(output, new RegExp(`listening: 0\\.0\\.0\\.0:${port}`), `output was:\n${output}`);
     assert.match(output, /port from PORT/, 'and it says the value came from the file');
