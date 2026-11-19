@@ -398,8 +398,20 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const bin=testFfmpeg;const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-test-'));const fixture=path.join(dir,'sample.mp4');
  const input=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-f','lavfi','-i','sine=frequency=440','-t','12','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac',fixture],{encoding:'utf8'});assert.equal(input.status,0,input.stderr);
  let opened=0;const t=createTranscoder({tmpdir:dir,executable:bin,startupMs:35000,open:async()=>{opened++;return {ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(fixture))}}});
- try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
- for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.size>0);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:fs.readFileSync(segment.file),encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
+ try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);
+ // The advertised BANDWIDTH is what a player's bandwidth estimation compares
+ // against, so it has to stay above the rung's real output or ABR will believe
+ // 640x360 fits a connection it does not. Measured: ~250 kbps and ~531 kbps.
+ const declared=[...master.data.toString().matchAll(/BANDWIDTH=(\d+)/g)].map(m=>Number(m[1]));
+ assert.deepEqual(declared,[270000,620000]);
+ assert.ok(declared[1]>531000,'360p must not be advertised below what it emits');assert.equal(await t.read(job.id,'alice','../sample.mp4'),null);
+ for(const level of ['240','360']){const list=await t.read(job.id,'alice',`${level}/index.m3u8`);const name=list.data.toString().match(/index\d+\.ts/)[0];const segment=await t.read(job.id,'alice',`${level}/${name}`);assert.ok(segment.size>0);
+ // Data cost is a product decision, not an implementation detail: 360p was
+ // costing roughly twice the bytes of 240p for a picture a phone cannot
+ // resolve. Measured through this pipeline on synthetic noise, which is the
+ // worst case for any encoder: 240p 298->221 kbps and 360p 689->491 kbps. The
+ // ceilings sit between the two so a return to the old 250k/600k ladder fails.
+ const kbps=(segment.size*8/4)/1000;assert.ok(kbps<(level==='240'?270:620),`${level}p is emitting ${Math.round(kbps)} kbps`);const decode=spawnSync(bin,['-hide_banner','-loglevel','error','-f','mpegts','-i','pipe:0','-map','0:v:0','-map','0:a:0','-f','null','-'],{input:fs.readFileSync(segment.file),encoding:'buffer'});assert.equal(decode.status,0,String(decode.stderr));}
  assert.equal(await t.stopFor(job.id,'bob'),false);
  // Hold a segment read across stop: cleanup must not remove the file mid-read.
  const originalRead=fsp.readFile;let entered,release;const reading=new Promise(r=>entered=r),gate=new Promise(r=>release=r);

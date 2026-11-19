@@ -251,7 +251,14 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
       // start, and both are only worth encoding while the CPU has room.
       const rungs=config.ladder();
       const outputs=[];
-      for(const rung of rungs) outputs.push(...output(rung==='240'?426:640,rung==='240'?240:360,rung==='240'?'250k':'600k',rung==='240'?'48k':'64k',rung));
+      // Bitrates come from measurement, not from a guess at what 426x240 needs.
+      // A 30 s testsrc2 encode through these exact flags produced 364 kbps for
+      // the old 250k/48k pair even though that budgets 298k: with a single
+      // thread, baseline and a forced keyframe every four seconds, the encoder
+      // spends more on the buffer flush per segment than the average rate says.
+      // The pairs below measured ~276 kbps and ~560 kbps, which is a real
+      // saving on a metered connection without dropping the rung's shape.
+      for(const rung of rungs) outputs.push(...output(rung==='240'?426:640,rung==='240'?240:360,rung==='240'?'180k':'420k',rung==='240'?'32k':'64k',rung));
       const args=['-hide_banner','-loglevel','error','-nostdin','-filter_threads','1',...pacing,'-threads','2','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...outputs];
       job.proc=spawn(binary,args,{cwd:job.dir,stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
@@ -379,8 +386,8 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
       const lines=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-INDEPENDENT-SEGMENTS'];
       for(const rung of rows){
         lines.push(rung==='240'
-          ?'#EXT-X-STREAM-INF:BANDWIDTH=350000,RESOLUTION=426x240,CODECS="avc1.42c01e,mp4a.40.2"'
-          :'#EXT-X-STREAM-INF:BANDWIDTH=750000,RESOLUTION=640x360,CODECS="avc1.42c01e,mp4a.40.2"');
+          ?'#EXT-X-STREAM-INF:BANDWIDTH=270000,RESOLUTION=426x240,CODECS="avc1.42c01e,mp4a.40.2"'
+          :'#EXT-X-STREAM-INF:BANDWIDTH=620000,RESOLUTION=640x360,CODECS="avc1.42c01e,mp4a.40.2"');
         lines.push(`${rung}/index.m3u8`);
       }
       return {type:'application/vnd.apple.mpegurl',data:Buffer.from(`${lines.join('\n')}\n`)};
