@@ -19,6 +19,7 @@ const KEY = {
   progress: 'solo-progress',
   height: 'solo-quality-height',
   saver: 'solo-data-saver',
+  speed: 'solo-playback-speed',
 } as const;
 
 type KeyName = 'list' | 'history';
@@ -103,6 +104,33 @@ export const saveHeight = (height: number) => {
   }
 };
 
+/** The speeds the player offers. Anything else in storage is not trusted. */
+export const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
+
+/**
+ * The saved playback rate.
+ *
+ * The README has promised "playback speed is saved locally" since the player was
+ * written, and nothing ever saved it: it reset to 1x on every mount and every
+ * episode. A rate is a viewing preference, not a per-title one.
+ */
+export const readSpeed = () => {
+  try {
+    const stored = Number(localStorage.getItem(KEY.speed));
+    return (SPEEDS as readonly number[]).includes(stored) ? stored : 1;
+  } catch {
+    return 1;
+  }
+};
+
+export const saveSpeed = (rate: number) => {
+  try {
+    localStorage.setItem(KEY.speed, String(rate));
+  } catch {
+    /* see write() */
+  }
+};
+
 export const readSaver = () => {
   try {
     const stored = localStorage.getItem(KEY.saver);
@@ -125,8 +153,9 @@ export const saveSaver = (on: boolean) => {
  * The rung to download, given the viewer's preferences and their connection.
  *
  * Data saver exists because 360p is roughly twice the bytes of 240p on these
- * encodes (measured: ~531 kbps against ~250, so about 230 MB an hour against
- * 110), and on a metered connection that difference is the whole bill. An
+ * encodes (measured through the current CRF settings: ~260 kbps against ~130, so
+ * about 114 MB an hour against 57), and on a metered connection that difference
+ * is the whole bill. An
  * explicit choice wins; otherwise a connection that reports itself as slow gets
  * the smaller rung without being asked, which is the case where it matters.
  */
