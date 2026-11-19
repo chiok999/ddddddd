@@ -104,3 +104,53 @@ test('the documented subtitle retiming describes what the code does', () => {
   // And it must say what it assumes, since that is the part that can silently rot.
   assert.match(readme, /timed against the whole film/i);
 });
+
+test('the player features the README describes exist in the player', () => {
+  // This README described a source menu, subtitle upload, subtitle search, and a
+  // height/size/colour setting for captions. None of the four existed anywhere in
+  // the interface: the words had drifted from the design reference and nothing
+  // checked them. Prose about UI is the easiest thing in this repository to let
+  // rot, so the claims with a code signature are pinned.
+  const readme = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8');
+  const app = path.join(__dirname, '..', 'reelbox-src', 'src');
+  const walk = (dir) => {
+    const out = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...walk(full));
+      else if (/\.(ts|tsx)$/.test(entry.name)) out.push(full);
+    }
+    return out;
+  };
+  assert.ok(fs.existsSync(app), 'the interface source must be present to check against');
+  const source = walk(app)
+    .map((file) => fs.readFileSync(file, 'utf8'))
+    .join('\n');
+
+  // Admit to what is missing rather than describing it as a feature.
+  for (const absent of ['no local subtitle upload', 'no subtitle height, size or colour setting']) {
+    assert.ok(readme.includes(absent), `the README must say what does not exist: ${absent}`);
+  }
+  // And the claims that DO have code behind them must keep it -- both the
+  // mechanism and the place that calls it. A mutation that renames only the
+  // helper used to slip past this, because the call site still held the name.
+  // A definition, not a mention: renaming a helper leaves its own import and its
+  // call sites matching by name, so `rotationStrategy` survived a rename of the
+  // function that defines it. `export ...` anchors on the declaration.
+  const claims = [
+    ['double-tap to seek', /[Dd]ouble-tap/, [/export class Gestures\b/, /'double'/, /kind === 'double'/]],
+    ['screen rotation', /rotation/i, [/export function rotationStrategy\b/, /export function nextLock\b/, /screen\.orientation/]],
+    ['a saved playback speed', /Playback speed and the frame choice are saved locally/, [/export const saveSpeed\s*=/, /saveSpeed\(rate\)/]],
+    ['a frame remembered per title', /the latter per title/, [/export function saveAspectFor\b/, /saveAspectFor\(/]],
+  ];
+  for (const [label, inDoc, required] of claims) {
+    assert.ok(inDoc.test(readme), `the README no longer makes the ${label} claim this test pins`);
+    for (const pattern of required) {
+      assert.ok(pattern.test(source), `the README claims ${label} but nothing matches ${pattern}`);
+    }
+  }
+  // The specific things that were invented must not come back, in any wording that
+  // presents them as present.
+  assert.doesNotMatch(readme, /local SRT\/VTT subtitle uploads are supported/i);
+  assert.doesNotMatch(readme, /\*\*Subtitle height\*\*/);
+});

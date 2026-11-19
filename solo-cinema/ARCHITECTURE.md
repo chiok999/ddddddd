@@ -118,7 +118,7 @@ Stated plainly, because earlier notes drifted into implying otherwise:
 ## Testing
 
 ```bash
-npm test     # 140 tests
+npm test     # 141 tests
 ```
 
 They fall into four groups: the HTTP surface (auth, origin checks, session

@@ -835,7 +835,7 @@ function Watch() {
               min={0}
               max={duration || 0}
               step={0.1}
-              value={scrubbing ? time : time}
+              value={time}
               onPointerDown={() => setScrubbing(true)}
               onPointerUp={() => setScrubbing(false)}
               onPointerCancel={() => setScrubbing(false)}
@@ -1037,12 +1037,18 @@ function Watch() {
               </button>
               <button
                 onClick={() => {
-                  setMuted(false);
-                  setVol((v) => (v === 0 ? 1 : v));
+                  // The old handler restored the volume only when it was already
+                  // zero, so pressing it while audible changed nothing at all.
+                  // A mute is what a viewer is actually asking for here.
+                  setMuted((m) => !m);
+                  setVol((v) => (v === 0 ? 0.8 : v));
+                  setMenu(false);
                 }}
+                aria-pressed={!muted}
                 className="flex flex-col items-center gap-1 rounded-lg bg-secondary px-2 py-2 text-[10px]"
               >
-                <Volume2 className="h-4 w-4" /> Sound
+                {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                {muted ? 'Unmute' : 'Sound'}
               </button>
             </div>
           </div>
