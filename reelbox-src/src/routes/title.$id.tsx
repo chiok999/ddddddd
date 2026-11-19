@@ -28,12 +28,36 @@ export const Route = createFileRoute('/title/$id')({
 
 function Detail() {
   const { id } = Route.useParams();
-  const item = itemStore.get(id);
+  const navigate = Route.useNavigate();
+  const found = itemStore.get(id);
+  const [recovering, setRecovering] = useState(false);
+  const [lost, setLost] = useState(false);
   const saved = useLib('list').includes(id);
   const [episodes, setEpisodes] = useState<Episode[] | null>(null);
   const [source, setSource] = useState('');
   const [season, setSeason] = useState(1);
 
+  // A shared link or a reopened tab has no stored entry, but the id is Troy's and
+  // still identifiable, so the title is looked up again. An id that cannot be
+  // recovered is a dead link, and the page says so instead of retrying forever.
+  useEffect(() => {
+    if (found) return;
+    let live = true;
+    setRecovering(true);
+    itemStore.recover(id).then((recovered) => {
+      if (!live) return;
+      setRecovering(false);
+      if (!recovered) return setLost(true);
+      // The recovered entry has a fresh id; move the URL onto it so the address
+      // bar, a reload and a share all point at something that resolves.
+      navigate({ to: '/title/$id', params: { id: recovered.id }, replace: true });
+    });
+    return () => {
+      live = false;
+    };
+  }, [id, found]);
+
+  const item = found;
   const series = item?.type === 'series' || item?.type === 'show';
 
   useEffect(() => {
@@ -59,14 +83,26 @@ function Detail() {
       <div>
         <Header />
         <div className="px-3 py-16 text-center">
-          <h1 className="font-display text-lg font-bold">This title is no longer loaded</h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Catalog entries are bound to the session that fetched them. Reload the page you came from, or search
-            again.
-          </p>
-          <Link to="/browse" search={{ q: undefined, g: undefined, t: undefined }} className="btn-ghost mt-4">
-            Search again
-          </Link>
+          {recovering ? (
+            <p className="text-sm text-muted-foreground">Looking this title up again…</p>
+          ) : (
+            <>
+              <h1 className="font-display text-lg font-bold">This link has expired</h1>
+              <p className="mt-2 text-sm text-muted-foreground">
+                {lost
+                  ? 'The title behind this address could not be found again, which usually means it has left the catalog.'
+                  : 'Catalog entries expire an hour after the search that produced them.'}
+              </p>
+              <div className="mt-4 flex flex-wrap justify-center gap-2">
+                <Link to="/" className="btn-primary">
+                  Go home
+                </Link>
+                <Link to="/browse" search={{ q: undefined, g: undefined, t: undefined }} className="btn-ghost">
+                  Search
+                </Link>
+              </div>
+            </>
+          )}
         </div>
       </div>
     );

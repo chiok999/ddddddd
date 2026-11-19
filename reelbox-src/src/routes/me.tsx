@@ -119,13 +119,6 @@ function Me() {
             {busy ? 'Signing out…' : 'Sign out'}
           </button>
         </section>
-
-        <section>
-          {/* The classic player is a separate page, not a route in this app. */}
-          <a href="/classic/" className="text-xs text-muted-foreground underline">
-            Open the classic player
-          </a>
-        </section>
       </div>
     </div>
   );

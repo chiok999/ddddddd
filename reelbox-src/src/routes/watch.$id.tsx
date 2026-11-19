@@ -42,7 +42,11 @@ const fmt = (seconds: number) => {
 function Watch() {
   const { id } = Route.useParams();
   const { s, e } = Route.useSearch();
-  const item = itemStore.get(id);
+  const navigate = Route.useNavigate();
+  const found = itemStore.get(id);
+  const item = found;
+  const [recovering, setRecovering] = useState(false);
+  const [lost, setLost] = useState(false);
   const video = useRef<HTMLVideoElement>(null);
   const box = useRef<HTMLDivElement>(null);
   const engine = useRef<Playback | null>(null);
@@ -183,16 +187,52 @@ function Watch() {
     );
   };
 
+  // A player link can outlive its entry — a resume link, a bookmark, a shared
+  // address. The id is still Troy's, so the title is looked up again and the URL
+  // moved onto the fresh one rather than leaving a dead page.
+  useEffect(() => {
+    if (found) return;
+    let live = true;
+    setRecovering(true);
+    itemStore.recover(id).then((recovered) => {
+      if (!live) return;
+      setRecovering(false);
+      if (!recovered) return setLost(true);
+      navigate({
+        to: '/watch/$id',
+        params: { id: recovered.id },
+        search: { s: s ?? undefined, e: e ?? undefined },
+        replace: true,
+      });
+    });
+    return () => {
+      live = false;
+    };
+  }, [id, found]);
+
   if (!item) {
     return (
       <div className="px-3 py-16 text-center">
-        <h1 className="font-display text-lg font-bold">This title is no longer loaded</h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Catalog entries expire an hour after the search that produced them. Search again to pick it up.
-        </p>
-        <Link to="/browse" search={{ q: undefined, g: undefined, t: undefined }} className="btn-ghost mt-4">
-          Search again
-        </Link>
+        {recovering ? (
+          <p className="text-sm text-muted-foreground">Looking this title up again…</p>
+        ) : (
+          <>
+            <h1 className="font-display text-lg font-bold">This link has expired</h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {lost
+                ? 'The title behind this address could not be found again, which usually means it has left the catalog.'
+                : 'Catalog entries expire an hour after the search that produced them.'}
+            </p>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <Link to="/" className="btn-primary">
+                Go home
+              </Link>
+              <Link to="/browse" search={{ q: undefined, g: undefined, t: undefined }} className="btn-ghost">
+                Search
+              </Link>
+            </div>
+          </>
+        )}
       </div>
     );
   }

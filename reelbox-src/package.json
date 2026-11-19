@@ -12,7 +12,7 @@
     "deploy": "npm run build",
     "test:engine": "node tools/build-engine-fixture.mjs && node tools/engine-check.mjs",
     "test:api": "node tools/build-api-fixture.mjs && node tools/api-check.mjs",
-    "test": "node tools/frame-check.mjs && npm run -s test:engine && npm run -s test:api"
+    "test": "node tools/frame-check.mjs && node tools/build-engine-fixture.mjs && node tools/build-api-fixture.mjs && node tools/api-check.mjs && node tools/store-check.mjs && node tools/engine-check.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
