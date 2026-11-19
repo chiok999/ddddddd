@@ -1,5 +1,11 @@
 # Troy control audit
 
+> **Historical.** These audits describe the hand-written player in `public/`,
+> which has since been deleted; ReelBox (`reelbox-src/`, built to `app/dist/public/`)
+> replaced it. The findings and reasoning are kept because the behaviours they
+> describe were carried over to the new player, but the file references below no
+> longer resolve.
+
 Scope: inspected the standalone app's `public/index.html` and every handler in `public/app.js`, plus fallback, provider and server routes used by those handlers. This is an interaction audit, not a full audit of the existing bot. Automated tests use jsdom and mocks; they do not render video or prove every control works on a physical device.
 
 ## Findings addressed

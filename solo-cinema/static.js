@@ -4,7 +4,8 @@
  *
  * The table this replaces meant every new stylesheet was a server edit, and a
  * file the page asked for but nobody remembered to add was a silent 404. Here a
- * request resolves against `public/` by name; anything outside it is refused.
+ * request resolves against `<root>/public` by name; anything outside it is
+ * refused. `root` is now the built app (`app/dist`), not the source tree.
  */
 const fs = require('node:fs');
 const path = require('node:path');

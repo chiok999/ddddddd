@@ -1,14 +1,15 @@
 # The interface
 
-Troy ships two front ends and serves both from the same process:
+Troy ships one front end:
 
 | path | what it is | files |
 |---|---|---|
 | `/` | **ReelBox** — the app shell (React, TanStack Router) | `app/dist/public/` |
-| `/classic/` | the original hand-written player | `public/` |
 
-Both talk to the same API on the same port. Nothing about the transcoder, the
-providers, the relay or the login changed when ReelBox became the default.
+It talks to the same API on the same port. Nothing about the transcoder, the
+providers, the relay or the login changed when ReelBox replaced the original
+hand-written player, and that player is now deleted rather than kept behind a
+URL.
 
 ## Why the shell is a committed build
 
@@ -61,28 +62,39 @@ a typo still says 404 instead of quietly rendering the home screen:
 ## Playback
 
 The shell does not re-implement playback. `reelbox-src/src/lib/playback.ts` ports
-the ladder the classic player proved in the field, and the reasoning is in that
+the ladder the original player proved in the field, and the reasoning is in that
 file's header: wait instead of restarting on a missing segment, let the server
 decide `canPlay`, report position once a second, borrow the playback rate on a
 thin buffer, retry the same position before failing over, and restart the
 conversion when a seek goes past what has been converted.
 
-`reelbox-src/tools/engine-check.mjs` tests those eight behaviours against a
-stand-in hls.js, and each case was mutation-checked: reintroducing the original
-bug makes exactly that test fail.
+`reelbox-src/tools/engine-check.mjs` tests those behaviours against a stand-in
+hls.js, and each case was mutation-checked: reintroducing the original bug makes
+exactly that test fail.
+
+Subtitles are per stream, not per title. Troy's caption URL is session-scoped
+and expires, so it is fetched on every playback and on every failover, and a
+provider that offers no caption leaves the button disabled with the reason
+shown rather than presenting a track that would never load.
+
+The frame follows the picture. A 4:3 feature or a 4:5 clip would otherwise be
+boxed inside 16:9 with black bars on two sides, so the shape comes from the
+decoded video and the viewer can pin a shape instead. `tools/frame-check.mjs`
+pins that, including that a pinned shape applies before metadata arrives.
 
 ## Tests
 
 ```bash
-npm test          # 174 tests, including 4 for the shell and the static layer
+npm test          # 127 tests, including 4 for the shell and the static layer
 ```
 
-`test-shell.js` covers the split: `/` is the shell, `/classic/` is the old UI, a
-typo is a 404, nested bundle paths are served, traversal is refused, and every
-inline script in the shell is hash-covered.
+`test-shell.js` covers routing: `/` is the shell, a typo is a 404, the deleted
+player's files are gone from the server rather than merely unlinked, nested
+bundle paths are served, traversal is refused, and every inline script in the
+shell is hash-covered.
 
 ## Going back
 
-Nothing to rebuild: the classic UI was never removed. Point yourself at
-`/classic/`. To make it the default again, swap the `APP_ROUTES` block in
-`server.js` for the `staticFiles` lookup that precedes it.
+There is no old UI to go back to. Recovering it means reverting the commit that
+deleted `public/`, which also restores the `staticFiles` lookup in `server.js`
+that the `/classic/` branch depended on.

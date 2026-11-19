@@ -92,3 +92,38 @@ await t('session and discover are GETs and return the unwrapped value', async ()
   assert.deepEqual(await api.discover(), [{ id: 'x', items: [] }]);
   assert.deepEqual(seen.map((c) => c.method), ['GET', 'GET']);
 });
+
+// Subtitle routing. Each provider serves its captions from its own endpoint, and
+// asking the wrong one with a valid id comes back empty rather than failing, so
+// the mapping is worth pinning exactly.
+await t('subtitle requests go to the provider that owns the caption', async () => {
+  const { subtitleRequest } = await import('/home/user/ddddddd/reelbox-src/dist-test/api.mjs');
+  const ids = { id: 'title1', season: 2, episode: 5 };
+
+  const kiss = subtitleRequest('kisskh', {}, 'kisskh', ids);
+  assert.deepEqual(kiss, { path: '/api/kiss-subtitle', data: ids });
+
+  const movy = subtitleRequest('movy:x', { captionId: 'cap1' }, 'moviebox', ids);
+  assert.deepEqual(movy, { path: '/api/movy-subtitle', data: { id: 'cap1' } });
+
+  const vidlink = subtitleRequest('7movies', { captionId: 'cap2' }, 'moviebox', ids);
+  assert.deepEqual(vidlink, { path: '/api/vidlink-subtitle', data: { id: 'cap2' } });
+
+  const moviebox = subtitleRequest('moviebox', { captionId: 'cap3' }, 'moviebox', ids);
+  assert.deepEqual(moviebox, { path: '/api/moviebox-subtitle', data: { id: 'cap3' } });
+
+  // No caption offered is the normal case and must not produce a request.
+  assert.equal(subtitleRequest('moviebox', {}, 'moviebox', ids), null);
+  assert.equal(subtitleRequest('moviebox', { captionId: null }, 'moviebox', ids), null);
+});
+
+await t('a caption URL is session-scoped and only ever returned as-is', async () => {
+  mode = {
+    '/api/moviebox-subtitle': { body: { url: '/caption/abc123' } },
+    '/api/kiss-subtitle': { body: { url: null } },
+  };
+  const { api } = await import('/home/user/ddddddd/reelbox-src/dist-test/api.mjs');
+  assert.deepEqual(await api.subtitle('/api/moviebox-subtitle', { id: 'cap3' }), { url: '/caption/abc123' });
+  assert.deepEqual(await api.subtitle('/api/kiss-subtitle', { id: 'x', season: 1, episode: 1 }), { url: null });
+  assert.equal(seen[0].method, 'POST');
+});

@@ -12,7 +12,8 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import { Playback, type PlaybackState } from '../lib/playback';
+import { Playback, type PlaybackState, type SubtitleState } from '../lib/playback';
+import { aspectFor, ASPECT_MODES, frameFor, readAspect, saveAspect, type AspectId } from '../lib/frame';
 import { itemStore } from '../lib/item-store';
 import { clearProgress, pushHistory, readHeight, saveHeight, saveProgress, readProgress } from '../lib/library';
 
@@ -53,7 +54,11 @@ function Watch() {
     duration: null,
     seekBase: 0,
     providers: '',
+    subtitleUrl: null,
   });
+  const [subs, setSubs] = useState<SubtitleState>({ available: false, on: false, note: '' });
+  const [aspect, setAspect] = useState<AspectId>(() => readAspect());
+  const [picture, setPicture] = useState({ width: 0, height: 0 });
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -79,6 +84,7 @@ function Watch() {
     if (!item) return;
     const playback = new Playback({
       onState: setState,
+      onSubtitle: setSubs,
       onProgress: (position, total, paused) => {
         setTime(position);
         setDuration(total ?? 0);
@@ -97,6 +103,7 @@ function Watch() {
         id: item.id,
         title: item.title,
         type: item.type,
+        source: item.source,
         season: s ?? 1,
         episode: e ?? 1,
         progressKey,
@@ -163,7 +170,15 @@ function Watch() {
   const retry = () => {
     if (!item) return;
     void engine.current?.start(
-      { id: item.id, title: item.title, type: item.type, season: s ?? 1, episode: e ?? 1, progressKey },
+      {
+        id: item.id,
+        title: item.title,
+        type: item.type,
+        source: item.source,
+        season: s ?? 1,
+        episode: e ?? 1,
+        progressKey,
+      },
       state.seekBase || undefined,
     );
   };
@@ -183,6 +198,12 @@ function Watch() {
   }
 
   const pending = state.phase === 'resolving' || state.phase === 'converting';
+  const frame = frameFor(aspect, picture.width, picture.height);
+
+  const chooseAspect = (id: AspectId) => {
+    setAspect(aspectFor(id).id);
+    saveAspect(aspectFor(id).id);
+  };
 
   return (
     <div className="min-h-screen bg-background">
@@ -190,15 +211,41 @@ function Watch() {
         ref={box}
         onMouseMove={poke}
         onTouchStart={poke}
-        className={`relative aspect-video max-h-screen w-full bg-player ${show ? '' : 'cursor-none'}`}
+        style={{
+          aspectRatio: frame.ratio ?? undefined,
+          // A portrait frame is driven by height: at full width a 4:5 clip is
+          // taller than the window and pushes the controls off-screen. With a
+          // definite height the width follows, so nothing is stretched.
+          ...(frame.portrait
+            ? { height: 'min(calc(100dvh - 2rem), 1200px)', width: 'auto', maxWidth: '100%', margin: '0 auto' }
+            : {}),
+        }}
+        className={`relative max-h-screen w-full bg-player ${show ? '' : 'cursor-none'} ${
+          frame.ratio ? '' : 'aspect-video'
+        }`}
       >
         <video
           ref={video}
-          className="h-full w-full"
+          className="h-full w-full object-contain"
           playsInline
           onClick={() => engine.current?.toggle()}
           onPlay={() => setPlaying(true)}
           onPause={() => setPlaying(false)}
+          onLoadedMetadata={(e) => {
+            const v = e.currentTarget;
+            setPicture({ width: v.videoWidth, height: v.videoHeight });
+          }}
+          // A source switch can change the size after metadata, so the shape is
+          // followed rather than decided once.
+          onResize={(e) => {
+            const v = e.currentTarget;
+            setPicture({ width: v.videoWidth, height: v.videoHeight });
+          }}
+          onEmptied={() => {
+            // A stale shape would describe a picture that no longer exists. A
+            // pinned shape stands, because the viewer chose the frame.
+            if (aspect === 'auto') setPicture({ width: 0, height: 0 });
+          }}
         />
 
         {pending && (
@@ -290,13 +337,15 @@ function Watch() {
 
             <div className="relative ml-auto flex shrink-0 items-center gap-3">
               <button
-                onClick={() => {
-                  setMuted(false);
-                  setVol((v) => (v > 0 ? 0 : 1));
-                }}
-                aria-label="Toggle volume"
-                className="hidden"
-              />
+                onClick={() => engine.current && setSubs(engine.current.toggleSubtitle())}
+                aria-label={subs.on ? 'Hide subtitles' : 'Show subtitles'}
+                aria-pressed={subs.on}
+                disabled={!subs.available}
+                title={subs.note || (subs.available ? 'Subtitles' : 'No subtitles for this source')}
+                className={subs.on ? 'text-primary' : subs.available ? '' : 'opacity-40'}
+              >
+                <Captions className="h-5 w-5" />
+              </button>
               <button onClick={() => setMenu(!menu)} aria-label="Settings">
                 <Settings className="h-5 w-5" />
               </button>
@@ -334,6 +383,27 @@ function Watch() {
                   <p className="mt-2 text-[10px] leading-tight text-muted-foreground">
                     Converted output only; the source may be higher.
                   </p>
+                  <p className="mb-1 mt-3 text-xs text-muted-foreground">Frame</p>
+                  <div className="flex flex-wrap gap-1">
+                    {ASPECT_MODES.map((mode) => (
+                      <button
+                        key={mode.id}
+                        onClick={() => chooseAspect(mode.id)}
+                        title={mode.hint}
+                        aria-pressed={aspect === mode.id}
+                        className={`rounded px-2 py-0.5 ${
+                          aspect === mode.id ? 'bg-primary text-primary-foreground' : 'bg-secondary'
+                        }`}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-2 text-[10px] leading-tight text-muted-foreground">
+                    {aspect === 'auto'
+                      ? 'The frame follows the picture.'
+                      : `Pinned to ${aspectFor(aspect).hint}, whatever the file.`}
+                  </p>
                 </div>
               )}
               <button onClick={fullscreen} aria-label="Fullscreen">
@@ -350,9 +420,10 @@ function Watch() {
         {state.message && state.phase === 'playing' && (
           <p className="mt-2 text-[11px] text-muted-foreground">{state.message}</p>
         )}
+        {subs.on && <p className="mt-2 text-[11px] text-primary">Subtitles on — English (provider)</p>}
+        {subs.note && <p className="mt-2 text-[11px] text-muted-foreground">{subs.note}</p>}
         <div className="mt-4 flex flex-wrap gap-2">
           <Link to="/title/$id" params={{ id: item.id }} search={{}} className="btn-ghost">
-            <Captions className="h-4 w-4" />
             Details
           </Link>
           {progressKey && (

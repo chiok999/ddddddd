@@ -149,18 +149,10 @@ function sameOrigin(req) {
   if (!req.headers.origin) return false;
   try { return new URL(req.headers.origin).host === req.headers.host && ['http:', 'https:'].includes(new URL(req.headers.origin).protocol); } catch { return false; }
 }
-// The shell is served from `public/` by name. The player library is the one
-// vendored file, so it gets a stable URL instead of a pinned version in markup.
-const staticFiles = createStatic({
-  root: __dirname,
-  vendored: new Map([['/hls.js', 'node_modules/hls.js/dist/hls.min.js']]),
-});
-// The ReelBox shell is a built app, so its bundle lives in its own directory
-// rather than next to `index.html`. The build output is committed, which keeps
-// the panel's `npm start` free of a build step.
-// `app/` holds only the published bundle: `createStatic` resolves against
-// `<root>/public`, so pointing it at `app/dist` makes `/assets/...` and
-// `/favicon.ico` resolve without a second prefix in the URLs.
+// The interface is a built app in `app/dist`, and it is the only one. The build
+// output is committed, which keeps the panel's `npm start` free of a build step.
+// `createStatic` resolves against `<root>/public`, so pointing it at `app/dist`
+// makes `/assets/...` and `/favicon.ico` resolve without a prefix in the URLs.
 const appFiles = createStatic({ root: path.join(__dirname, 'app', 'dist') });
 const APP_SHELL = path.join(__dirname, 'app', 'dist', 'public', '_shell.html');
 // Pages the shell owns. Anything else is a 404, not the app: a typo in a static
@@ -453,13 +445,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname.startsWith('/media/') && req.method === 'GET') return send(res, authorized ? 403 : 401, {error:authorized ? 'Direct playback is disabled; conversion is required' : 'Login required'});
     if (req.method === 'GET' || req.method === 'HEAD') {
-      // The app bundle first: its URLs are hashed and cannot collide with the
-      // classic player's flat file names.
+      // Hashed bundle files are served directly. The shell is excluded because it
+      // is only ever sent for a page route, never as a static file at its own
+      // path.
       const appEntry = appFiles.lookup(url.pathname);
       if (appEntry && !appEntry.file.endsWith('_shell.html')) return appFiles.send(req, res, appEntry);
-      // A page the shell owns is answered with the shell, and that check comes
-      // before the classic player's files. Otherwise `/` would be the old
-      // document, which is exactly the confusion this rewrite is meant to end.
+      // A page the app owns is answered with the shell, and the client router
+      // renders it. Anything else falls through to the 404 below: a typo should
+      // say so rather than quietly rendering the home screen.
       if (APP_ROUTES.some(pattern => pattern.test(url.pathname))) {
         const shell = appFiles.lookup('/_shell.html');
         if (!shell) return send(res, 503, { error: 'The app shell is missing; run the app build' });
@@ -468,16 +461,6 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, headers);
         return createReadStream(shell.file).pipe(res);
       }
-      // The classic player keeps working under /classic/ and stays a real set of
-      // files. It is the rollback path while the new shell beds in.
-      if (url.pathname === '/classic' || url.pathname.startsWith('/classic/')) {
-        const rest = url.pathname.slice('/classic'.length) || '/';
-        const entry = staticFiles.lookup(rest);
-        if (entry) return staticFiles.send(req, res, entry);
-        return send(res, 404, { error: 'Not found' });
-      }
-      const entry = staticFiles.lookup(url.pathname);
-      if (entry) return staticFiles.send(req, res, entry);
     }
     return send(res, 404, { error: 'Not found' });
   } catch (error) {

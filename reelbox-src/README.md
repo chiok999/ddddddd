@@ -6,8 +6,8 @@ to Troy's real catalog, search, episodes and transcoder rather than to placehold
 
 The build is copied into `solo-cinema/app/dist/public/` and served by `solo-cinema`'s
 existing server, so the deployment stays one process on one port with no build step on
-the host. See `solo-cinema/UI.md` for the routing rules, the CSP changes and how to go
-back to the classic player.
+the host. See `solo-cinema/UI.md` for the routing rules and the CSP requirements. The
+original hand-written player has been deleted, so this is the only interface.
 
 ## Why this exists
 
@@ -63,12 +63,12 @@ the checks above run against fixtures instead.
 
 - `src/lib/api.ts` — every Troy endpoint the UI uses, in one place, so a failure has one
   shape. Bodies are asserted in `tools/api-check.mjs` against each handler's validation.
-- `src/lib/playback.ts` — resolve → convert → play, ported from the classic player with
+- `src/lib/playback.ts` — resolve → convert → play, ported from the original player with
   the original bug-and-rule comments kept. See `solo-cinema/UI.md`.
 - `src/lib/item-store.ts` — catalog ids are bound to the session that fetched them and
   expire after an hour, so entries are kept in memory (mirrored to sessionStorage) rather
   than re-fetched by id, which Troy does not support.
-- `src/lib/art.ts` — artwork through wsrv.nl, with the hostname allowlist the classic UI
+- `src/lib/art.ts` — artwork through wsrv.nl, with the hostname allowlist the original UI
   used.
 - `src/lib/library.ts` — My List and history on the original `rb:*` keys, progress and
   quality on Troy's existing `solo-*` keys, so the two UIs agree.

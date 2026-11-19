@@ -40,10 +40,10 @@ async function withServer(fn) {
 }
 
 test('the static layer refuses traversal while serving nested bundle paths', () => {
-  const files = createStatic({ root: __dirname });
+  const files = createStatic({ root: path.join(__dirname, 'app', 'dist') });
   // A nested asset is the reason this changed: the bundle lives in assets/.
   assert.ok(files.resolve('/assets/app.js'), 'nested asset should resolve');
-  assert.ok(files.resolve('/index.html'));
+  assert.ok(files.resolve('/_shell.html'), 'the shell is a real file');
   for (const attempt of [
     '/../package.json',
     '/assets/../../package.json',
@@ -64,7 +64,7 @@ test('the static layer refuses traversal while serving nested bundle paths', () 
   assert.equal(files.resolve('/assets/../../../package.json'), null);
 });
 
-test('the app owns /, the classic player keeps /classic/, and a typo is a 404', async () => {
+test('the app owns /, the old player is gone, and a typo is a 404', async () => {
   if (!hasShell) {
     assert.ok(true, 'no published shell; run `npm run build` in reelbox-src first');
     return;
@@ -74,7 +74,7 @@ test('the app owns /, the classic player keeps /classic/, and a typo is a 404', 
     assert.equal(root.status, 200);
     const body = await root.text();
     assert.match(body, /data-tsr-stream-part/, 'the shell is the built app document');
-    assert.doesNotMatch(body, /id="loginForm"/, 'the classic login form must not be at /');
+    assert.doesNotMatch(body, /id="loginForm"/, 'only the app renders at /');
 
     // Deep links are the shell too, because the client router resolves them.
     for (const route of ['/browse', '/ranking', '/me', '/title/abc123', '/watch/abc123']) {
@@ -83,10 +83,11 @@ test('the app owns /, the classic player keeps /classic/, and a typo is a 404', 
       assert.match(await response.text(), /data-tsr-stream-part/, route);
     }
 
-    const classic = await fetch(base + '/classic/');
-    assert.equal(classic.status, 200);
-    assert.match(await classic.text(), /id="loginForm"/, 'the old UI is still reachable');
-    assert.equal((await fetch(base + '/classic/app.js')).status, 200);
+    // The classic player was removed on request. Its files must be gone from the
+    // server, not merely unlinked: a stale copy would still be reachable by URL.
+    for (const gone of ['/classic/', '/classic/app.js', '/player-ui.js', '/app.js', '/tokens.css', '/hls.js']) {
+      assert.equal((await fetch(base + gone)).status, 404, `${gone} must be gone`);
+    }
 
     assert.equal((await fetch(base + '/nope')).status, 404, 'a typo must not render the app');
     assert.equal((await fetch(base + '/title/')).status, 404);

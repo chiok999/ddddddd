@@ -23,7 +23,7 @@
  */
 
 import Hls from 'hls.js';
-import { api, type Stream, type TranscodeJob } from './api';
+import { api, subtitleRequest, type Stream, type TranscodeJob } from './api';
 
 export type Phase =
   | 'idle'
@@ -38,6 +38,8 @@ export interface PlaybackTarget {
   id: string;
   title: string;
   type?: string;
+  /** Provider family, which decides the subtitle endpoint. */
+  source?: string;
   season?: number;
   episode?: number;
   /** Where to start, in seconds of the full timeline. */
@@ -57,12 +59,26 @@ export interface PlaybackState {
   seekBase: number;
   /** Human-readable summary of what each provider offered. */
   providers: string;
+  /** VTT URL for this stream's subtitle, when the provider offered one. */
+  subtitleUrl: string | null;
+}
+
+/** Subtitle availability for one stream, for the player's captions button. */
+export interface SubtitleState {
+  /** A track exists and can be switched on. */
+  available: boolean;
+  /** The track is attached and showing. */
+  on: boolean;
+  /** Why there is no track, when there isn't one. */
+  note: string;
 }
 
 export interface PlayerEvents {
   onState: (state: PlaybackState) => void;
   /** Full-timeline position, for resume bookkeeping. */
   onProgress: (position: number, duration: number | null, paused: boolean) => void;
+  /** Subtitle availability, which changes per stream rather than per title. */
+  onSubtitle?: (state: SubtitleState) => void;
 }
 
 const WAITABLE =
@@ -91,6 +107,9 @@ export class Playback {
   private waiting = false;
   private pausedByViewer = false;
   private attemptedSeek = false;
+  private subtitle: SubtitleState = { available: false, on: false, note: '' };
+  private subtitleEl: HTMLTrackElement | null = null;
+  private subtitleActive = false;
   private state: PlaybackState = {
     phase: 'idle',
     message: '',
@@ -98,6 +117,7 @@ export class Playback {
     duration: null,
     seekBase: 0,
     providers: '',
+    subtitleUrl: null,
   };
 
   constructor(events: PlayerEvents) {
@@ -222,6 +242,8 @@ export class Playback {
   async stop() {
     this.generation++;
     this.stopTimer();
+    this.clearSubtitleEl();
+    this.subtitle = { available: false, on: false, note: '' };
     this.hls?.destroy();
     this.hls = null;
     const video = this.video;
@@ -253,6 +275,7 @@ export class Playback {
     this.attemptedSeek = false;
     this.streams = [];
     this.streamIndex = 0;
+    this.subtitle = { available: false, on: false, note: '' };
     this.set({
       phase: 'resolving',
       message: 'Looking for a stream…',
@@ -260,6 +283,7 @@ export class Playback {
       providers: '',
       duration: null,
       seekBase: this.seekBase,
+      subtitleUrl: null,
     });
 
     const season = target.season ?? 1;
@@ -331,12 +355,91 @@ export class Playback {
       }
       this.job = job;
       this.duration = Number.isFinite(job.duration) && job.duration! > 0 ? job.duration! : null;
+      // Subtitle availability belongs to the stream, not the title: failing over
+      // to another provider means asking that provider for its own caption.
+      void this.loadSubtitle(stream, target, generation);
       this.set({ seekBase: this.seekBase, duration: this.duration });
       this.attachPlaylist(job, wasPaused, generation);
     } catch (error: any) {
       if (generation !== this.generation) return;
       await this.failOver(index, generation, error?.message || 'Conversion failed');
     }
+  }
+
+  /**
+   * Fetches this stream's subtitle and attaches it as a <track>.
+   *
+   * The URL Troy returns is session-scoped and expires, so it is fetched per
+   * playback rather than stored with the title. A provider that has no caption
+   * is the normal case, not an error: it says so and the button stays disabled
+   * instead of offering a track that would never load.
+   */
+  private async loadSubtitle(stream: Stream, target: PlaybackTarget, generation: number) {
+    this.clearSubtitleEl();
+    this.subtitle = { available: false, on: false, note: '' };
+    const request = subtitleRequest(stream.provider, stream, target.source, {
+      id: target.id,
+      season: target.season ?? 1,
+      episode: target.episode ?? 1,
+    });
+    if (!request) {
+      this.subtitle = { available: false, on: false, note: 'This source has no subtitles.' };
+      this.publishSubtitle();
+      return;
+    }
+    try {
+      const result = await api.subtitle(request.path, request.data);
+      if (generation !== this.generation) return;
+      if (!result?.url) {
+        this.subtitle = { available: false, on: false, note: 'This source has no subtitles.' };
+        this.publishSubtitle();
+        return;
+      }
+      const video = this.video;
+      if (!video) return;
+      const el = document.createElement('track');
+      el.kind = 'subtitles';
+      el.label = 'English (provider)';
+      el.srclang = 'en';
+      el.src = result.url;
+      // Not `default`: the viewer asked for a clean picture until they say
+      // otherwise, and an autoplaying caption track is a surprise on a phone.
+      el.track.mode = 'hidden';
+      video.append(el);
+      this.subtitleEl = el;
+      this.subtitle = { available: true, on: false, note: '' };
+      this.set({ subtitleUrl: result.url });
+      this.publishSubtitle();
+    } catch (error: any) {
+      if (generation !== this.generation) return;
+      this.subtitle = { available: false, on: false, note: error?.message || 'Subtitles unavailable.' };
+      this.publishSubtitle();
+    }
+  }
+
+  private publishSubtitle() {
+    this.events.onSubtitle?.(this.subtitle);
+  }
+
+  private clearSubtitleEl() {
+    this.subtitleEl?.remove();
+    this.subtitleEl = null;
+    this.subtitleActive = false;
+  }
+
+  /** Switches the attached track on or off. Returns the new state. */
+  toggleSubtitle(): SubtitleState {
+    if (this.subtitleEl) {
+      this.subtitleActive = !this.subtitleActive;
+      this.subtitleEl.track.mode = this.subtitleActive ? 'showing' : 'hidden';
+    }
+    this.subtitle = { ...this.subtitle, on: this.subtitleActive && !!this.subtitleEl };
+    this.publishSubtitle();
+    return this.subtitle;
+  }
+
+  subtitleState() {
+    return this.subtitle;
   }
 
   private attachPlaylist(job: TranscodeJob, wasPaused: boolean, generation: number) {

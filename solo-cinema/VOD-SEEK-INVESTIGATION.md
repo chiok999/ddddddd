@@ -1,5 +1,11 @@
 > Current storage policy: the application no longer enforces its former output cap or free-space reserve. Statements about those thresholds below are historical.
 
+> **Historical.** These audits describe the hand-written player in `public/`,
+> which has since been deleted; ReelBox (`reelbox-src/`, built to `app/dist/public/`)
+> replaced it. The findings and reasoning are kept because the behaviours they
+> describe were carried over to the new player, but the file references below no
+> longer resolve.
+
 > Update: supported fast-start MP4 files with valid duration can now restart conversion at a selected timestamp; the preceding source bytes may still need to be read through the pipe. See `TRANSCODING-AUDIT.md`. Older notes are historical.
 
 > Current update: bounded EVENT output is now implemented for supported MP4 inputs; see `TRANSCODING-AUDIT.md`. Seek only through the already-converted portion. The earlier investigations below are historical.
