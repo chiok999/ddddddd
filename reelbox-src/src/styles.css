@@ -1,0 +1,218 @@
+@import 'tailwindcss';
+
+/* Tokens reproduce the original bundle exactly, including the colour space: the
+   theme was authored in oklch and gradient interpolation depends on it. */
+:root {
+  --radius: 0.75rem;
+  --background: oklch(14% 0.01 260);
+  --foreground: oklch(97% 0 0);
+  --card: oklch(19% 0.012 260);
+  --card-foreground: oklch(97% 0 0);
+  --popover: oklch(20% 0.012 260);
+  --popover-foreground: oklch(97% 0 0);
+  --primary: oklch(72% 0.17 152);
+  --primary-foreground: oklch(15% 0.02 160);
+  --secondary: oklch(23% 0.012 260);
+  --secondary-foreground: oklch(97% 0 0);
+  --muted: oklch(23% 0.012 260);
+  --muted-foreground: oklch(70% 0.01 260);
+  --accent: oklch(25% 0.012 260);
+  --accent-foreground: oklch(97% 0 0);
+  --destructive: oklch(60% 0.22 27);
+  --destructive-foreground: oklch(98% 0 0);
+  --border: oklch(100% 0 0 / 0.09);
+  --input: oklch(100% 0 0 / 0.12);
+  --ring: oklch(72% 0.17 152);
+  --player: oklch(5% 0 0);
+  --chart-1: oklch(72% 0.17 152);
+  --chart-2: oklch(60% 0.118 184);
+  --chart-3: oklch(40% 0.07 227);
+  --chart-4: oklch(83% 0.19 84);
+  --chart-5: oklch(77% 0.19 70);
+  --sidebar: oklch(19% 0.012 260);
+  --sidebar-foreground: oklch(97% 0 0);
+  --sidebar-primary: oklch(72% 0.17 152);
+  --sidebar-primary-foreground: oklch(15% 0.02 160);
+  --sidebar-accent: oklch(25% 0.012 260);
+  --sidebar-accent-foreground: oklch(97% 0 0);
+  --sidebar-border: oklch(100% 0 0 / 0.09);
+  --sidebar-ring: oklch(72% 0.17 152);
+}
+
+@theme inline {
+  --font-sans: 'Manrope', sans-serif;
+  --font-display: 'Sora', sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-player: var(--player);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 0.25rem);
+  --radius-2xl: calc(var(--radius) + 0.5rem);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html,
+  body {
+    background: var(--background);
+    color: var(--foreground);
+  }
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  img {
+    -webkit-user-drag: none;
+  }
+}
+
+@layer components {
+  .app-shell {
+    width: 100%;
+    max-width: 480px;
+    min-height: 100dvh;
+    padding-bottom: calc(4rem + env(safe-area-inset-bottom));
+    background: var(--background);
+    margin-inline: auto;
+    overflow-x: clip;
+  }
+
+  /* Two gradients stacked: up from the background, then in from the left. */
+  .hero-fade {
+    background:
+      linear-gradient(to top, var(--background) 5%, transparent 60%),
+      linear-gradient(to right, var(--background) 0%, transparent 65%);
+  }
+
+  .rank-num {
+    color: var(--background);
+    -webkit-text-stroke: 2px var(--primary);
+  }
+
+  .range {
+    appearance: none;
+    cursor: pointer;
+    height: 4px;
+    border-radius: 9999px;
+    background: linear-gradient(
+      to right,
+      var(--primary) var(--p, 0%),
+      color-mix(in oklch, var(--foreground) 25%, transparent) var(--p, 0%)
+    );
+  }
+  .range::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 9999px;
+    background: var(--primary);
+  }
+
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.7rem 1.5rem;
+    border-radius: 9999px;
+    font-weight: 600;
+    background: var(--primary);
+    color: var(--primary-foreground);
+    transition: transform 0.2s;
+  }
+  .btn-primary:hover {
+    transform: scale(1.04);
+  }
+
+  /* Deliberately split the way the original cascade was: the opaque fallback,
+     then the color-mix upgrade, then sizing. */
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    border-radius: 9999px;
+    background: var(--foreground);
+  }
+  @supports (color: color-mix(in lab, red, red)) {
+    .btn-ghost {
+      background: color-mix(in oklch, var(--foreground) 12%, transparent);
+    }
+  }
+  .btn-ghost {
+    padding: 0.7rem 1.5rem;
+    font-weight: 600;
+  }
+  .btn-ghost:hover {
+    background: color-mix(in oklch, var(--foreground) 20%, transparent);
+  }
+
+  .glass {
+    background: color-mix(in oklch, var(--background) 80%, transparent);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+  }
+
+  .bg-premium {
+    background: linear-gradient(
+      110deg,
+      var(--primary),
+      color-mix(in oklch, var(--primary) 55%, var(--accent))
+    );
+    color: var(--primary-foreground);
+  }
+
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .shadow-glow {
+    box-shadow: 0 0 40px color-mix(in oklch, var(--primary) 50%, transparent);
+  }
+
+  /* The hero image cross-fades: `animate-in fade-in duration-700` resolved to
+     these two utilities in the original. */
+  .animate-in {
+    animation: enter
+      var(--tw-animation-duration, var(--tw-duration, 0.15s))
+      var(--tw-ease, ease) var(--tw-animation-delay, 0s)
+      var(--tw-animation-iteration-count, 1) var(--tw-animation-direction, normal)
+      var(--tw-animation-fill-mode, none);
+  }
+  .fade-in {
+    --tw-enter-opacity: 0;
+  }
+  .duration-700 {
+    --tw-duration: 0.7s;
+    transition-duration: 0.7s;
+  }
+}
+
+@keyframes enter {
+  0% {
+    opacity: var(--tw-enter-opacity, 1);
+    transform: translate3d(var(--tw-enter-translate-x, 0), var(--tw-enter-translate-y, 0), 0)
+      scale3d(var(--tw-enter-scale, 1), var(--tw-enter-scale, 1), var(--tw-enter-scale, 1))
+      rotate(var(--tw-enter-rotate, 0));
+    filter: blur(var(--tw-enter-blur, 0));
+  }
+}
