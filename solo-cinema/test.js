@@ -398,12 +398,19 @@ test('real FFmpeg creates two session-bound playable HLS renditions and cleans u
  const {createTranscoder}=require('./transcode'),{Readable}=require('node:stream'),fs=require('node:fs'),fsp=fs.promises,os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');const bin=testFfmpeg;const dir=await fsp.mkdtemp(path.join(os.tmpdir(),'troy-test-'));const fixture=path.join(dir,'sample.mp4');
  const input=spawnSync(bin,['-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=480x270:rate=20','-f','lavfi','-i','sine=frequency=440','-t','12','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart','-c:a','aac',fixture],{encoding:'utf8'});assert.equal(input.status,0,input.stderr);
  let opened=0;const t=createTranscoder({tmpdir:dir,executable:bin,startupMs:35000,open:async()=>{opened++;return {ok:true,status:200,headers:new Headers({'content-type':'video/mp4'}),body:Readable.toWeb(fs.createReadStream(fixture))}}});
- try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);const master=await t.read(job.id,'alice','master.m3u8');assert.match(master.data.toString(),/RESOLUTION=426x240/);assert.match(master.data.toString(),/RESOLUTION=640x360/);
+ try{const job=await t.start({},'alice');assert.equal(opened,1);await assert.rejects(t.start({},'bob'),e=>e.status===409);assert.equal(await t.read(job.id,'bob','master.m3u8'),null);
+ // Readiness opens on the first rung, so the second may legitimately not be
+ // listed yet -- that is the behaviour, not a failure. Asserting both inline was
+ // a race that only ever passed when the slower rung happened to win.
+ let master='';
+ for(let i=0;i<300;i++){master=(await t.read(job.id,'alice','master.m3u8')).data.toString();if(master.includes('640x360'))break;await new Promise(r=>setTimeout(r,100));}
+ assert.match(master,/RESOLUTION=426x240/);
+ assert.match(master,/RESOLUTION=640x360/,'the 360p rung must appear once it has a finished segment');
  // The advertised BANDWIDTH is what a player's bandwidth estimation compares
  // against, so it has to stay above the rung's real output or ABR will believe
  // 640x360 fits a connection it does not. Measured through this pipeline: ~130
  // kbps on 240p, ~260 kbps on 360p; the ceilings are their `-maxrate` plus audio.
- const declared=[...master.data.toString().matchAll(/BANDWIDTH=(\d+)/g)].map(m=>Number(m[1]));
+ const declared=[...master.matchAll(/BANDWIDTH=(\d+)/g)].map(m=>Number(m[1]));
  assert.deepEqual(declared,[290000,580000]);
  assert.ok(declared[1]>500000,'360p must not be advertised below its maxrate plus audio');
  // A CRF ladder can emit less than its ceiling, but never more: if it did, the

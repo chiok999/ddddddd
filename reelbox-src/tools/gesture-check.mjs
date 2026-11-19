@@ -36,7 +36,20 @@ await build({
   },
 });
 const { Gestures } = await import('../dist-test/gestures.mjs');
+await build({
+  configFile: false,
+  logLevel: 'error',
+  build: {
+    outDir: 'dist-test',
+    emptyOutDir: false,
+    lib: { entry: 'src/lib/orientation.ts', formats: ['es'], fileName: () => 'orientation.mjs' },
+    minify: false,
+  },
+});
 const { readSpeed, saveSpeed, SPEEDS } = await import('../dist-test/library.mjs');
+const { rotationStrategy, nextLock, shouldRelease, currentOrientation, rotationNote } = await import(
+  '../dist-test/orientation.mjs'
+);
 const { chromeVisible, seekSegments, seekTarget, gestureLabel, IDLE_MS } = await import(
   '../dist-test/player-ux.mjs'
 );
@@ -227,6 +240,53 @@ await check('the playback speed is remembered, and only a real speed is trusted'
   };
   assert.equal(readSpeed(), 1);
   saveSpeed(2);
+});
+
+await check('rotation asks for fullscreen first on the devices where a lock needs it', () => {
+  // The shipped button called `lock()` outside fullscreen, which browsers reject,
+  // so it failed on every Android device where it would have helped.
+  const both = { canLock: true, canUnlock: true, canFullscreen: true, fullscreen: false };
+  assert.equal(rotationStrategy(both), 'fullscreen-then-lock');
+  assert.equal(rotationStrategy({ ...both, fullscreen: true }), 'lock');
+  // iOS Safari: no lock API at all. Fullscreen is still better than portrait, and
+  // saying so beats a button that silently does nothing.
+  assert.equal(rotationStrategy({ ...both, canLock: false }), 'fullscreen-only');
+  // Neither.
+  assert.equal(rotationStrategy({ ...both, canLock: false, canFullscreen: false }), 'manual');
+});
+
+await check('the rotate button is a toggle, not a one-way trip', () => {
+  assert.equal(nextLock(null, 'landscape'), 'landscape');
+  assert.equal(nextLock('landscape', 'landscape'), 'portrait', 'and back again');
+  assert.equal(nextLock('portrait', 'landscape'), 'landscape');
+  // A vertical film wants the app upright with the phone on its side.
+  assert.equal(nextLock(null, 'portrait'), 'portrait');
+});
+
+await check('a screen lock is given back when the player goes away', () => {
+  // The shipped version never unlocked. A lock outlives the page that took it, so
+  // the home rail and the settings page stayed sideways until the tab closed.
+  assert.equal(shouldRelease('landscape', false), true);
+  assert.equal(shouldRelease('landscape', true), false, 'never unlock twice');
+  assert.equal(shouldRelease(null, false), false, 'nothing held, nothing to release');
+});
+
+await check('the current orientation is read from the screen, not assumed', () => {
+  assert.equal(currentOrientation('landscape-primary', false), 'landscape');
+  assert.equal(currentOrientation('landscape-secondary', true), 'landscape');
+  assert.equal(currentOrientation('portrait-primary', false), 'portrait');
+  // Browsers that expose only matchMedia.
+  assert.equal(currentOrientation(undefined, true), 'portrait');
+  assert.equal(currentOrientation(undefined, false), 'landscape');
+  // An unknown type must fall through rather than be guessed as landscape.
+  assert.equal(currentOrientation('sideways', true), 'portrait');
+});
+
+await check('the viewer is told when rotation could not happen', () => {
+  assert.match(rotationNote('manual', null), /turn the phone/i);
+  assert.match(rotationNote('fullscreen-only', null), /fullscreen/i);
+  assert.equal(rotationNote('lock', 'landscape'), 'Screen locked landscape. Release it in Settings.');
+  assert.equal(rotationNote('lock', null), null, 'a released lock needs no note');
 });
 
 console.log(results.every(([pass]) => pass) ? '\nall gesture checks passed' : '\nfailures above');
