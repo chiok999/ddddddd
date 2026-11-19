@@ -41,6 +41,17 @@ Set `CINEMA_RELAY=0` to disable the relay and require conversion (the previous b
 
 **Bandwidth note:** the relay costs server bandwidth equal to what you watch, because the bytes pass through the host. If the host has a transfer allowance, watch that; there is no disk cost.
 
+## Documentation
+
+- **`ARCHITECTURE.md`** — how conversion, seeking, providers and their failure
+  modes actually work, with the limits read from the source. Start here.
+- `UI.md` — routing, the app bundle and the CSP hash rule.
+- `RELAY-PERF.md` — what the relay does and the measurements behind it.
+
+Earlier audit notes were removed: they had been corrected in place so often that
+their "current policy" headers contradicted both their own bodies and the code.
+Nothing from them that is still true is missing from `ARCHITECTURE.md`.
+
 ## FFmpeg and temporary storage
 
 Conversion is the only playback path, so the server refuses to play anything
