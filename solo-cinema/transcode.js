@@ -33,7 +33,11 @@ const HLSTIME=4;
 
 // Seconds of finished output the player needs to keep going, and the point at
 // which a paused player may start again. The gap is what stops it flapping.
-const MIN_LEAD=2, RESUME_LEAD=8;
+// A player opens the gate and immediately consumes what is there. At 2 s against
+// a 4 s segment that means half a segment of runway, which drains at once and
+// re-pauses -- the loop where playback never quite starts. One whole segment is
+// the smallest amount that survives being played.
+const MIN_LEAD=HLSTIME, RESUME_LEAD=HLSTIME*3;
 
 function fastStartGate(limit=8*1024*1024,seekOffset=0){
  let buffer=Buffer.alloc(0),offset=0,seenFtyp=false,ready=false;
@@ -129,9 +133,6 @@ async function probeFfmpeg(executable){
   const filters=await probeCommand(executable,['-hide_banner','-filters']);
   if(!/^\s*[A-Z.]{2,3}\s+scale\s/m.test(filters) || !/^\s*[A-Z.]{2,3}\s+pad\s/m.test(filters))throw Error('FFmpeg is missing the scale or pad filter');
   const options=await probeCommand(executable,['-hide_banner','-h','full']);
-  // -readrate is deliberately unused: it caps input at a multiple of realtime.
-  // Pacing is done by pausing the process, which needs no encoder cooperation.
-  if(!/^\s*-readrate_initial_burst\s/m.test(options))throw Error('FFmpeg lacks -readrate_initial_burst');
   // The listing prints `-force_key_frames[:<stream_spec>]`, so the name is not
   // followed directly by whitespace.
   if(!/^\s*-force_key_frames\b/m.test(options))throw Error('FFmpeg lacks -force_key_frames');
@@ -151,6 +152,25 @@ function videoEncoder(executable){
   // Software unless the operator explicitly opted into hardware encoding.
   if(config.encoder()==='rkmpp' && ffmpegEncoders.get(executable)==='h264_rkmpp') return 'h264_rkmpp';
   return 'libx264';
+}
+
+/**
+ * Finished segments in one rung's playlist.
+ *
+ * Shared by readiness and by the master playlist, because the two must agree: if
+ * readiness opened on a rung the master did not list, a player would ask for a
+ * variant that is not there.
+ */
+async function finishedSegments(dir, rung){
+  try{
+    const list=await fsp.readFile(path.join(dir,rung,'index.m3u8'),'utf8');
+    // The muxer writes the path it was given, so a line may be absolute.
+    const segments=(list.match(/^.*?index\d+\.(?:ts|m4s)\s*$/gm)||[]).length;
+    // A rung is ready with one segment. Requiring two would deadlock on any input
+    // shorter than two HLS segments, and an ENDLIST already says the whole
+    // timeline is on disk.
+    return list.includes('#EXT-X-ENDLIST') ? Math.max(segments,2) : segments;
+  }catch{return 0;}
 }
 
 function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.idleMs(), startupMs=config.startupMs(), authorize=()=>true}={}){
@@ -227,39 +247,67 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
       const type=response.headers.get('content-type')||'', encoding=response.headers.get('content-encoding')||'identity';
       if(/mpegurl|text\/html/i.test(type) || encoding.toLowerCase()!=='identity'){await response.body.cancel().catch(()=>{});throw Error('Only uncompressed direct MP4 sources can be transcoded');}
       const encoder=videoEncoder(binary);
-      // At 426x240 and 640x360 `veryfast` spends CPU on detail the output cannot
-      // show. Measured on a 1080p source, one 240p rung: veryfast 11.5s of CPU,
-      // ultrafast+zerolatency+baseline 5.0s, for 1% larger segments. baseline also
-      // removes CABAC, which is what makes the decode cheap on old phones.
+      // Rate control is quality-targeted, not bitrate-targeted. `-b:v 180k` is a
+      // *target*, and x264 spends it whether the frame needs it or not; CRF spends
+      // what the frame needs and lets `-maxrate` cap it. Measured on a 1080p source
+      // (SSIM against the downscaled original, per hours of media):
+      //
+      //   360p  ultrafast baseline 420k  491 kbps  216 MB/h  SSIM 0.9919
+      //         medium    high     crf27 260 kbps  114 MB/h  SSIM 0.9937
+      //   240p  ultrafast baseline 180k  217 kbps   96 MB/h  SSIM 0.9844
+      //         veryfast  main     crf30 130 kbps   57 MB/h  SSIM 0.9784
+      //
+      // So the same picture costs about half the mobile data, which matters more
+      // here than CPU: the 360p rung still encodes at 6.2x realtime on two cores.
+      // `zerolatency` is gone with it -- it disables B-frames and lookahead, which
+      // is exactly where most of that saving comes from.
+      //
+      // `main` on 240p rather than `high`: high profile buys 8x8 transform and
+      // extra refs that a 240-line picture cannot show, and costs decode on the
+      // old phones that are the only reason to serve 240p at all.
+      //
       // h264_rkmpp takes neither -preset nor -threads, and scaling stays on the
       // plain software filter so it works on any build.
-      const videoOptions=encoder==='h264_rkmpp'
+      const videoOptions=rung=>encoder==='h264_rkmpp'
         ? ['-c:v','h264_rkmpp','-rc_mode','CBR']
-        : ['-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-profile:v','baseline','-level','3.0','-threads','1','-sc_threshold','0'];
+        : rung==='240'
+          ? ['-c:v','libx264','-preset','veryfast','-profile:v','main','-level','3.1','-crf','30','-threads','0','-sc_threshold','0']
+          : ['-c:v','libx264','-preset','medium','-profile:v','high','-level','3.1','-crf','27','-threads','0',
+             // Spelled out rather than inherited from `-preset medium`: every one
+             // of these was measured, and a future FFmpeg moving a preset default
+             // would silently change what we ship and what the bitrate table below
+             // claims.
+             '-x264-params','cabac=1:deblock=1,1:8x8dct=1:mbtree=1:bframes=3:b-adapt=2:ref=3:subme=7:trellis=1:rc-lookahead=30:aq-mode=3:direct=auto:me=umh'];
       // Two rungs, and FFmpeg must never write a segment before it is complete:
       // a half-written playlist is what makes a player re-request and jump back.
-      const output=(w,h,bitrate,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,...videoOptions,'-pix_fmt','yuv420p','-b:v',bitrate,'-maxrate',`${Math.round(parseInt(bitrate)*1.3)}k`,'-bufsize',`${parseInt(bitrate)*3}k`,'-force_key_frames',`expr:gte(t,n_forced*${HLSTIME})`,'-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time',String(HLSTIME),'-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',`${dir}/index%d.ts`,`${dir}/index.m3u8`];
-      const headroom=config.leadSeconds();
+      // `-maxrate` is the ceiling CRF may climb to on a hard scene and `-bufsize`
+      // is how much of that a player may be asked to absorb; three seconds of it
+      // keeps the declared BANDWIDTH honest without stalling a segment.
+      const output=(rung,w,h,ceiling,audio,dir)=>['-map','0:v:0','-map','0:a:0?','-vf',`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,...videoOptions(rung),'-pix_fmt','yuv420p','-maxrate',ceiling,'-bufsize',`${parseInt(ceiling)*3}k`,'-force_key_frames',`expr:gte(t,n_forced*${HLSTIME})`,'-c:a','aac','-b:a',audio,'-ac','2','-ar','48000','-f','hls','-hls_time',String(HLSTIME),'-hls_list_size','0','-hls_playlist_type','event','-hls_flags','temp_file+independent_segments','-hls_segment_filename',`${dir}/index%d.ts`,`${dir}/index.m3u8`];
       // No -readrate: it caps the input at a multiple of realtime, so a value
       // below 1 makes it arithmetically impossible for the encoder to stay ahead
       // and the buffer drains 15% per second. Read as fast as the encoder can and
       // bound the *lead* instead, by pausing the process (see `throttle`).
-      // -readrate_initial_burst stays: it lets a seek refill the gap immediately.
-      const lead=(seekOffset||0)+headroom;
-      const pacing=['-readrate_initial_burst',String(Math.ceil(lead)),...(seekOffset>0?['-ss',String(seekOffset)]:[])];
+      //
+      // -readrate_initial_burst was here and did nothing: it only configures the
+      // initial burst of the -readrate limiter, which is deliberately never set.
+      // A seek already refills the gap because the input is read unthrottled.
+      const pacing=[...(seekOffset>0?['-ss',String(seekOffset)]:[])];
       // Two rungs cost two encodes. On a small box the 240p one is enough to
       // start, and both are only worth encoding while the CPU has room.
       const rungs=config.ladder();
       const outputs=[];
-      // Bitrates come from measurement, not from a guess at what 426x240 needs.
-      // A 30 s testsrc2 encode through these exact flags produced 364 kbps for
-      // the old 250k/48k pair even though that budgets 298k: with a single
-      // thread, baseline and a forced keyframe every four seconds, the encoder
-      // spends more on the buffer flush per segment than the average rate says.
-      // The pairs below measured ~276 kbps and ~560 kbps, which is a real
-      // saving on a metered connection without dropping the rung's shape.
-      for(const rung of rungs) outputs.push(...output(rung==='240'?426:640,rung==='240'?240:360,rung==='240'?'180k':'420k',rung==='240'?'32k':'64k',rung));
-      const args=['-hide_banner','-loglevel','error','-nostdin','-filter_threads','1',...pacing,'-threads','2','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...outputs];
+      // The ceilings come from measurement, not from a guess at what 426x240
+      // needs. With CRF the encoder only approaches them on hard material, so they
+      // are set at what a worst case may cost rather than what a typical scene
+      // does: measured output is ~130 kbps on 240p and ~260 kbps on 360p.
+      for(const rung of rungs) outputs.push(...output(rung,rung==='240'?426:640,rung==='240'?240:360,rung==='240'?'250k':'500k',rung==='240'?'32k':'64k',rung));
+      // One process with two outputs on a 1-2 vCPU panel: pinning each encode to a
+      // single thread and the filter graph to another oversubscribes the box and
+      // can drop the encoder below realtime, after which the buffer drains however
+      // correct the gate is. Measured at 240p+360p on 2 cores: 5.83x realtime with
+      // -threads 1 per output plus -filter_threads 1, 6.79x letting x264 decide.
+      const args=['-hide_banner','-loglevel','error','-nostdin',...pacing,'-threads','0','-protocol_whitelist','pipe','-format_whitelist','mov','-f','mov','-i','pipe:0',...outputs];
       job.proc=spawn(binary,args,{cwd:job.dir,stdio:['pipe','ignore','pipe'],shell:false});let stderr='',diskFull=false;job.proc.stderr.on('data',chunk=>{stderr=(stderr+chunk.toString('utf8')).slice(-8192);if(/no space left on device|disk quota exceeded/i.test(stderr))diskFull=true;});
       job.proc.once('error',err=>{if(['ENOENT','EACCES','EPERM','ENOEXEC'].includes(err.code))binaryPromise=null;job.error=executableError(err);void stop(job);});
       job.proc.once('close',code=>{if(!job.stopped && code!==0){if(!job.error)job.error=ffmpegExitError(code,diskFull?'no space left on device':stderr);void stop(job);}});
@@ -285,7 +333,11 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
           let done=0;
           for(const n of names) if(/^index\d+\.ts$/.test(n)) done++;
           const encoded=done*HLSTIME;
-          const played=job.position ? Math.max(0,Number(job.position.seconds)||0) : 0;
+          // `encoded` counts from the job's start; the client reports a position on
+          // the full timeline. Subtracting one from the other without removing the
+          // offset made this return 0 for every seek, so the throttle never paused
+          // the encoder and the disk cap could be overrun by `offset` seconds.
+          const played=job.position ? Math.max(0,(Number(job.position.seconds)||0)-(job.offset||0)) : 0;
           return Math.max(0,encoded-played);
         }catch{return null;}
       };
@@ -306,25 +358,20 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
       // Ready means "there is something complete to play", not "a playlist
       // exists". Starting on a playlist with no finished segment is what makes a
       // player show an error and restart -- and restarting is the "seek back to
-      // where I was" the viewer sees. Two finished segments is the minimum a
-      // player can start on without immediately stalling.
+      // where I was" the viewer sees. One finished segment is one full HLSTIME,
+      // which is the least the player can open on; a second rung is not required,
+      // because the master playlist only lists a rung once it has one.
       const rungDirs=rungs;
-      async function finishedSegments(dir){
-        try{
-          const list=await fsp.readFile(path.join(job.dir,dir,'index.m3u8'),'utf8');
-          // The muxer writes the path it was given, so a line may be absolute.
-          const segments=(list.match(/^.*?index\d+\.ts\s*$/gm)||[]).length;
-          // A finished rung is ready with one segment. Requiring two would
-          // deadlock on any input shorter than two HLS segments, and an
-          // ENDLIST already says the whole timeline is on disk.
-          return list.includes('#EXT-X-ENDLIST') ? Math.max(segments,2) : segments;
-        }catch{return 0;}
-      }
       const deadline=Date.now()+(seekOffset ? Math.max(startupMs,180000+Math.ceil(seekOffset*1000)) : startupMs);
       while(Date.now()<deadline && !job.stopped){
         if(job.error)throw Error(job.error);
-        const counts=await Promise.all(rungDirs.map(finishedSegments));
-        if(counts.every(n=>n>=1)){job.ready=true;job.lastAccess=Date.now();job.rungs=rungDirs;job.firstSegmentMs=Date.now()-startedAt;return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate.duration || null,offset:seekOffset,rungs:rungDirs};}
+        // Only the first rung has to be ready. Requiring every rung meant the
+        // default 240p viewer waited for a 360p encode it never downloads, and
+        // both encoders competed for the same cores from the first frame. A 360p
+        // viewer is served by the master playlist, which lists a rung once it has
+        // a segment (see read('master.m3u8')).
+        const ready=await finishedSegments(job.dir,rungDirs[0]);
+        if(ready>=1){job.ready=true;job.lastAccess=Date.now();job.rungs=rungDirs;job.firstSegmentMs=Date.now()-startedAt;return {id:job.id,url:`/transcode/${job.id}/master.m3u8`,duration:job.gate.duration || null,offset:seekOffset,rungs:rungDirs};}
         await interval(200);
       }
       throw Error(job.error || 'Transcode did not start in time');
@@ -367,27 +414,48 @@ function createTranscoder({open, executable, tmpdir=os.tmpdir(), idleMs=config.i
         counts[rung]={segments,encoded:Number(duration.toFixed(2))};
       }catch{counts[rung]={segments:0,encoded:0};}
     }
-    const encoded=Math.min(...Object.values(counts).map(rung=>rung.encoded));
+    // Only over the rungs the player can actually request. `read(master.m3u8)`
+    // hides a rung until it has one finished segment, so counting a not-yet-listed
+    // rung here reports 0 seconds of lead for output that is already being served
+    // -- which is precisely what a slower preset made visible.
+    const listed=Object.values(counts).filter(rung=>rung.segments>=1);
+    const encoded=listed.length ? Math.min(...listed.map(rung=>rung.encoded)) : 0;
     const offset=job.offset || 0;
-    const played=job.position ? Math.max(0,Number(job.position.seconds)||0) : 0;
-    const ahead=Number((offset+encoded-(offset+played)).toFixed(2));
+    // With nothing reported yet the viewer is at the job's start, not at zero.
+    const played=job.position ? Math.max(0,Number(job.position.seconds)||0) : offset;
+    // `played` is absolute and `encoded` is not, so the window position is the
+    // difference. Adding the offset to both sides, as this used to, cancels it
+    // out and leaves ahead understated by exactly the offset -- correct at 0,
+    // and a wait of `offset` seconds after any seek.
+    const watched=Math.max(0,played-offset);
+    const ahead=Number((encoded-watched).toFixed(2));
     // The verdict is decided here, not inferred by the player: `canPlay` means
     // there is enough finished output to keep going, `resumeAt` gives the player
     // hysteresis so it does not toggle on the boundary.
     const canPlay=ahead>=MIN_LEAD, resumeAt=ahead>=RESUME_LEAD;
-    return {active:true,error:null,encoded,ahead,canPlay,resumeAt,playing:played,position:offset+played,rungs:counts,finished:job.proc?.exitCode===0,throttled:!!job.paused,firstSegmentMs:job.firstSegmentMs ?? null};
+    return {active:true,error:null,encoded,ahead,canPlay,resumeAt,playing:played,position:played,rungs:counts,finished:job.proc?.exitCode===0,throttled:!!job.paused,firstSegmentMs:job.firstSegmentMs ?? null};
   }
   async function read(id,sid,part){const job=get(id,sid);if(!job)return null;
     if(part==='master.m3u8'){
-      const rows=job.rungs || ['240','360'];
-      // avc1.42c01e is baseline level 3.0 (what the encoder is told to produce,
-      // so 240p and 360p both fit it); mp4a.40.2 is AAC-LC. Without CODECS hls.js
-      // has to load a fragment before it can decide the level is playable.
+      const declared=job.rungs || ['240','360'];
+      // Only a rung with a finished segment is listed. Readiness now opens on the
+      // first rung alone, so the second one may legitimately have nothing yet --
+      // and advertising a variant whose playlist is empty makes a player pick it
+      // and stall. The first rung is always listed, because readiness guaranteed it.
+      const counts=await Promise.all(declared.map(rung=>finishedSegments(job.dir,rung)));
+      const rows=declared.filter((rung,index)=>index===0 || counts[index]>=1);
+      // The CODECS string must describe what the encoder actually emitted, or a
+      // player that trusts it builds the wrong decoder: avc1.4d401f is main level
+      // 3.1 (240p, profile_idc 77) and avc1.64001f is high level 3.1 (360p,
+      // profile_idc 100), both confirmed by reading the SPS out of a real segment.
+      // The two rungs genuinely differ now that 240p picks a cheaper profile.
+      // mp4a.40.2 is AAC-LC. Without CODECS hls.js has to load a fragment before
+      // it can decide the level is playable.
       const lines=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-INDEPENDENT-SEGMENTS'];
       for(const rung of rows){
         lines.push(rung==='240'
-          ?'#EXT-X-STREAM-INF:BANDWIDTH=270000,RESOLUTION=426x240,CODECS="avc1.42c01e,mp4a.40.2"'
-          :'#EXT-X-STREAM-INF:BANDWIDTH=620000,RESOLUTION=640x360,CODECS="avc1.42c01e,mp4a.40.2"');
+          ?'#EXT-X-STREAM-INF:BANDWIDTH=290000,RESOLUTION=426x240,CODECS="avc1.4d401f,mp4a.40.2"'
+          :'#EXT-X-STREAM-INF:BANDWIDTH=580000,RESOLUTION=640x360,CODECS="avc1.64001f,mp4a.40.2"');
         lines.push(`${rung}/index.m3u8`);
       }
       return {type:'application/vnd.apple.mpegurl',data:Buffer.from(`${lines.join('\n')}\n`)};

@@ -89,6 +89,20 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const newRequestId = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(16)), (n) => n.toString(16).padStart(2, '0')).join('');
 
+/**
+ * Asks Troy for the caption track retimed into the window that starts at `from`.
+ *
+ * A `<track src>` cannot carry a header, so the offset has to be a query
+ * parameter. At `from === 0` the URL is returned unchanged -- the common case,
+ * and it keeps the stored URL identical to what the server would have sent
+ * anyway.
+ */
+export function captionUrl(url: string, from: number) {
+  if (!(from > 0)) return url;
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}from=${encodeURIComponent(from.toFixed(3))}`;
+}
+
 /** Doubles as the sink for the audio/video element the UI renders. */
 export class Playback {
   private video: HTMLVideoElement | null = null;
@@ -266,6 +280,12 @@ export class Playback {
   async start(target: PlaybackTarget, startAt?: number) {
     const generation = ++this.generation;
     this.stopTimer();
+    // The old track is relative to the old window, so it must go now rather than
+    // when the new one arrives: `start` can take tens of seconds waiting for a
+    // conversion, and cues from the previous seek point would otherwise keep
+    // firing over the new picture. `subtitleActive` is deliberately *not* cleared
+    // here, so the viewer's choice survives the restart.
+    this.clearSubtitleEl();
     this.hls?.destroy();
     this.hls = null;
     this.job = null;
@@ -401,14 +421,20 @@ export class Playback {
       el.kind = 'subtitles';
       el.label = 'English (provider)';
       el.srclang = 'en';
-      el.src = result.url;
+      // Provider captions are timed against the whole film; a converted window
+      // starts near zero at `seekBase`. Without `from` every cue fires offset
+      // seconds early, and cues behind the window fire all at once on load.
+      el.src = captionUrl(result.url, this.seekBase);
       // Not `default`: the viewer asked for a clean picture until they say
       // otherwise, and an autoplaying caption track is a surprise on a phone.
       el.track.mode = 'hidden';
       video.append(el);
       this.subtitleEl = el;
-      this.subtitle = { available: true, on: false, note: '' };
-      this.set({ subtitleUrl: result.url });
+      // Re-apply the choice made on a previous window; `hidden` only wins when the
+      // viewer has never asked for captions.
+      el.track.mode = this.subtitleActive ? 'showing' : 'hidden';
+      this.subtitle = { available: true, on: this.subtitleActive, note: '' };
+      this.set({ subtitleUrl: el.src });
       this.publishSubtitle();
     } catch (error: any) {
       if (generation !== this.generation) return;
@@ -421,10 +447,15 @@ export class Playback {
     this.events.onSubtitle?.(this.subtitle);
   }
 
+  /**
+   * Detaches the <track> element. `subtitleActive` is the viewer's preference and
+   * outlives the element: resetting it here is what made subtitles turn
+   * themselves off whenever a seek restarted the conversion or a stream failed
+   * over, so the button had to be pressed again after every hiccup.
+   */
   private clearSubtitleEl() {
     this.subtitleEl?.remove();
     this.subtitleEl = null;
-    this.subtitleActive = false;
   }
 
   /** Switches the attached track on or off. Returns the new state. */
@@ -675,9 +706,17 @@ export class Playback {
     if (!video || video.paused || this.waiting || !video.buffered.length) return;
     const buffered = video.buffered.end(video.buffered.length - 1) - video.currentTime;
     const chosen = this.userRate || 1;
-    const target = buffered < 6 ? Math.min(chosen, 0.92) : chosen;
+    // Two thresholds, not one. A single `buffered < 6` test flips 0.92x and 1.0x
+    // every second whenever the buffer sits at almost exactly six seconds, which
+    // is audible as a stutter and was the reported "rate keeps changing".
+    if (this.slowed && buffered > 9) this.slowed = false;
+    else if (!this.slowed && buffered < 5) this.slowed = true;
+    const target = this.slowed ? Math.min(chosen, 0.92) : chosen;
     if (Math.abs((video.playbackRate || 1) - target) > 0.01) video.playbackRate = target;
   }
+
+  /** Set while the buffer is thin, so the governor does not oscillate. */
+  private slowed = false;
 
   userRate = 1;
 
