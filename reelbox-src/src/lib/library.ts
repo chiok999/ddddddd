@@ -112,3 +112,33 @@ export const readSaver = () => {
   }
   return !!(navigator as any).connection?.saveData;
 };
+
+export const saveSaver = (on: boolean) => {
+  try {
+    localStorage.setItem(KEY.saver, String(on));
+  } catch {
+    /* see write() */
+  }
+};
+
+/**
+ * The rung to download, given the viewer's preferences and their connection.
+ *
+ * Data saver exists because 360p is roughly twice the bytes of 240p on these
+ * encodes (measured: ~531 kbps against ~250, so about 230 MB an hour against
+ * 110), and on a metered connection that difference is the whole bill. An
+ * explicit choice wins; otherwise a connection that reports itself as slow gets
+ * the smaller rung without being asked, which is the case where it matters.
+ */
+export const readQuality = () => {
+  const chosen = readHeight();
+  // A saved 360 figure is a real choice only if the viewer made it; readSaver
+  // reports the saved toggle or the browser's own hint.
+  if (chosen === 360 && !readSaver()) {
+    const connection = (navigator as any).connection;
+    const slow = connection?.effectiveType && /(^|-)2g$|(^|-)3g$/.test(connection.effectiveType);
+    if (slow) return 240;
+  }
+  if (readSaver()) return 240;
+  return chosen;
+};

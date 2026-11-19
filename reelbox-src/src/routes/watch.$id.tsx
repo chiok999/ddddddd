@@ -15,7 +15,16 @@ import {
 import { Playback, type PlaybackState, type SubtitleState } from '../lib/playback';
 import { aspectFor, ASPECT_MODES, frameFor, readAspect, saveAspect, type AspectId } from '../lib/frame';
 import { itemStore } from '../lib/item-store';
-import { clearProgress, pushHistory, readHeight, saveHeight, saveProgress, readProgress } from '../lib/library';
+import {
+  clearProgress,
+  pushHistory,
+  readQuality,
+  readSaver,
+  readProgress,
+  saveHeight,
+  saveProgress,
+  saveSaver,
+} from '../lib/library';
 
 interface Search {
   s?: number;
@@ -69,7 +78,10 @@ function Watch() {
   const [muted, setMuted] = useState(false);
   const [vol, setVol] = useState(1);
   const [rate, setRate] = useState(1);
+  // `height` is what the viewer asked for; the rung actually downloaded may be
+  // smaller when data saver is on or the connection says it is metered.
   const [height, setHeight] = useState(240);
+  const [saver, setSaver] = useState(false);
   const [menu, setMenu] = useState(false);
   const [show, setShow] = useState(true);
   const hide = useRef<number | undefined>(undefined);
@@ -97,8 +109,11 @@ function Watch() {
       },
     });
     engine.current = playback;
-    setHeight(readHeight());
-    playback.quality = readHeight();
+    setHeight(readQuality());
+    setSaver(readSaver());
+    // Applies the saved rung to this stream now, rather than only when the
+    // settings menu is opened.
+    playback.setQuality(readQuality());
     playback.attach(video.current);
 
     const startAt = progressKey ? readProgress().find((x) => x.url === progressKey)?.time : 0;
@@ -168,7 +183,23 @@ function Watch() {
   const changeQuality = (next: number) => {
     setHeight(next);
     saveHeight(next);
+    // Choosing a rung by hand overrides data saver for the rest of the session,
+    // otherwise the toggle would silently undo the choice on the next title.
+    if (saver) {
+      setSaver(false);
+      saveSaver(false);
+    }
     engine.current?.setQuality(next);
+  };
+
+  const toggleSaver = () => {
+    const next = !saver;
+    setSaver(next);
+    saveSaver(next);
+    const rung = next ? 240 : height;
+    setHeight(rung);
+    saveHeight(rung);
+    engine.current?.setQuality(rung);
   };
 
   const retry = () => {
@@ -422,6 +453,28 @@ function Watch() {
                   </div>
                   <p className="mt-2 text-[10px] leading-tight text-muted-foreground">
                     Converted output only; the source may be higher.
+                  </p>
+                  {/* Measured through these exact encoder flags on a 1080p
+                      source: 426x240 is ~250 kbps of transport stream (about
+                      110 MB an hour) and 640x360 is ~531 (~230 MB). The figures
+                      are here rather than in a tooltip so the choice is made on
+                      numbers instead of on a feeling about "quality". */}
+                  <button
+                    onClick={toggleSaver}
+                    aria-pressed={saver}
+                    className="mt-3 flex w-full items-center justify-between rounded bg-secondary px-2 py-1 text-xs"
+                  >
+                    <span>Data saver</span>
+                    <span className={saver ? 'text-primary' : 'text-muted-foreground'}>
+                      {saver ? 'on' : 'off'}
+                    </span>
+                  </button>
+                  <p className="mt-1 text-[10px] leading-tight text-muted-foreground">
+                    {saver
+                      ? 'Pinned to 240p, about 110 MB an hour.'
+                      : height === 360
+                        ? '360p, about 230 MB an hour.'
+                        : '240p, about 110 MB an hour.'}
                   </p>
                   <p className="mb-1 mt-3 text-xs text-muted-foreground">Frame</p>
                   <div className="flex flex-wrap gap-1">

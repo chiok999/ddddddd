@@ -24,7 +24,10 @@ writeFileSync(
   `export default class Hls {
      static isSupported(){return true}
      static get Events(){return {MANIFEST_PARSED:'manifest',ERROR:'error'}}
-     constructor(config){this.config=config;globalThis.__hls=this;this.listeners={};this.levels=[]}
+     constructor(config){this.config=config;globalThis.__hls=this;this.listeners={};this.levels=[];this._level=-1}
+     // Levels are listed 360 first, as a provider might. A player that picks by
+     // index rather than by height would download the wrong rung here.
+     set currentLevel(v){this._level=v} get currentLevel(){return this._level}
      loadSource(u){this.url=u} attachMedia(v){this.media=v}
      on(e,cb){(this.listeners[e] ||= []).push(cb)}
      emit(e,d){for(const cb of this.listeners[e]||[]) cb(e,d)}
@@ -375,6 +378,53 @@ await check('a subtitle outage leaves the video playing', async () => {
   assert.equal(last().phase, 'playing', 'playback continues');
   assert.equal(video.paused, false);
   assert.match(engine.subtitleState().note, /Provider refused/);
+});
+
+// 12. The chosen rung is what gets downloaded, before the menu is ever opened.
+await check('the saved quality is pinned on load, not left to bandwidth estimation', async () => {
+  const { engine } = makeEngine();
+  responses['/api/resolve'] = resolved([
+    { provider: 'moviebox', format: 'file', url: '/media/360', quality: 360 },
+    { provider: 'moviebox', format: 'file', url: '/media/240', quality: 240 },
+  ]);
+  responses['/api/transcode'] = job();
+  responses['/api/transcode/status'] = { body: { canPlay: true } };
+  // Set before playback, the way the page does it from the saved preference.
+  engine.setQuality(240);
+  await engine.start({ ...target, source: 'moviebox' });
+  const hls = globalThis.__hls;
+  // The provider lists 360 first, so an index-based choice would take it.
+  hls.levels = [{ height: 360 }, { height: 240 }];
+  hls.emit('manifest', {});
+  assert.equal(hls.currentLevel, 1, 'the 240p level is selected by height, not by index');
+  // Opening the menu and choosing 360 must still work afterwards.
+  engine.setQuality(360);
+  assert.equal(hls.currentLevel, 0);
+});
+
+// 13. A seek that restarts the conversion builds a new HLS instance; the rung
+// has to be re-applied or the restart silently reverts to the default.
+await check('a restarted conversion keeps the chosen quality', async () => {
+  const { engine, video } = makeEngine();
+  responses['/api/resolve'] = resolved([{ provider: 'moviebox', format: 'file', url: '/media/s' }]);
+  responses['/api/transcode'] = job();
+  responses['/api/transcode/status'] = { body: { canPlay: true } };
+  engine.setQuality(360);
+  await engine.start({ ...target, source: 'moviebox' });
+  const first = globalThis.__hls;
+  first.levels = [{ height: 240 }, { height: 360 }];
+  first.emit('manifest', {});
+  assert.equal(first.currentLevel, 1);
+  // Seek past the converted window: a second job and a second Hls instance.
+  video.duration = 300; // 300 s converted of a 3600 s title
+  video.seekable = { length: 1, start: () => 0, end: () => 300 };
+  engine.seek(1800);
+  await new Promise((r) => setTimeout(r, 60));
+  const second = globalThis.__hls;
+  assert.notEqual(second, first, 'a new instance was built');
+  second.levels = [{ height: 240 }, { height: 360 }];
+  second.emit('manifest', {});
+  assert.equal(second.currentLevel, 1, 'the chosen rung survives the restart');
 });
 
 // Everything above stops its own engine, so nothing should be left holding the

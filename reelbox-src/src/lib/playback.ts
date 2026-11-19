@@ -461,6 +461,10 @@ export class Playback {
     }
 
     const hls = new Hls({
+      // `startLevel` is an index into the provider's level list, not ours, and a
+      // network estimate can move it again. The quality is therefore pinned by
+      // height once the manifest is parsed (see MANIFEST_PARSED below), which is
+      // also what makes "240p" mean 240p rather than "whatever ABR chose".
       startLevel: 0,
       startPosition: 0,
       liveDurationInfinity: false,
@@ -484,8 +488,15 @@ export class Playback {
     hls.attachMedia(video);
 
     let recoveredAppend = false;
+    const pinLevel = () => {
+      // Choose the rung the viewer asked for. A missing rung means a ladder of
+      // one, in which case there is nothing to choose.
+      const index = hls.levels.findIndex((level) => level.height === this.quality);
+      if (index >= 0) hls.currentLevel = index;
+    };
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       if (generation !== this.generation || this.hls !== hls) return;
+      pinLevel();
       this.startTimer();
       if (!wasPaused) void video.play().catch(() => {});
     });
@@ -565,6 +576,15 @@ export class Playback {
 
   quality = 240;
 
+  /**
+   * The rung the player should download.
+   *
+   * This has to be set before playback and re-applied on every new HLS instance,
+   * because a seek past the converted window and a failover both build one. It
+   * was previously only written when the viewer opened the settings menu, so the
+   * saved choice was ignored on load and the stream ran at whatever the
+   * bandwidth estimate picked — twice the data, for a picture an inch bigger.
+   */
   setQuality(height: number) {
     this.quality = height;
     if (this.hls) {
