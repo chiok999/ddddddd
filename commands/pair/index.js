@@ -53,6 +53,50 @@ module.exports = [
     },
   },
   {
+    name: 'sessionid',
+    aliases: ['recoverystring'],
+    category: 'admin',
+    description: 'Get a recovery string that can restore a login on a fresh deploy',
+    usage: '.sessionid [number]',
+    ownerOnly: true,
+    async execute(sock, msg, args, extra) {
+      const target = args[0] ? digits(args[0]) : accountSockets.sessionKey(sock);
+      if (args[0] && !validNumber(target)) return extra.reply('Usage: .sessionid [number]\nExample: .sessionid 265991234567 — with no number you get the recovery string of the account you are sending from.');
+      await react(sock, msg, '⏳');
+      let result;
+      try { result = await accountSockets.recoveryString(target); }
+      catch (err) {
+        await react(sock, msg, '⚠️');
+        return extra.reply(`⚠️ ${String(err?.message || 'Could not build a recovery string.')}`);
+      }
+      await react(sock, msg, '✅');
+      const label = result.number ? `+${result.number}` : 'the owner account';
+      // The string is long, so it goes as a small text file the owner can
+      // save; a chat message would truncate it.
+      try {
+        await sock.sendMessage(msg.key.remoteJid, {
+          document: Buffer.from(String(result.token), 'utf8'),
+          fileName: `zafar-session-${result.number || 'owner'}.txt`,
+          mimetype: 'text/plain',
+        });
+      } catch {
+        return extra.reply('⚠️ Could not send the recovery file. Try again in a moment.');
+      }
+      return extra.reply([
+        `🔑 *Recovery string for ${label}*`,
+        '',
+        'The file above contains a full login snapshot for that account (credentials + session keys).',
+        'Anyone who has it can take over the account — store it like a password, never share it.',
+        '',
+        `To use it on a fresh deploy, put it in the SESSION_IDS environment variable as ${result.number ? `${result.number}=` : 'owner='}<string>, or give the owner string on its own as SESSION_ID.`,
+        ...(result.encrypted
+          ? ['This string is encrypted: the new deploy also needs the same SESSION_RECOVERY_SECRET.']
+          : ['Tip: set SESSION_RECOVERY_SECRET before creating strings so they are stored encrypted.']),
+        'An older string never overwrites a newer login, and WhatsApp can still log the device out from the phone itself.',
+      ].join('\n'));
+    },
+  },
+  {
     name: 'remove',
     aliases: ['unlink'],
     category: 'admin',

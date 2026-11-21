@@ -48,6 +48,27 @@ test('.remove reports whether WhatsApp logged the device out, and unknown number
   assert.match(await run('remove', []), /Usage: \.remove/);
 });
 
+test('.sessionid is owner-only and sends the recovery string as a file with handling warnings', async () => {
+  assert.equal(byName.sessionid.ownerOnly, true);
+  assert.notEqual(byName.sessionid.linkedOk, true);
+  const seen = [];
+  accountSockets.setRecoveryProvider((target) => { seen.push(target); return { token: 'ZAFAR~dGVzdA', number: null, role: 'owner', encrypted: true, entryCount: 4 }; });
+  const sent = [];
+  const replies = [];
+  const docSock = { sendMessage: async (jid, content) => { sent.push({ jid, content }); return {}; } };
+  await byName.sessionid.execute(docSock, msg, [], { reply: async (t) => { replies.push(t); } });
+  const documents = sent.filter((s) => s.content.document);
+  assert.equal(documents.length, 1);
+  assert.equal(documents[0].content.document.toString('utf8'), 'ZAFAR~dGVzdA');
+  assert.match(documents[0].content.fileName, /zafar-session-owner\.txt/);
+  const text = replies.join('\n');
+  assert.match(text, /store it like a password/i);
+  assert.match(text, /SESSION_IDS/);
+  assert.match(text, /encrypted/i);
+  await byName.sessionid.execute(docSock, msg, ['+265 991 111 111'], { reply: async () => {} });
+  assert.deepEqual(seen, ['primary', '265991111111'], 'no argument means the sending account; a number targets that linked account');
+});
+
 test('the commands are registered and appear in the owner menu', () => {
   const { loadCommands } = require('../gateway/registry');
   const all = loadCommands();

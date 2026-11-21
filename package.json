@@ -38,6 +38,8 @@
     "node": ">=22.13.0"
   },
   "optionalDependencies": {
+    "mongodb": "^6.22.0",
+    "pg": "^8.23.1",
     "webtorrent": "^3.0.21"
   },
   "allowScripts": {

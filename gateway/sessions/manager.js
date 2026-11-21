@@ -116,6 +116,53 @@ function createSessionManager(opts) {
     : 'Linked-account index is unavailable; preserved session files. Fix or restore accounts.json before adding accounts.';
   if (manifestError) log.error(indexUnavailableMessage);
 
+  // Session recovery (June-X SESSION_ID-style, per account): on a fresh or
+  // wiped deploy the owner can hand the bot one recovery string per account
+  // via the environment. Install any account that is not already known
+  // locally; an existing login is never overwritten by an older string.
+  const recoveredAccounts = [];
+  if (!manifestError && opts.recoverySessions) {
+    let items = [];
+    try {
+      items = Array.isArray(opts.recoverySessions)
+        ? opts.recoverySessions
+        : authStore.parseRecoveryEnv(String(opts.recoverySessions || ''), opts.recoveryOwnerToken || '');
+    } catch { items = []; }
+    let manifestChanged = false;
+    for (const item of items) {
+      const key = String(item?.key || 'owner').trim().toLowerCase();
+      try {
+        if (key === 'owner' || key === 'primary') {
+          if (!authStore.hasFiles(primaryDir)) {
+            const restored = authStore.installRecoveryToken(primaryDir, item.token, { secret: opts.recoverySecret });
+            if (restored.installed) recoveredAccounts.push('owner');
+          }
+          continue;
+        }
+        const number = key.replace(/\D/g, '');
+        if (!NUMBER_RE.test(number) || manifest.accounts[number]) continue;
+        const attempt = authStore.recoveryAttemptFor(number);
+        const dir = path.join(linkedRoot, number, attempt);
+        if (!authStore.hasFiles(dir)) {
+          const restored = authStore.installRecoveryToken(dir, item.token, { secret: opts.recoverySecret });
+          if (!restored.installed) continue;
+        }
+        manifest.accounts[number] = { attempt, state: 'active' };
+        manifestChanged = true;
+        recoveredAccounts.push(number);
+      } catch (err) {
+        log.error(`A recovery string for ${key === 'owner' || key === 'primary' ? 'the owner' : `+${key}`} could not be used (${err?.code || 'invalid'}); it was ignored.`);
+      }
+    }
+    if (manifestChanged) {
+      try { if (indexStore) indexStore.write(manifest); else writeJsonAtomic(manifestFile, manifest); }
+      catch (err) { log.error(`Recovered linked accounts could not be saved to the account index: ${err?.message || err}`); }
+    }
+    if (recoveredAccounts.length) {
+      log.info?.(`Restored login(s) from recovery strings: ${recoveredAccounts.map((x) => (x === 'owner' ? 'owner' : `+${x}`)).join(', ')}.`);
+    }
+  }
+
   // Why a connected linked number would not answer ('' = it answers).
   function pauseReason(entry) {
     if (!entry.number) return '';
@@ -764,6 +811,23 @@ function createSessionManager(opts) {
     return flight;
   }
 
+  // `.sessionid`: build the recovery string for one account (the caller's own
+  // session by default). Contains the full login snapshot — handle like a password.
+  function recoveryString(target) {
+    const raw = String(target || '');
+    let entry = raw ? entries.get(raw) : primary;
+    if (!entry && raw) {
+      const number = raw.replace(/\D/g, '');
+      entry = NUMBER_RE.test(number) ? entries.get(`linked:${number}`) : null;
+    }
+    if (!entry) throw Object.assign(new Error('That number is not linked.'), { statusCode: 404 });
+    const result = authStore.createRecoveryString(entry.dir, {
+      secret: opts.recoverySecret,
+      account: entry.number || 'owner',
+    });
+    return { ...result, number: entry.number || null, role: entry.number ? 'linked' : 'owner' };
+  }
+
   function status() {
     const accounts = [];
     for (const entry of entries.values()) {
@@ -854,12 +918,14 @@ function createSessionManager(opts) {
       const retired = await settleWithin([...entries.values()].map((entry) => retire(entry, 'Service stopping')), retirementShutdownTimeoutMs);
       if (!retired) errors.push(new Error('A WhatsApp socket or credential write did not finish before shutdown.'));
       else for (const result of retired) if (result.status === 'rejected') errors.push(new Error('A WhatsApp session could not be retired.', { cause: result.reason }));
+      // Last chance for queued auth-mirror pushes to land before we exit.
+      try { await authStore.flushMirrorPushes(); } catch { /* mirror is best effort */ }
       if (errors.length) throw new AggregateError(errors, 'WhatsApp session shutdown was incomplete.');
     })();
     return stopPromise;
   }
 
-  return { start, stop, requestPair, removeAccount, status, health, heal, reconnectAll, pruneCaches, _checkStale: checkStale, _maintain: maintain };
+  return { start, stop, requestPair, removeAccount, status, health, heal, reconnectAll, pruneCaches, recoveryString, recoveredAccounts, _checkStale: checkStale, _maintain: maintain };
 }
 
 module.exports = { createSessionManager };

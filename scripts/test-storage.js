@@ -343,6 +343,116 @@ test('sqlite backup snapshots the database and a fresh process restores it after
   assert.ok(fs.readdirSync(dir).some((name) => name.includes('.corrupt-')), 'the corrupt original was quarantined, not deleted');
 });
 
+test('a recovery string restores credentials and session keys (not pre-keys) and never overwrites a newer login', async () => {
+  const sourceDir = path.join(ROOT, 'recovery-source');
+  const targetDir = path.join(ROOT, 'recovery-target');
+  const source = await authStore.useSqliteAuthState(sourceDir);
+  source.state.creds.registered = true;
+  source.state.creds.me = { id: '265991111111:1@s.whatsapp.net' };
+  source.state.creds.accountSyncCounter = 3;
+  await source.saveCreds();
+  await source.state.keys.set({
+    session: { peer: { record: Buffer.from('session-key') } },
+    'pre-key': { 7: { record: Buffer.from('disposable') } },
+  });
+
+  const created = authStore.createRecoveryString(sourceDir, { account: '265991111111' });
+  assert.match(created.token, /^ZAFAR~/);
+  assert.equal(created.encrypted, false);
+  const parsed = authStore.parseRecoveryString(created.token);
+  assert.equal(parsed.account, '265991111111');
+  assert.ok(parsed.entries['session-peer.json'], 'session keys travel with the string');
+  assert.equal(parsed.entries['pre-key-7.json'], undefined, 'pre-keys are replenishable and stay behind');
+
+  const installed = authStore.installRecoveryToken(targetDir, created.token);
+  assert.ok(installed.installed >= 2);
+  const restored = await authStore.useSqliteAuthState(targetDir, { requireExisting: true });
+  assert.equal(restored.state.creds.accountSyncCounter, 3);
+  assert.equal((await restored.state.keys.get('session', ['peer'])).peer.record.toString(), 'session-key');
+
+  // A stale string installed later must not roll the login back.
+  restored.state.creds.accountSyncCounter = 9;
+  await restored.saveCreds();
+  authStore.installRecoveryToken(targetDir, created.token);
+  const after = await authStore.useSqliteAuthState(targetDir, { requireExisting: true });
+  assert.equal(after.state.creds.accountSyncCounter, 9, 'existing entries always win');
+});
+
+test('encrypted recovery strings need the same secret, and the env formats parse', async () => {
+  const dir = path.join(ROOT, 'recovery-encrypted');
+  const auth = await authStore.useSqliteAuthState(dir);
+  auth.state.creds.registered = true;
+  await auth.saveCreds();
+  const { token, encrypted } = authStore.createRecoveryString(dir, { secret: 'correct horse', account: 'owner' });
+  assert.equal(encrypted, true);
+  assert.throws(() => authStore.parseRecoveryString(token), { code: 'RECOVERY_SECRET_REQUIRED' });
+  assert.throws(() => authStore.parseRecoveryString(token, { secret: 'wrong' }), { code: 'RECOVERY_INVALID' });
+  assert.equal(authStore.parseRecoveryString(token, { secret: 'correct horse' }).account, 'owner');
+  assert.throws(() => authStore.parseRecoveryString('ZAFAR~not-a-token'), { code: 'RECOVERY_INVALID' });
+  assert.throws(() => authStore.createRecoveryString(path.join(ROOT, 'recovery-empty')), { code: 'AUTH_MISSING' },
+    'no string is minted for an account that never finished linking');
+
+  assert.deepEqual(
+    authStore.parseRecoveryEnv('{"owner":"ZAFAR~a","265991111111":"ZAFAR~b"}'),
+    [{ key: 'owner', token: 'ZAFAR~a' }, { key: '265991111111', token: 'ZAFAR~b' }],
+  );
+  assert.deepEqual(
+    authStore.parseRecoveryEnv('owner=ZAFAR~a; 265991111111=ZAFAR~b', 'ZAFAR~ignored-duplicate'),
+    [{ key: 'owner', token: 'ZAFAR~ignored-duplicate' }, { key: '265991111111', token: 'ZAFAR~b' }],
+    'SESSION_ID wins for the owner; SESSION_IDS fills in the rest',
+  );
+  assert.deepEqual(authStore.parseRecoveryEnv('ZAFAR~bare'), [{ key: 'owner', token: 'ZAFAR~bare' }]);
+  assert.match(authStore.recoveryAttemptFor('265991111111'), /^[a-f0-9]{24}$/);
+});
+
+test('the remote auth mirror restores a wiped account and the pg adapter round-trips', async (t) => {
+  t.after(() => authStore._resetMirrorForTests());
+  // Adapter contract, exercised through the real Postgres adapter with a fake driver.
+  const rows = new Map();
+  class FakePool {
+    async query(sql, params = []) {
+      if (/^SELECT/.test(sql)) return { rows: rows.has(params[0]) ? [{ snapshot: rows.get(params[0]) }] : [] };
+      if (/^INSERT/.test(sql)) rows.set(params[0], params[1]);
+      return { rows: [] };
+    }
+    async end() {}
+  }
+  const pgMirror = authStore.createRemoteMirror('postgres://user:pass@db.internal:5432/zafar', { drivers: { pg: { Pool: FakePool } } });
+  await pgMirror.save('session', 'ZAFAR~snapshot');
+  assert.equal(await pgMirror.load('session'), 'ZAFAR~snapshot');
+  assert.throws(() => authStore.createRemoteMirror('oracle://db'), { code: 'MIRROR_URL_INVALID' });
+
+  // End to end: save locally -> mirrored -> local copy wiped -> restored on open.
+  const store = new Map();
+  const mirror = {
+    kind: 'fake',
+    load: async (key) => store.get(key) || null,
+    save: async (key, snapshot) => { store.set(key, snapshot); },
+  };
+  const dir = path.join(ROOT, 'mirror-session');
+  const first = await authStore.useSqliteAuthState(dir, { mirror, mirrorDelayMs: 0 });
+  first.state.creds.registered = true;
+  first.state.creds.me = { id: '265990000007:1@s.whatsapp.net' };
+  await first.saveCreds();
+  await first.state.keys.set({ session: { peer: { record: Buffer.from('mirrored-key') } } });
+  await authStore.flushMirrorPushes();
+  assert.equal(store.size, 1, 'the snapshot reached the mirror');
+
+  authStore.removeDir(dir);
+  assert.equal(authStore.validateAuthState(dir).registered, false);
+  const restored = await authStore.useSqliteAuthState(dir, { mirror, requireExisting: true });
+  assert.equal(restored.mirrorRestored, true);
+  assert.equal(restored.state.creds.me.id, '265990000007:1@s.whatsapp.net');
+  assert.equal((await restored.state.keys.get('session', ['peer'])).peer.record.toString(), 'mirrored-key');
+
+  // A mirror that is down must never block or break a local login.
+  const dead = { load: async () => { throw new Error('connection refused'); }, save: async () => { throw new Error('connection refused'); } };
+  const localOnly = await authStore.useSqliteAuthState(path.join(ROOT, 'mirror-dead'), { mirror: dead });
+  localOnly.state.creds.registered = true;
+  await localOnly.saveCreds();
+  await authStore.flushMirrorPushes();
+});
+
 test('linked index refuses corrupt SQLite data instead of trusting a stale file copy', () => {
   const { createIndexStore } = require(path.join(ROOT, 'gateway/sessions/indexStore'));
   const session = path.join(ROOT, 'corrupt-durable-index');

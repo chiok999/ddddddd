@@ -106,7 +106,7 @@ for (const [signal, failBackup] of [['SIGTERM', false], ['SIGINT', false], ['SIG
         './gateway/handler': { handleMessage() {} },
         './lib/hotReload': { onReload() {} },
         './lib/jid': { isSystemJid() { return false; } },
-        './lib/accountSockets': { setHealthSource() {}, setHealer() {}, setLinker() {}, getOnline() { return null; } },
+        './lib/accountSockets': { setHealthSource() {}, setHealer() {}, setLinker() {}, setRecoveryProvider() {}, getOnline() { return null; } },
         './gateway/sessions/manager': { createSessionManager: () => ({
           start: async () => { mark('sessions-start'); setImmediate(() => { process.emit('unhandledRejection', undefined); process.stdout.write('SERVICE_READY\\n'); }); },
           stop: async () => {
