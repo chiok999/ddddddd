@@ -41,6 +41,19 @@ if (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 13)) {
 // Override with NODE_ENV=development when debugging locally.
 process.env.NODE_ENV = process.env.NODE_ENV || 'production';
 
+// Database safety net, before anything else opens SQLite: if the live
+// database was lost or damaged (panel reinstall, overwritten file) and a
+// validated backup exists, put the backup back — logins included — instead
+// of starting empty and forcing everyone to pair again.
+try {
+  const sqliteStore = require('./lib/sqlite');
+  const restored = sqliteStore.restoreFromBackupIfNeeded();
+  if (restored.restored) console.log('Database restored from the last validated backup.');
+  if (!/^(0|false|no|off)$/i.test(String(process.env.DB_BACKUP || ''))) {
+    sqliteStore.startBackupScheduler({ log: console });
+  }
+} catch (err) { console.warn(`Database backup check failed: ${err?.message || err}`); }
+
 const { formatArgs, safeText, installConsoleFilter } = require('./lib/safeLog');
 const { initializeTempSystem } = require('./lib/tempManager');
 const { startCleanup, stopCleanup } = require('./lib/cleanup');
@@ -81,6 +94,8 @@ const {
   DisconnectReason,
   Browsers,
   fetchLatestWaWebVersion,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
   jidNormalizedUser
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
@@ -158,30 +173,95 @@ const FALLBACK_VERSION = [2, 3000, 1033141466];
 let versionPromise = null;
 let cachedVersion = null;
 let versionValidUntil = 0;
+let versionGeneration = 0;
+// The session manager calls this after a storm of 408 timeouts: ten in a
+// row usually means WhatsApp moved on and the cached version is the problem.
+// The next connection then fetches a fresh version instead of making an
+// eleventh identical attempt with a stale one.
+function invalidateWebVersion() {
+  versionGeneration += 1;
+  cachedVersion = null;
+  versionValidUntil = 0;
+  versionPromise = null;
+}
 function getWebVersion() {
   if (cachedVersion && Date.now() < versionValidUntil) return Promise.resolve(cachedVersion);
   if (!versionPromise) {
+    const generation = versionGeneration;
     versionPromise = new Promise((resolve) => {
       let done = false;
       const finish = (version, isFallback = false) => {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        cachedVersion = version;
-        // Retry failed lookups sooner, but coalesce simultaneous connections.
-        versionValidUntil = Date.now() + (isFallback ? 5 * 60_000 : 60 * 60_000);
-        versionPromise = null;
+        // A lookup that was invalidated while in flight must not re-cache
+        // the stale value it was fetching.
+        if (generation === versionGeneration) {
+          cachedVersion = version;
+          // Retry failed lookups sooner, but coalesce simultaneous connections.
+          versionValidUntil = Date.now() + (isFallback ? 5 * 60_000 : 60 * 60_000);
+        }
+        if (versionPromise && generation === versionGeneration) versionPromise = null;
         resolve(version);
       };
       const timer = setTimeout(() => finish(FALLBACK_VERSION, true), 8000);
       timer.unref?.();
-      Promise.resolve().then(() => fetchLatestWaWebVersion())
+      const fetchVersion = typeof fetchLatestBaileysVersion === 'function' ? fetchLatestBaileysVersion : fetchLatestWaWebVersion;
+      Promise.resolve().then(() => fetchVersion())
         .then((result) => result?.version ? finish(result.version) : finish(FALLBACK_VERSION, true))
         .catch(() => finish(FALLBACK_VERSION, true));
     });
   }
   return versionPromise;
 }
+
+// Durable home for per-account disconnect counters, so a panel restart in
+// the middle of a 408/440 storm does not reset the backoff to full speed.
+const disconnectStateStore = (() => {
+  const keyFor = (id) => `disconnect-counters:${String(id || 'primary')}`;
+  return {
+    read(id) {
+      try {
+        const row = require('./lib/sqlite').open().prepare('SELECT value FROM kv WHERE key = ?').get(keyFor(id));
+        return row ? JSON.parse(row.value) : null;
+      } catch { return null; }
+    },
+    write(id, counters) {
+      try {
+        require('./lib/sqlite').open().prepare(
+          'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+        ).run(keyFor(id), JSON.stringify(counters), Date.now());
+      } catch { /* counters are an optimisation; losing them is safe */ }
+    },
+    delete(id) {
+      try { require('./lib/sqlite').open().prepare('DELETE FROM kv WHERE key = ?').run(keyFor(id)); } catch { /* best effort */ }
+    },
+  };
+})();
+
+// Process survival guards: an HTTP health endpoint + self-ping (started
+// before WhatsApp connects, so the host never sees an idle app) and a
+// memory watchdog that sheds caches before the panel OOM-kills us. Both
+// report counts only — never a number or session detail.
+let activeSessions = null;
+const { startKeepAliveServer, startMemoryWatchdog } = require('./lib/runtimeGuards');
+const keepAliveServer = /^(0|false|no|off)$/i.test(String(process.env.KEEPALIVE_SERVER || ''))
+  ? null
+  : startKeepAliveServer({
+    ports: process.env.PORT ? [Number(process.env.PORT)] : [5000, 3000, 8000, 4000],
+    host: '0.0.0.0',
+    status: () => (activeSessions ? activeSessions.status() : { connected: false, accounts: [] }),
+    selfPingUrl: process.env.APP_URL || process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '',
+    selfPingIntervalMs: Number(process.env.KEEPALIVE_PING_MS || 240_000),
+    log: console,
+  });
+const memoryWatchdog = /^(0|false|no|off)$/i.test(String(process.env.MEMORY_WATCHDOG || ''))
+  ? null
+  : startMemoryWatchdog({
+    intervalMs: Number(process.env.MEMORY_WATCHDOG_MS || 300_000),
+    log: console,
+    onPressure: () => (activeSessions ? activeSessions.pruneCaches() : null),
+  });
 
 // Owner notices (a number finished linking, WhatsApp logged one out, a code
 // expired) arrive in the owner's own chat. They never start with the prefix, so
@@ -215,22 +295,39 @@ async function startService() {
   pairNumber: config.pairNumber,
   maxAccounts: Number(process.env.MAX_LINKED_ACCOUNTS || 20),
   loggedOutCode: DisconnectReason.loggedOut,
+  disconnectStateStore,
+  invalidateVersion: invalidateWebVersion,
   // Login keys live in database/bot.sqlite (old session files are imported once).
   loadAuthState: (dir, options) => require('./lib/authStore').useSqliteAuthState(dir, options),
   getVersion: getWebVersion,
-  makeSocket: ({ auth, version }) => makeWASocket({
-    version,
-    logger: createSuppressedLogger('silent'),
-    printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
-    auth,
-    syncFullHistory: false,
-    downloadHistory: false,
-    markOnlineOnConnect: false,
-    keepAliveIntervalMs: 20_000, // frequent pings keep idle panel/mobile networks from dropping the socket
-    connectTimeoutMs: 60_000,
-    getMessage: async () => undefined,
-  }),
+  makeSocket: ({ auth, version, getMessage, msgRetryCounterCache }) => {
+    // Cache Signal key lookups in memory: without this every encrypt/decrypt
+    // waits on a synchronous SQLite read, and under media load that latency
+    // is long enough for WhatsApp handshakes to time out.
+    let socketAuth = auth;
+    try {
+      if (typeof makeCacheableSignalKeyStore === 'function' && auth?.creds && auth?.keys) {
+        socketAuth = { creds: auth.creds, keys: makeCacheableSignalKeyStore(auth.keys, createSuppressedLogger('silent')) };
+      }
+    } catch { socketAuth = auth; }
+    return makeWASocket({
+      version,
+      logger: createSuppressedLogger('silent'),
+      printQRInTerminal: false,
+      browser: Browsers.ubuntu('Chrome'),
+      auth: socketAuth,
+      syncFullHistory: false,
+      downloadHistory: false,
+      markOnlineOnConnect: false,
+      keepAliveIntervalMs: 20_000, // frequent pings keep idle panel/mobile networks from dropping the socket
+      connectTimeoutMs: 60_000,
+      generateHighQualityLinkPreview: false,
+      // Real retry support from the per-account bounded store: a peer asking
+      // WhatsApp to resend a message now actually gets it.
+      getMessage: typeof getMessage === 'function' ? getMessage : async () => undefined,
+      msgRetryCounterCache,
+    });
+  },
   // Idle = nothing downloading or queued, so a scheduled reconnect cannot cut a job off.
   isBusy: () => {
     try {
@@ -258,6 +355,7 @@ async function startService() {
   },
 });
 
+activeSessions = sessions;
 const accountSockets = require('./lib/accountSockets');
 accountSockets.setHealthSource(() => sessions.health());
 accountSockets.setHealer((options) => sessions.heal(options));
@@ -308,6 +406,8 @@ function shutdown(signal) {
   console.log(`Stopping WhatsApp service (${signal}).`);
   stopCleanup();
   stopDiskGuard();
+  try { keepAliveServer?.close(); } catch { /* non-fatal */ }
+  try { memoryWatchdog?.stop(); } catch { /* non-fatal */ }
   try { require('./lib/workers/pool').stopAll(); } catch { /* no workers */ }
   let finished = false;
   let timer;
@@ -317,6 +417,10 @@ function shutdown(signal) {
     if (timer) clearTimeout(timer);
     clearInterval(serviceLifetime);
     if (timedOut) console.warn('Shutdown timed out. Local files were preserved.');
+    // Last act: snapshot the database (credentials included) so the next
+    // start can restore from backup even if this stop was not clean.
+    try { require('./lib/sqlite').flushBackup(); } catch { /* non-fatal */ }
+    try { require('./lib/sqlite').stopBackupScheduler(); } catch { /* non-fatal */ }
     try { require('./lib/telemetry').flushNow(); } catch { /* non-fatal */ }
     process.exit(0);
   };

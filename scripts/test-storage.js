@@ -266,6 +266,83 @@ test('a compressed credentials-only session string restores a snapshot, not late
   assert.equal((await source.state.keys.get('session', ['recipient'])).recipient.record.toString(), 'later-key');
 });
 
+test('auth validation catches a damaged Signal key, and corrupt LID mappings repair themselves', async () => {
+  const dir = path.join(ROOT, 'validate-session');
+  const auth = await authStore.useSqliteAuthState(dir);
+  auth.state.creds.registered = true;
+  auth.state.creds.me = { id: '265990000009:1@s.whatsapp.net' };
+  await auth.saveCreds();
+  await auth.state.keys.set({ session: { peer: { record: Buffer.from('good') } } });
+  let report = authStore.validateAuthState(dir);
+  assert.equal(report.ok, true);
+  assert.equal(report.registered, true);
+  assert.ok(report.keyRows >= 1);
+
+  const key = authStore.dirKey(dir);
+  const db = sqlite.open();
+  db.prepare('UPDATE auth SET value = ? WHERE dir = ? AND name = ?').run('{broken', key, 'session-peer.json');
+  report = authStore.validateAuthState(dir);
+  assert.equal(report.ok, false);
+  assert.deepEqual(report.corrupt, ['session-peer.json'], 'entry names only — never values');
+  await assert.rejects(authStore.useSqliteAuthState(dir), { code: 'AUTH_CORRUPT' },
+    'a damaged key must stop the connection instead of degrading into session errors');
+
+  // Restore the good key, then damage only a rebuildable LID mapping.
+  db.prepare('UPDATE auth SET value = ? WHERE dir = ? AND name = ?')
+    .run(JSON.stringify({ record: Buffer.from('good').toJSON() }), key, 'session-peer.json');
+  db.prepare('INSERT INTO auth (dir, name, value) VALUES (?, ?, ?)')
+    .run(key, 'lid-mapping-broken.json', '{broken');
+  assert.deepEqual(authStore.validateAuthState(dir).corruptLidMappings, ['lid-mapping-broken.json']);
+  const healed = await authStore.useSqliteAuthState(dir, { requireExisting: true });
+  assert.equal(healed.state.creds.me.id, '265990000009:1@s.whatsapp.net');
+  assert.equal(db.prepare('SELECT 1 AS x FROM auth WHERE dir = ? AND name = ?').get(key, 'lid-mapping-broken.json'), undefined,
+    'the corrupt LID mapping was removed by the repair');
+});
+
+test('a corrupt owner login is refused instead of being replaced by a blank one', async () => {
+  const dir = path.join(ROOT, 'owner-corrupt-session');
+  fs.mkdirSync(dir, { recursive: true });
+  const auth = await authStore.useSqliteAuthState(dir);
+  auth.state.creds.registered = true;
+  await auth.saveCreds();
+  const key = authStore.dirKey(dir);
+  sqlite.open().prepare('UPDATE auth SET value = ? WHERE dir = ? AND name = ?').run('{broken', key, 'creds.json');
+  // No requireExisting: this is the owner path, which used to fall through to
+  // initAuthCreds() and overwrite the real login on the next save.
+  await assert.rejects(authStore.useSqliteAuthState(dir), { code: 'AUTH_CORRUPT' });
+  assert.equal(sqlite.open().prepare('SELECT value FROM auth WHERE dir = ? AND name = ?').get(key, 'creds.json').value, '{broken',
+    'the damaged login is preserved for backup restore, never overwritten');
+});
+
+test('sqlite backup snapshots the database and a fresh process restores it after corruption', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zf-backup-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'bot.sqlite');
+  const env = { ...process.env, BOT_DB: file };
+  const libPath = JSON.stringify(path.join(ROOT, 'lib/sqlite'));
+  const seed = spawnSync(process.execPath, ['-e', `
+    const sqlite = require(${libPath});
+    sqlite.open().prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)').run('marker', '"alive"', Date.now());
+    const backup = sqlite.createBackup();
+    if (!backup.ok) { console.error(backup.reason); process.exit(1); }
+    sqlite.close();
+  `], { cwd: ROOT, encoding: 'utf8', env });
+  assert.equal(seed.status, 0, seed.stderr);
+  assert.ok(fs.existsSync(`${file}.backup`));
+
+  fs.writeFileSync(file, 'this is no longer a database');
+  const restored = spawnSync(process.execPath, ['-e', `
+    const sqlite = require(${libPath});
+    const result = sqlite.restoreFromBackupIfNeeded();
+    const row = sqlite.open().prepare('SELECT value FROM kv WHERE key = ?').get('marker');
+    console.log(JSON.stringify({ restored: result.restored, value: row && JSON.parse(row.value) }));
+    sqlite.close();
+  `], { cwd: ROOT, encoding: 'utf8', env });
+  assert.equal(restored.status, 0, restored.stderr);
+  assert.deepEqual(JSON.parse(restored.stdout.trim()), { restored: true, value: 'alive' });
+  assert.ok(fs.readdirSync(dir).some((name) => name.includes('.corrupt-')), 'the corrupt original was quarantined, not deleted');
+});
+
 test('linked index refuses corrupt SQLite data instead of trusting a stale file copy', () => {
   const { createIndexStore } = require(path.join(ROOT, 'gateway/sessions/indexStore'));
   const session = path.join(ROOT, 'corrupt-durable-index');
