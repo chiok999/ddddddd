@@ -1009,6 +1009,32 @@ test('disconnect counters survive in the injected store and reset on open', asyn
   assert.equal(saved.get('linked:265991111111')?.timeout408, 0, 'a proven connection clears the storm counters');
 });
 
+test('recovery strings seed a wiped deploy: the linked account comes back without re-pairing', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-recovery-seed-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  // Build a recovery string from a "previous deploy's" login files.
+  process.env.AUTH_STORE = 'files'; // fixture auth is file-based; production uses the same code path over SQLite
+  t.after(() => { delete process.env.AUTH_STORE; });
+  const authStore = require('../lib/authStore');
+  const previous = path.join(root, 'previous-deploy');
+  fs.mkdirSync(previous, { recursive: true });
+  fs.writeFileSync(path.join(previous, 'creds.json'), JSON.stringify({ registered: true, me: { id: '265991111111:1@s.whatsapp.net' } }));
+  fs.writeFileSync(path.join(previous, 'session-peer.json'), JSON.stringify({ record: 'kept' }));
+  const { token } = authStore.createRecoveryString(previous, { account: '265991111111' });
+  const fx = fixture(path.join(root, 'fresh-deploy'), { recoverySessions: [{ key: '265991111111', token }] });
+  t.after(() => fx.manager.stop());
+  assert.deepEqual(fx.manager.recoveredAccounts, ['265991111111']);
+  await fx.manager.start();
+  assert.equal(fx.created.length, 2, 'owner plus the recovered linked account both start');
+  open(fx.created[1], '265991111111');
+  await waitFor(() => stateOf(fx, '265991111111') === 'connected');
+
+  // A second manager over the same folder must not reinstall or duplicate it.
+  const again = fixture(path.join(root, 'fresh-deploy'), { recoverySessions: [{ key: '265991111111', token }] });
+  t.after(() => again.manager.stop());
+  assert.deepEqual(again.manager.recoveredAccounts, [], 'an existing account is never re-seeded');
+});
+
 test('keep-alive server reports only counts, and the memory watchdog sheds on pressure', async (t) => {
   const http = require('node:http');
   const { startKeepAliveServer, startMemoryWatchdog, sanitizedStatus } = require('../lib/runtimeGuards');

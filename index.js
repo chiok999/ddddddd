@@ -53,6 +53,9 @@ try {
     sqliteStore.startBackupScheduler({ log: console });
   }
 } catch (err) { console.warn(`Database backup check failed: ${err?.message || err}`); }
+if (String(process.env.AUTH_MIRROR_URL || '').trim()) {
+  console.log('Remote auth mirror: configured (logins are mirrored off-container and restored automatically when missing locally).');
+}
 
 const { formatArgs, safeText, installConsoleFilter } = require('./lib/safeLog');
 const { initializeTempSystem } = require('./lib/tempManager');
@@ -297,6 +300,17 @@ async function startService() {
   loggedOutCode: DisconnectReason.loggedOut,
   disconnectStateStore,
   invalidateVersion: invalidateWebVersion,
+  // Fresh/wiped deploy rescue: recovery strings supplied in the environment
+  // are installed for accounts that have no local login yet (never over one).
+  recoverySessions: (() => {
+    try {
+      return require('./lib/authStore').parseRecoveryEnv(
+        process.env.SESSION_IDS || process.env.LINKED_SESSION_IDS || '',
+        process.env.SESSION_ID || '',
+      );
+    } catch { return []; }
+  })(),
+  recoverySecret: process.env.SESSION_RECOVERY_SECRET || '',
   // Login keys live in database/bot.sqlite (old session files are imported once).
   loadAuthState: (dir, options) => require('./lib/authStore').useSqliteAuthState(dir, options),
   getVersion: getWebVersion,
@@ -360,6 +374,7 @@ const accountSockets = require('./lib/accountSockets');
 accountSockets.setHealthSource(() => sessions.health());
 accountSockets.setHealer((options) => sessions.heal(options));
 accountSockets.setLinker({ pair: (number) => sessions.requestPair(number), remove: (number) => sessions.removeAccount(number) });
+accountSockets.setRecoveryProvider((target) => sessions.recoveryString(target));
 const { startSessionServices } = require('./gateway/sessions/startup');
 await startSessionServices(sessions);
 
