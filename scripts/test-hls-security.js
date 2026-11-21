@@ -23,6 +23,38 @@ test('HLS verification blocks local URLs and private redirects', async () => {
   } finally { global.fetch = originalFetch; await new Promise(resolve => server.close(resolve)); }
 });
 
+test('native HLS downloader refuses private hosts and private redirect hops', async () => {
+  const { downloadHlsNative } = await import('../lib/movies/engine/media/hls.js');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const dest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'hls-ssrf-')), 'out.ts');
+  let hits = 0;
+  const server = http.createServer((_req, res) => { hits++; res.end('#EXTM3U\n#EXT-X-ENDLIST'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const originalFetch = global.fetch;
+  try {
+    // Direct private playlist: blocked before any request is made.
+    await assert.rejects(
+      downloadHlsNative(`http://127.0.0.1:${server.address().port}/index.m3u8`, dest),
+      { code: 'UNSAFE_SOURCE' },
+    );
+    assert.equal(hits, 0);
+    // Public playlist redirecting onto the LAN: the hop is blocked too.
+    let calls = 0;
+    global.fetch = async () => {
+      calls++;
+      return new Response('', { status: 302, headers: { location: `http://127.0.0.1:${server.address().port}/private` } });
+    };
+    await assert.rejects(downloadHlsNative('https://cdn.example.test/master.m3u8', dest), { code: 'UNSAFE_SOURCE' });
+    assert.equal(calls, 1);
+    assert.equal(hits, 0);
+  } finally {
+    global.fetch = originalFetch;
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('unsafe HLS candidates cannot return as unverified fallback links', async () => {
   await import('../lib/movies/engine/media/index.js');
   const registry = (await import('../lib/movies/engine/core/registry.js')).default;
