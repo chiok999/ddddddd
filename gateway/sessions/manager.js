@@ -8,7 +8,8 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { createReconnector } = require('./reconnect');
+const { createReconnector, createDisconnectCounters, resetDisconnectCounters, disconnectMessage, planDisconnect } = require('./reconnect');
+const { createMessageStore, createRetryCounterCache, createReplayDrain } = require('../../lib/messageStore');
 const { readJsonSafe, writeJsonAtomic } = require('../../lib/jsonStore');
 const sockets = require('../../lib/accountSockets');
 const authStore = require('../../lib/authStore');
@@ -20,6 +21,9 @@ const ATTEMPT_RE = /^[a-f0-9]{24}$/;
 const STORED_STATES = new Set(['pending', 'active', 'expired', 'logged_out']);
 // Credentials that are missing or unreadable can never connect: stop and say so.
 const AUTH_FATAL = new Set(['AUTH_MISSING', 'AUTH_CORRUPT']);
+// Close kinds that are routine network/WhatsApp weather: quiet at debug level
+// unless they pile up (handled by the drop counter in the close handler).
+const QUIET_CLOSE_KINDS = new Set(['timeout', 'restart', 'closed', 'server', 'unavailable']);
 
 function credentialsOnDisk(dir) {
   try {
@@ -68,6 +72,32 @@ function createSessionManager(opts) {
   // An explicit nonzero recycleMs remains available to embedding callers.
   const recycleMs = Math.max(0, Number(opts.recycleMs) || 0);
   const maintainMs = Math.max(500, Number(opts.maintainMs) || 60_000);
+  // Per-code policy delays are the production behaviour. Callers that inject
+  // their own reconnect timing (offline tests with 5-10 ms budgets) cap the
+  // policy to that budget instead of waiting out a five-minute stand-down.
+  const policyDelayCapMs = (() => {
+    const explicit = Number(opts.reconnectPolicyMaxMs ?? opts.disconnectDelayCapMs);
+    if (Number.isFinite(explicit) && explicit > 0) return explicit;
+    if (Object.hasOwn(opts, 'reconnectBaseMs') || Object.hasOwn(opts, 'reconnectMaxMs')) {
+      const cap = Number(opts.reconnectMaxMs);
+      return Number.isFinite(cap) && cap > 0 ? cap : null;
+    }
+    return null;
+  })();
+  // Optional durable home for disconnect counters (SQLite kv in production),
+  // so a panel restart mid-storm does not reset a 408 loop to full speed.
+  const disconnectStore = opts.disconnectStateStore || null;
+  const loadDisconnectCounters = (id) => {
+    let stored = null;
+    try { stored = disconnectStore?.read?.(id) || null; } catch { /* counters are an optimisation; losing them is safe */ }
+    return createDisconnectCounters(stored);
+  };
+  const saveDisconnectCounters = (entry) => {
+    try { disconnectStore?.write?.(entry.id, { ...entry.disconnectCounters }); } catch { /* best effort */ }
+  };
+  const dropDisconnectCounters = (entry) => {
+    try { disconnectStore?.delete?.(entry.id); } catch { /* best effort */ }
+  };
   const validManifest = (data) => Boolean(
     data && data.version === 1 && data.accounts && typeof data.accounts === 'object' && !Array.isArray(data.accounts) &&
     Object.entries(data.accounts).every(([number, record]) =>
@@ -234,10 +264,27 @@ function createSessionManager(opts) {
         connectedFor: entry.connected && entry.openedAt ? now - entry.openedAt : 0,
         lastInboundAgo: entry.lastInboundAt ? now - entry.lastInboundAt : null,
         reconnects: entry.reconnects,
-        lastClose: entry.lastCloseCode ? { code: entry.lastCloseCode, ago: now - entry.lastCloseAt } : null,
+        lastClose: entry.lastCloseCode ? { code: entry.lastCloseCode, kind: entry.lastCloseKind || null, ago: now - entry.lastCloseAt } : null,
+        disconnect: { ...entry.disconnectCounters },
+        cache: entry.messageStore?.stats() || null,
+        replay: entry.replayDrain?.stats() || null,
       });
     }
     return out;
+  }
+
+  // Memory-pressure relief for the process watchdog: shed half of every
+  // account's message/retry caches. Losing a cached message only means one
+  // retry request may fail; an OOM kill loses every account at once.
+  function pruneCaches() {
+    let chats = 0;
+    let retries = 0;
+    for (const entry of entries.values()) {
+      try { chats += entry.messageStore?.prune(0.5) || 0; } catch { /* best effort */ }
+      try { retries += entry.retryCache?.prune(0.5) || 0; } catch { /* best effort */ }
+      if (entry.seen?.size > 1000) entry.seen.clear();
+    }
+    return { chats, retries };
   }
 
   const entries = new Map();
@@ -288,7 +335,11 @@ function createSessionManager(opts) {
       stopped: false, starting: null, requestStarted: false, pairResult: null,
       waiters: [], expiryTimer: null, seen: new Map(), credentialWrites: new Set(), retryNoticeAt: 0,
       openedAt: 0, lastInboundAt: 0, lastProbeOkAt: 0, probing: false, reconnects: 0, pauseReason: '', pauseNoticeAt: 0, pauseSince: 0,
-      lastCloseCode: 0, lastCloseAt: 0, fatalReason: '',
+      lastCloseCode: 0, lastCloseAt: 0, lastCloseKind: '', fatalReason: '',
+      disconnectCounters: loadDisconnectCounters(id),
+      messageStore: opts.messageStoreFactory ? opts.messageStoreFactory(id) : createMessageStore(opts.messageStore || {}),
+      retryCache: createRetryCounterCache(opts.retryCache || {}),
+      replayDrain: createReplayDrain(opts.replayDrain || {}),
       jitter: 0.9 + Math.random() * 0.2,
     };
     entry.reconnector = createReconnector({
@@ -394,6 +445,11 @@ function createSessionManager(opts) {
         entry.connected = false;
         old.__superseded = true;
         sockets.setOffline(entry.id, old);
+        // Fully retire the previous generation: no listener and no websocket
+        // of the old socket may survive into the new connection and fight it
+        // (a surviving close handler is how a bot ends up replacing itself).
+        try { old.ev?.removeAllListeners?.(); } catch { /* best effort */ }
+        try { old.ws?.close?.(); } catch { /* best effort */ }
         try { await old.end(new Error('reconnecting')); } catch { /* already closed */ }
       }
       // A close can race with an accepted creds.update. Reloading first may
@@ -415,11 +471,19 @@ function createSessionManager(opts) {
         // or damaged login is never replaced with a blank one.
         auth = await opts.loadAuthState(entry.dir, { requireExisting: Boolean(entry.number) && entry.status === 'active' });
       } catch (err) {
-        if (!AUTH_FATAL.has(err?.code) || !entry.number) throw err;
+        if (!AUTH_FATAL.has(err?.code)) throw err;
+        // Missing/damaged credentials can never connect — for the owner as
+        // well as linked numbers. Stop loudly with the data preserved rather
+        // than letting Baileys continue with a blank login.
         entry.fatalReason = err.code === 'AUTH_MISSING' ? 'its saved login is missing' : 'its saved login is damaged';
         entry.reconnector.stop();
-        log.error(`Linked +${entry.number} cannot start: ${entry.fatalReason}. Its stored data was left untouched.`);
-        mark(entry, 'logged_out');
+        if (entry.number) {
+          log.error(`Linked +${entry.number} cannot start: ${entry.fatalReason}. Its stored data was left untouched.`);
+          mark(entry, 'logged_out');
+        } else {
+          entry.status = 'logged_out';
+          log.error(`The owner account cannot start: ${entry.fatalReason}. Its stored data was left untouched.`);
+        }
         notify();
         return null;
       }
@@ -428,7 +492,17 @@ function createSessionManager(opts) {
       entry.saveCreds = auth.saveCreds;
       const version = await opts.getVersion();
       if (stopped || entry.stopped) return null;
-      const sock = opts.makeSocket({ auth: auth.state, version });
+      const sock = opts.makeSocket({
+        auth: auth.state,
+        version,
+        sessionId: entry.id,
+        accountNumber: entry.number,
+        // Real message-retry support: Baileys can now answer retry requests
+        // from peers' phones instead of failing every one of them.
+        getMessage: (key) => entry.messageStore.getMessage(key),
+        msgRetryCounterCache: entry.retryCache,
+        messageStore: entry.messageStore,
+      });
       sock.__sessionId = entry.id;
       sock.__sessionDir = entry.dir;
       sock.__accountNumber = entry.number;
@@ -483,6 +557,11 @@ function createSessionManager(opts) {
           if (entry.number) mark(entry, 'active');
           else entry.status = 'active';
           entry.reconnector.reset();
+          // A proven connection clears every per-code storm counter.
+          resetDisconnectCounters(entry.disconnectCounters);
+          saveDisconnectCounters(entry);
+          entry.lastCloseKind = '';
+          entry.replayDrain.markConnectionOpen(Date.now());
           entry.retryNoticeAt = 0;
           entry.openedAt = Date.now();
           entry.lastInboundAt = entry.openedAt;
@@ -497,30 +576,53 @@ function createSessionManager(opts) {
           const statusCode = update.lastDisconnect?.error?.output?.statusCode;
           entry.lastCloseCode = Number.isInteger(statusCode) ? statusCode : -1;
           entry.lastCloseAt = Date.now();
-          if (statusCode === opts.loggedOutCode) {
+          // Per-code policy (see reconnect.js): a conflict is not a logout,
+          // a banned number is not retried forever, a 503 is not retried at
+          // full speed, and a 408 storm eventually refreshes the WA version.
+          const plan = planDisconnect(entry.disconnectCounters, {
+            statusCode: Number.isInteger(statusCode) ? statusCode : null,
+            message: disconnectMessage(update.lastDisconnect?.error),
+            loggedOutCode: opts.loggedOutCode,
+            random: opts.disconnectRandom,
+          });
+          entry.lastCloseKind = plan.kind;
+          saveDisconnectCounters(entry);
+          if (plan.invalidateVersion) {
+            try { (opts.invalidateVersion || opts.onVersionStale)?.(); } catch { /* version refresh is best effort */ }
+          }
+          if (plan.fatal) {
             entry.reconnector.stop();
-            entry.fatalReason = 'WhatsApp logged the device out';
+            entry.fatalReason = plan.kind === 'forbidden'
+              ? 'WhatsApp refused this account (403) three times; the number may be banned'
+              : 'WhatsApp logged the device out';
             if (entry.number) mark(entry, 'logged_out');
             else entry.status = 'logged_out';
             settlePair(entry, Object.assign(new Error('WhatsApp logged out. Request a new linking code.'), { statusCode: 409 }));
             log.warn(`${entry.number ? `Linked +${entry.number}` : 'The owner account'} was logged out by WhatsApp. Its credentials were preserved.`);
           } else {
-            const delay = entry.reconnector.schedule();
-            if (delay !== false) {
+            let delay = plan.delayMs;
+            if (delay !== null && policyDelayCapMs) delay = Math.min(delay, policyDelayCapMs);
+            const scheduled = delay === null ? entry.reconnector.schedule() : entry.reconnector.schedule(delay);
+            if (scheduled !== false) {
               const code = Number.isInteger(statusCode) ? statusCode : 'unknown';
               // Do not log the raw disconnect object: it can contain session details.
               const now = Date.now();
-              const message = `WhatsApp connection closed (status ${code}); retrying in ${delay}ms.`;
+              const message = `WhatsApp connection closed (status ${code}); retrying in ${scheduled}ms.`;
               entry.drops = (entry.drops || []).filter((at) => now - at < 10 * 60_000);
               entry.drops.push(now);
               const quietFor5Min = !entry.retryNoticeAt || now - entry.retryNoticeAt >= 5 * 60_000;
-              if (TRANSIENT_CLOSE_CODES.has(statusCode)) {
+              if (TRANSIENT_CLOSE_CODES.has(statusCode) || QUIET_CLOSE_KINDS.has(plan.kind)) {
                 // Network blips and WhatsApp-requested restarts (408, 428, 515, ...)
                 // reconnect by themselves: keep them out of the console unless
                 // they pile up, which means the host's network is unstable.
                 if (entry.drops.length >= 5 && quietFor5Min) {
                   entry.retryNoticeAt = now;
                   log.warn(`WhatsApp connection is unstable: ${entry.drops.length} drops in 10 min (last status ${code}). Check the host's network.`);
+                } else log.debug?.(message);
+              } else if (plan.kind === 'conflict') {
+                if (quietFor5Min) {
+                  entry.retryNoticeAt = now;
+                  log.warn(`${entry.number ? `Linked +${entry.number}: ` : ''}WhatsApp connection replaced (status ${code}); reconnecting in ${scheduled}ms. Close other instances using this number if this repeats.`);
                 } else log.debug?.(message);
               } else if (quietFor5Min) {
                 entry.retryNoticeAt = now;
@@ -542,7 +644,14 @@ function createSessionManager(opts) {
         for (const msg of messages) {
           const from = msg?.key?.remoteJid;
           const id = msg?.key?.id;
-          if (!msg?.message || !id || !from || opts.isSystemJid?.(from)) continue;
+          if (!msg?.message || !id || !from) continue;
+          // Keep every deliverable message for Baileys retry requests, even
+          // ones we will not act on (backlog, system chats).
+          try { entry.messageStore.storeMessage(from, msg); } catch { /* the store is bounded and best effort */ }
+          if (opts.isSystemJid?.(from)) continue;
+          // Post-reconnect backlog is not new work: drop it while the drain
+          // window is open instead of re-running stale commands in a burst.
+          if (entry.replayDrain.isReplayMessage(msg, now)) continue;
           const key = `${from}:${id}`;
           if (entry.seen.has(key)) continue;
           const sentAt = Number(msg.messageTimestamp) * 1000;
@@ -695,6 +804,7 @@ function createSessionManager(opts) {
     }
     await retire(entry, 'Number removed');
     dropRecord(number);
+    dropDisconnectCounters(entry);
     entries.delete(entry.id);
     try { removeCredentials(number); } catch (err) { log.warn(`Could not delete the stored login of +${number}: ${err?.message || err}`); }
     notify();
@@ -749,7 +859,7 @@ function createSessionManager(opts) {
     return stopPromise;
   }
 
-  return { start, stop, requestPair, removeAccount, status, health, heal, reconnectAll, _checkStale: checkStale, _maintain: maintain };
+  return { start, stop, requestPair, removeAccount, status, health, heal, reconnectAll, pruneCaches, _checkStale: checkStale, _maintain: maintain };
 }
 
 module.exports = { createSessionManager };

@@ -13,6 +13,8 @@
 /cookies/
 *.sqlite-shm
 *.sqlite-wal
+*.sqlite.backup
+*.sqlite.backup.tmp-*
 *.corrupt
 *.bak
 *.migrated
@@ -23,3 +25,7 @@
 
 # Cloned separately for reference (chiok999/reelbox); not part of this repo
 /reelbox/
+
+# Downloaded separately for reference (supreme-Lord2/xjx); not part of this repo
+/xjx-main/
+/xjx-main.zip

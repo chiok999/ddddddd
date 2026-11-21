@@ -839,3 +839,210 @@ test('credential updates save in order before reconnection', async (t) => {
   release();
   await waitFor(() => calls === 2);
 });
+
+// ─── Connection resilience (ported June-X behaviours, multi-account edition) ──
+
+test('disconnect policy: each WhatsApp code gets its own delay, counter and verdict', () => {
+  const { createDisconnectCounters, planDisconnect } = require('../gateway/sessions/reconnect');
+  const noJitter = () => 0;
+
+  // 401 that merely mentions a conflict is a conflict, never a logout.
+  let counters = createDisconnectCounters();
+  let plan = planDisconnect(counters, { statusCode: 401, message: 'device conflict', random: noJitter });
+  assert.equal(plan.kind, 'conflict');
+  assert.equal(plan.fatal, false);
+  assert.equal(plan.delayMs, 13_000);
+  for (let i = 0; i < 8; i++) plan = planDisconnect(counters, { statusCode: 440, message: '', random: noJitter });
+  plan = planDisconnect(counters, { statusCode: 440, message: '', random: noJitter });
+  assert.equal(plan.delayMs, 300_000, 'the tenth conflict stands down for five minutes');
+  assert.equal(plan.standDown, true);
+
+  // A real logout is fatal; credentials are the caller's to preserve.
+  counters = createDisconnectCounters();
+  plan = planDisconnect(counters, { statusCode: 401, message: '', random: noJitter });
+  assert.deepEqual([plan.kind, plan.fatal], ['logged_out', true]);
+
+  // 403 is retried twice, then fatal (banned numbers are not hammered).
+  counters = createDisconnectCounters();
+  assert.equal(planDisconnect(counters, { statusCode: 403, random: noJitter }).fatal, false);
+  assert.equal(planDisconnect(counters, { statusCode: 403, random: noJitter }).fatal, false);
+  plan = planDisconnect(counters, { statusCode: 403, random: noJitter });
+  assert.deepEqual([plan.kind, plan.fatal], ['forbidden', true]);
+
+  // 408 grows exponentially and the tenth asks for a fresh WA version.
+  counters = createDisconnectCounters();
+  assert.equal(planDisconnect(counters, { statusCode: 408, random: noJitter }).delayMs, 10_000);
+  for (let i = 0; i < 8; i++) planDisconnect(counters, { statusCode: 408, random: noJitter });
+  plan = planDisconnect(counters, { statusCode: 408, random: noJitter });
+  assert.equal(plan.invalidateVersion, true);
+  assert.equal(plan.delayMs, 60_000);
+  assert.equal(counters.timeout408, 0, 'the counter restarts after a version refresh');
+
+  // 503 backs off linearly to five minutes; 500 stays fast and never fatal.
+  counters = createDisconnectCounters();
+  planDisconnect(counters, { statusCode: 503, random: noJitter });
+  planDisconnect(counters, { statusCode: 503, random: noJitter });
+  assert.equal(planDisconnect(counters, { statusCode: 503, random: noJitter }).delayMs, 90_000);
+  assert.equal(planDisconnect(createDisconnectCounters(), { statusCode: 500, random: noJitter }).delayMs, 10_000);
+  assert.equal(planDisconnect(createDisconnectCounters(), { statusCode: 515, random: noJitter }).delayMs, 1000);
+});
+
+test('message store answers retry requests, retry cache is bounded, replay drain drops backlog', async () => {
+  const { createMessageStore, createRetryCounterCache, createReplayDrain, messageTimestampMs } = require('../lib/messageStore');
+
+  const store = createMessageStore({ maxPerChat: 2, maxChats: 2 });
+  const msg = (jid, id, text) => ({ key: { remoteJid: jid, id }, message: { conversation: text } });
+  store.storeMessage('a@s.whatsapp.net', msg('a@s.whatsapp.net', '1', 'one'));
+  store.storeMessage('a@s.whatsapp.net', msg('a@s.whatsapp.net', '2', 'two'));
+  store.storeMessage('a@s.whatsapp.net', msg('a@s.whatsapp.net', '3', 'three'));
+  assert.equal(store.loadMessage('a@s.whatsapp.net', '1'), null, 'oldest message evicted at the per-chat cap');
+  assert.equal(store.getMessage({ remoteJid: 'a@s.whatsapp.net', id: '3' }).conversation, 'three');
+  assert.equal(store.getMessage({ remoteJid: 'x@lid', remoteJidAlt: 'a@s.whatsapp.net', id: '2' }).conversation, 'two', 'LID lookups fall back to the alternate JID');
+  assert.equal(store.getMessage({ remoteJid: 'a@s.whatsapp.net', id: 'missing' }), undefined);
+
+  const cache = createRetryCounterCache({ maxEntries: 2 });
+  cache.set('a', 1); cache.set('b', 2); cache.set('c', 3);
+  assert.equal(cache.get('a'), undefined, 'retry cache evicts the oldest entry at its cap');
+  assert.equal(cache.get('c'), 3);
+
+  const drain = createReplayDrain({ initialMs: 45_000, oldMs: 30_000 });
+  const openAt = 1_700_000_000_000;
+  drain.markConnectionOpen(openAt);
+  const oldMessage = { messageTimestamp: Math.floor((openAt - 120_000) / 1000) };
+  const freshMessage = { messageTimestamp: Math.floor(openAt / 1000) };
+  assert.equal(messageTimestampMs(freshMessage), openAt);
+  assert.equal(drain.isReplayMessage(oldMessage, openAt + 500), true, 'two-minute-old backlog is dropped');
+  assert.equal(drain.isReplayMessage(freshMessage, openAt + 500), false, 'live traffic passes');
+  assert.equal(drain.stats(openAt + 500).dropped, 1);
+  assert.equal(drain.isReplayMessage(oldMessage, openAt + 200_000), false, 'the drain always ends');
+});
+
+test('a 401 conflict reconnects instead of parking the account as logged out', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-conflict401-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const fx = fixture(root);
+  t.after(() => fx.manager.stop());
+  await fx.manager.start();
+  open(fx.created[0], '265990000000');
+  const { sock } = await request(fx, '265991111111');
+  open(sock, '265991111111');
+  const before = fx.created.length;
+  sock.ev.emit('connection.update', {
+    connection: 'close',
+    lastDisconnect: { error: { message: 'stream error: conflict — device replaced', output: { statusCode: 401 } } },
+  });
+  await waitFor(() => fx.created.length === before + 1);
+  assert.notEqual(stateOf(fx, '265991111111'), 'logged_out');
+  assert.equal(fx.events.filter((e) => e.type === 'logged_out').length, 0);
+});
+
+test('three 403 refusals park the account as logged out instead of retrying forever', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-forbidden-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const fx = fixture(root);
+  t.after(() => fx.manager.stop());
+  await fx.manager.start();
+  open(fx.created[0], '265990000000');
+  const { sock } = await request(fx, '265991111111');
+  open(sock, '265991111111');
+  let current = sock;
+  for (let i = 0; i < 2; i++) {
+    const before = fx.created.length;
+    current.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 403 } } } });
+    await waitFor(() => fx.created.length === before + 1);
+    current = fx.created[fx.created.length - 1];
+  }
+  current.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 403 } } } });
+  assert.equal(stateOf(fx, '265991111111'), 'logged_out');
+  const settled = fx.created.length;
+  await delay(40);
+  assert.equal(fx.created.length, settled, 'a refused account is not retried in a loop');
+  assert.deepEqual(fx.events.filter((e) => e.type === 'logged_out').map((e) => e.number), ['265991111111']);
+});
+
+test('replay backlog after a reconnect is dropped, live messages and the retry store still work', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-replay-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const fx = fixture(root);
+  t.after(() => fx.manager.stop());
+  await fx.manager.start();
+  open(fx.created[0], '265990000000');
+  const { sock } = await request(fx, '265991111111');
+  open(sock, '265991111111');
+  await waitFor(() => stateOf(fx, '265991111111') === 'connected');
+
+  const stale = message('stale-1');
+  stale.messageTimestamp = Math.floor(Date.now() / 1000) - 120;
+  sock.ev.emit('messages.upsert', { type: 'notify', messages: [stale] });
+  await delay(20);
+  assert.equal(fx.messages.length, 0, 'a two-minute-old replayed command is not executed again');
+
+  sock.ev.emit('messages.upsert', { type: 'notify', messages: [message('fresh-1')] });
+  await waitFor(() => fx.messages.length === 1);
+  const row = fx.manager.health().find((h) => h.number === '265991111111');
+  assert.ok(row.cache.messages >= 1, 'delivered messages are kept for retry requests');
+  assert.ok(row.replay.dropped >= 1);
+  const shed = fx.manager.pruneCaches();
+  assert.ok(shed.chats >= 0 && fx.manager.health().find((h) => h.number === '265991111111').cache.messages <= row.cache.messages);
+});
+
+test('disconnect counters survive in the injected store and reset on open', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-counters-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const saved = new Map();
+  const fx = fixture(root, {
+    disconnectStateStore: {
+      read: (id) => saved.get(id) || null,
+      write: (id, counters) => saved.set(id, { ...counters }),
+      delete: (id) => saved.delete(id),
+    },
+  });
+  t.after(() => fx.manager.stop());
+  await fx.manager.start();
+  open(fx.created[0], '265990000000');
+  const { sock } = await request(fx, '265991111111');
+  open(sock, '265991111111');
+  sock.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 408 } } } });
+  assert.equal(saved.get('linked:265991111111')?.timeout408, 1, 'a restart mid-storm keeps the backoff position');
+  await waitFor(() => fx.created.length === 3);
+  open(fx.created[2], '265991111111');
+  assert.equal(saved.get('linked:265991111111')?.timeout408, 0, 'a proven connection clears the storm counters');
+});
+
+test('keep-alive server reports only counts, and the memory watchdog sheds on pressure', async (t) => {
+  const http = require('node:http');
+  const { startKeepAliveServer, startMemoryWatchdog, sanitizedStatus } = require('../lib/runtimeGuards');
+  assert.deepEqual(
+    sanitizedStatus({ accounts: [{ state: 'connected', number: '265990000000' }, { state: 'connecting' }] }),
+    { connectedAccounts: 1, totalAccounts: 2, byState: { connected: 1, connecting: 1 } },
+    'health output must never include a phone number',
+  );
+  const server = startKeepAliveServer({
+    ports: [0],
+    status: () => ({ accounts: [{ state: 'connected', number: '265990000000' }] }),
+    selfPingIntervalMs: 0,
+    log: { warn() {} },
+  });
+  t.after(() => server.close());
+  const bound = await server.ready;
+  assert.ok(bound.port > 0);
+  const body = await new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port: bound.port, path: '/health' }, (response) => {
+      let text = '';
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, text }));
+    }).on('error', reject);
+  });
+  assert.equal(body.status, 200);
+  assert.match(body.text, /"connectedAccounts":1/);
+  assert.doesNotMatch(body.text, /265990000000/);
+  server.close();
+
+  let shed = 0;
+  const watchdog = startMemoryWatchdog({ intervalMs: 60_000, limitMb: 1, onPressure: () => { shed += 1; return { chats: 1 }; }, log: { warn() {} } });
+  t.after(() => watchdog.stop());
+  const report = watchdog.checkOnce();
+  assert.equal(report.pressured, true);
+  assert.equal(shed, 1);
+  watchdog.stop();
+});

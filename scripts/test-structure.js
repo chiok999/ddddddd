@@ -75,7 +75,9 @@ test('layout: gateway, commands and lib exist; old utils/ and engine/ roots are 
 const BOT_FILE_BUDGET = 200;
 const SEPARATE_PROJECTS = new Set(['solo-cinema']);
 const countSourceFiles = (dir, { stopAt = null } = {}) => {
-  const skip = new Set(['node_modules', 'database', 'temp', 'tmp', 'bin', '.git', 'session', 'sessions', 'logs', 'secrets', 'assets']);
+  // `xjx-main/` is a downloaded reference copy of another bot, kept in the
+  // workspace for comparison only (see .gitignore); it is not bot source.
+  const skip = new Set(['node_modules', 'database', 'temp', 'tmp', 'bin', '.git', 'session', 'sessions', 'logs', 'secrets', 'assets', 'xjx-main']);
   let count = 0;
   (function walk(current) {
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {

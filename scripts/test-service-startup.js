@@ -88,6 +88,15 @@ for (const [signal, failBackup] of [['SIGTERM', false], ['SIGINT', false], ['SIG
       const logger = () => ({info(){},warn(){},error(){},debug(){}}); logger.banner = () => {};
       const fake = {
         './lib/tempManager': { initializeTempSystem() {} },
+        './lib/sqlite': {
+          restoreFromBackupIfNeeded: () => ({ restored: false }),
+          startBackupScheduler() {}, flushBackup() {}, stopBackupScheduler() {},
+          open: () => ({ prepare: () => ({ get: () => null, run: () => {} }) }),
+        },
+        './lib/runtimeGuards': {
+          startKeepAliveServer: () => ({ ready: Promise.resolve(null), close() {}, port: () => null }),
+          startMemoryWatchdog: () => ({ stop() {}, checkOnce: () => ({ pressured: false }) }),
+        },
         './lib/cleanup': { startCleanup() {}, stopCleanup() { mark('cleanup'); }, cleanupOldFiles() {} },
         './lib/diskGuard': { startDiskGuard() {}, stopDiskGuard() { mark('disk'); } },
         'pino': () => ({ info() {} }),
