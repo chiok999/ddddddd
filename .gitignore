@@ -11,6 +11,10 @@
 /logs/
 /secrets/
 /cookies/
+# Runtime database: contains WhatsApp login keys — never commit it.
+# (The bot recreates it on first start and restores from bot.sqlite.backup
+# or the remote auth mirror when one is configured.)
+database/*.sqlite
 *.sqlite-shm
 *.sqlite-wal
 *.sqlite.backup

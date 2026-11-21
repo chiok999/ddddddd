@@ -351,7 +351,7 @@ for (const padded of [true, false]) {
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     try {
-      const out = await downloadHlsNative(`http://127.0.0.1:${server.address().port}/index.m3u8`, path.join(TMP, `hls-${padded}.ts`));
+      const out = await downloadHlsNative(`http://127.0.0.1:${server.address().port}/index.m3u8`, path.join(TMP, `hls-${padded}.ts`), { allowPrivateHosts: true });
       assert.deepEqual(fs.readFileSync(out.file), Buffer.concat(originals));
     } finally {
       server.closeAllConnections();
@@ -379,7 +379,7 @@ test('native HLS enforces the size cap while receiving a segment', async () => {
   try {
     await assert.rejects(
       Promise.race([
-        downloadHlsNative(`http://127.0.0.1:${server.address().port}/playlist`, path.join(TMP, 'too-large.ts'), { maxBytes: 1024 }),
+        downloadHlsNative(`http://127.0.0.1:${server.address().port}/playlist`, path.join(TMP, 'too-large.ts'), { maxBytes: 1024, allowPrivateHosts: true }),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('size cap did not stop the response')), 1500); }),
       ]),
       (err) => err.code === 'TOO_BIG',
@@ -408,7 +408,7 @@ test('native HLS refuses to silently drop a separate audio rendition', async () 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
     await assert.rejects(
-      downloadHlsNative(`http://127.0.0.1:${server.address().port}/master`, path.join(TMP, 'silent.ts')),
+      downloadHlsNative(`http://127.0.0.1:${server.address().port}/master`, path.join(TMP, 'silent.ts'), { allowPrivateHosts: true }),
       /separate audio.*ffmpeg/i,
     );
     assert.equal(fs.existsSync(path.join(TMP, 'silent.ts')), false);
@@ -430,7 +430,7 @@ test('native HLS removes partial output if a later segment exceeds the cap', asy
   const out = path.join(TMP, 'partial.ts');
   try {
     await assert.rejects(
-      downloadHlsNative(`http://127.0.0.1:${server.address().port}/playlist`, out, { maxBytes: 25000 }),
+      downloadHlsNative(`http://127.0.0.1:${server.address().port}/playlist`, out, { maxBytes: 25000, allowPrivateHosts: true }),
       (err) => err.code === 'TOO_BIG',
     );
     assert.equal(fs.existsSync(out), false);
@@ -584,14 +584,14 @@ test('native HLS uses the same byte boundary as HTTP downloads', async () => {
   try {
     for (const label of ['below', 'at']) {
       const dest = path.join(TMP, `hls-cap-${label}.mp4`);
-      const result = await hlsToFile(`http://127.0.0.1:${server.address().port}/playlist/${label}`, dest);
+      const result = await hlsToFile(`http://127.0.0.1:${server.address().port}/playlist/${label}`, dest, null, { allowPrivateHosts: true });
       assert.equal(result.engine, 'native');
       assert.equal(result.bytes, sizes[label], label);
       assert.equal(fs.statSync(result.file).size, sizes[label], label);
     }
     for (const label of ['above', 'between']) {
       const dest = path.join(TMP, `hls-cap-${label}.mp4`);
-      await assert.rejects(hlsToFile(`http://127.0.0.1:${server.address().port}/playlist/${label}`, dest), (err) => err.code === 'TOO_BIG');
+      await assert.rejects(hlsToFile(`http://127.0.0.1:${server.address().port}/playlist/${label}`, dest, null, { allowPrivateHosts: true }), (err) => err.code === 'TOO_BIG');
       assert.equal(fs.existsSync(dest), false);
       assert.equal(fs.existsSync(dest.replace(/\.mp4$/, '.ts')), false);
     }
@@ -742,7 +742,7 @@ test('native HLS resolves relative playlists after redirects', async () => {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
-    const out = await downloadHlsNative(`http://127.0.0.1:${server.address().port}/start`, path.join(TMP, 'redirect.ts'));
+    const out = await downloadHlsNative(`http://127.0.0.1:${server.address().port}/start`, path.join(TMP, 'redirect.ts'), { allowPrivateHosts: true });
     assert.deepEqual(fs.readFileSync(out.file), segment);
   } finally {
     server.closeAllConnections();
@@ -767,7 +767,7 @@ test('native HLS decrypts an explicitly encrypted initialization map', async () 
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
-    const out = await downloadHlsNative(`http://127.0.0.1:${server.address().port}/playlist`, path.join(TMP, 'init.mp4'));
+    const out = await downloadHlsNative(`http://127.0.0.1:${server.address().port}/playlist`, path.join(TMP, 'init.mp4'), { allowPrivateHosts: true });
     assert.equal(Buffer.compare(fs.readFileSync(out.file), Buffer.concat([init, segment])), 0, 'decrypted initialization map differs');
   } finally {
     server.closeAllConnections();
@@ -793,7 +793,7 @@ test('HLS playlists are bounded even when response size is unknown', async () =>
   let timer;
   try {
     await assert.rejects(Promise.race([
-      downloadHlsNative(`http://127.0.0.1:${server.address().port}/playlist`, path.join(TMP, 'huge-playlist.mp4')),
+      downloadHlsNative(`http://127.0.0.1:${server.address().port}/playlist`, path.join(TMP, 'huge-playlist.mp4'), { allowPrivateHosts: true }),
       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('playlist read was unbounded')), 1500); }),
     ]), (err) => err.code === 'TOO_BIG');
   } finally {
@@ -852,7 +852,7 @@ test('native HLS cancellation stops an in-flight segment and removes partial out
   const dest = path.join(TMP, 'cancelled-hls.mp4');
   let cancel = false, timer;
   try {
-    const task = hlsToFile(`http://127.0.0.1:${server.address().port}/playlist`, dest, null, { onAbort: () => cancel });
+    const task = hlsToFile(`http://127.0.0.1:${server.address().port}/playlist`, dest, null, { onAbort: () => cancel, allowPrivateHosts: true });
     await segmentStarted;
     cancel = true;
     await assert.rejects(Promise.race([

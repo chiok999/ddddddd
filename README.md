@@ -367,6 +367,14 @@ starting this one and preserve its `.env`, session and database.
 
 ### Existing sessions and data
 
+`database/bot.sqlite` (which holds every WhatsApp login) is **not tracked by
+Git** — it is runtime state, like `.env`. Deploying new code therefore never
+overwrites it. If a deploy replaces the whole folder, copy the old `database/`
+folder across; if only `bot.sqlite` itself is lost, the bot restores it at
+boot from `database/bot.sqlite.backup`, and with `AUTH_MIRROR_URL` configured
+it can also rebuild logins from the remote mirror. Back up `database/` before
+any move anyway.
+
 The reorganization does not copy files from a remote server. If moving an existing
 bot installation, stop it and securely back up and transfer its `.env`,
 `session/`, `database/` (including JSON and SQLite files), and any needed

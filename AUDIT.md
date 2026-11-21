@@ -84,3 +84,66 @@ Observed: the local server received `/private` and `verified: true`. The test di
 ## Current re-audit scope
 
 The HLS verification mitigation was tested offline, but the end-to-end SSRF issue, Git-tracked runtime database, and optional dependency advisory remain open. The exhaustive audit originally requested has not been completed. No real production sessions, provider responses or WhatsApp playback were tested.
+
+## Re-audit 2026-11-21 (end-to-end, after PRs #101/#102)
+
+Scope: full test run, syntax pass, dependency audit, static scans, live boot
+smoke test. Branch `arena/87018650-ddddddd` at `083c26f`.
+
+- `npm test`: **342 passing, 0 failing** (structure 42, preflight/readiness 59,
+  media 88, bugfixes 13, sessions 109, workers 11, storage 20).
+- `node --check` on every JS file under commands/gateway/lib/scripts plus
+  index.js/config.js: **154/154 clean**.
+- Live boot (scratch DB): starts, `GET /health` and `/health/details` answer
+  counts-only JSON (no numbers/session data), graceful SIGTERM exit 0, and a
+  shutdown `bot.sqlite.backup` is written.
+- Static scans: no `eval`/`new Function`, no `shell: true` or shell `exec()`
+  (child processes use `execFile`/`spawn`/`fork` with argument arrays), no
+  hard-coded credentials outside env lookups, no template-string SQL.
+- `npm audit`: 0 vulnerabilities with optional deps omitted; the same 4 high
+  entries via optional `webtorrent` → `bittorrent-tracker` → `ip` remain
+  (see earlier disposition — still open, unchanged).
+- New-code review (recovery strings + mirror, PR #102): mirror URL is never
+  logged; recovery/mirror payloads are AES-256-GCM encrypted when a secret is
+  configured. Two informational notes: (1) recovery strings are unencrypted
+  when `SESSION_RECOVERY_SECRET` is unset — the command and README both warn
+  to treat them as passwords; (2) `.sessionid` delivers a login-equivalent
+  file inside WhatsApp chat (owner-only, by design).
+- Still open from earlier sections, unchanged: Git-tracked
+  `database/bot.sqlite`; the optional-dependency advisory; the partially
+  mitigated HLS SSRF surface (verification path guarded and tested, native/
+  external downloader paths not fully covered).
+- Limits: no live WhatsApp account, real Postgres/Mongo server, panel, or
+  media provider was exercised; mirror adapters were verified against fake
+  drivers, recovery/mirror flows against local fixtures.
+
+## Fix pass 2026-11-21 (only fixes that cannot affect the PR #101/#102 integration)
+
+- **Fixed: Git-tracked runtime database.** `database/bot.sqlite` removed from
+  the index (`git rm --cached`; the live file stays on disk) and
+  `database/*.sqlite` is now ignored with a comment explaining why. Session/
+  auth code untouched. If a deploy ever loses the file, boot restores it from
+  `database/bot.sqlite.backup` (PR #101) or the remote mirror (PR #102);
+  README's deployment section says so. Verified: full suite green, boot smoke
+  green.
+- **Fixed (native path): HLS SSRF in the pure-Node downloader.**
+  `lib/movies/engine/media/hls.js` now validates every fetched URL —
+  playlist, variant, segment, key, and each redirect hop — against the same
+  public-address rules used by the verified-manifest path, and fetches through
+  the DNS-pinning Undici dispatcher (`publicLookup`), so public hostnames
+  cannot resolve to private addresses either. Cross-origin redirects strip
+  credential headers. An explicit `allowPrivateHosts` option exists only for
+  offline loopback test fixtures; production callers (`download.js`) never
+  pass it. Regression: `scripts/test-hls-security.js` (private playlist
+  blocked with zero requests; public→private redirect blocked). Still open,
+  unchanged: ffmpeg/N_m3u8DL-RE subprocess downloaders cannot be DNS-pinned
+  this way and remain reachable only with URLs that already passed the
+  guarded resolve/verify stage.
+- **Not fixed, deliberately: optional `webtorrent` advisory.** The installed
+  `ip` is already 2.0.1 and the advisory has no patched release; the only
+  npm-suggested remedy is a major downgrade/removal of the optional torrent
+  feature. Verified again that `bittorrent-tracker` never calls the
+  advisory's `isPublic`/`isPrivate` functions (its only `ip` use is address
+  formatting), so the flagged code path is unreachable here. Removing a
+  working feature to silence an unreachable advisory would be a regression,
+  not a fix.
